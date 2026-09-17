@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', stats: '网关统计', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -136,6 +136,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
+  if (v === 'stats') loadStats();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); loadCNInvite(true); pollQueueOnce(); }
 }
@@ -163,6 +164,25 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    // 模型级 6004 限流（rate_limited_models）：账号级 healthy，但对这些模型不可选。
+    //
+    // 为什么单列：上游 CooldownSoftForModel 带 resetAt 时**不写账号级 until**（6004 从不
+    // 写），所以这类账号 cooling=false、cool_remaining_sec 不出现 —— 只看上面三个账号级
+    // 截止会渲染成「可用」，而日志里明明是 6004。该字段后端一直透出，这里补渲染。
+    // 注意：不并入 frozen —— 账号对其他模型仍可用，不该出现「解冻」按钮。
+    const rl = s.rate_limited_models || [];
+    if (rl.length) {
+      const rlTip = rl.map(m => '  ' + m.model + '：至 ' +
+        String(m.until || m.reset_at || '').slice(5, 16).replace('T', ' ') +
+        (m.reason ? '（' + m.reason + '）' : '')).join('\n');
+      const rlSoon = rl.reduce((acc, m) => {
+        const t = (new Date(m.until || 0) - Date.now()) / 1000;
+        return t > 0 && (acc < 0 || t < acc) ? t : acc;
+      }, -1);
+      tag += '<span class="tag warn" title="模型级限流（仅下列模型不可选，其余模型正常）：\n' +
+        esc(rlTip) + '">' + (rl.length > 1 ? rl.length + ' 个模型限流' : esc(rl[0].model) + ' 限流') +
+        (rlSoon > 0 ? ' · ' + dur(rlSoon) : '') + '</span>';
+    }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
@@ -397,7 +417,6 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
-  max_body_mb: ['server', 'max_body_mb'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -589,6 +608,7 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') pollQueueOnce();
+  else if (view === 'stats') loadStats(true);
 }
 function start() {
   loadOverview(true);
@@ -1308,8 +1328,13 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
-    (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
+  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
+  //
+  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
+  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
+  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
+  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+    (d.buckets || 0) + ' 个分桶' +
     (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
@@ -1326,55 +1351,135 @@ function renderUsage(d) {
   renderUsageChart(d.series || []);
 }
 
-/* renderUsageChart 画堆叠柱状图。日点与小时点混用 x 轴，因此按数据序号等距
-   排布（不按真实时间比例），并在标签上区分粒度——用量面板看的是相对高低，
-   不是精确的时间刻度。 */
+/* renderUsageChart 画堆叠柱状图。
+ *
+ * x 轴是**真实时间轴**，不是按序号等距。这一点很重要：数据里存在 1 小时的
+ * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
+ * 画得和 1 小时一样宽，让「什么时候用的」完全失真。
+ *
+ * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到
+ * 容器宽度，柱子和文字都变形。改为固定比例、按容器宽度自适应高度。
+ *
+ * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
+ * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
+ */
+
+/* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
+function parsePointTime(p) {
+  // hour: "2026-09-16T13"  day: "2026-09-16"
+  const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
 function renderUsageChart(series) {
   const host = $('usChart');
-  if (!series.length) {
+
+  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+  const pts = [];
+  for (const p of series) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const pt = Number(p.prompt_tokens || 0);
+    const ct = Number(p.completion_tokens || 0);
+    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
+               req: p.requests || 0 });
+  }
+  if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
     return;
   }
-  const W = 760, H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
+
+  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
 
-  const max = Math.max(1, ...series.map(p => Number(p.total_tokens || 0)));
-  const bw = Math.max(2, Math.min(26, iw / series.length - 3));
+  const t0 = pts[0].t;
+  const t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
 
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
-  // y 轴网格 + 刻度（4 档）
+  const max = Math.max(1, ...pts.map(p => p.tt));
+
+  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
+  // 变细，但不会细到看不见。
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
+
+  const xOf = t => PL + (t - t0) / span * iw;
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
+            'preserveAspectRatio="xMidYMid meet">';
+
+  // y 轴网格 + 刻度
   for (let i = 0; i <= 4; i++) {
-    const v = max * i / 4;
     const y = PT + ih - (ih * i / 4);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5) + '" text-anchor="end">' + fmtTok(v) + '</text>';
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
 
-  const step = iw / series.length;
-  series.forEach((p, i) => {
-    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
-    const tt = Number(p.total_tokens || 0) || (pt + ct);
-    const x = PL + i * step + (step - bw) / 2;
-    const hTot = ih * (tt / max);
-    const hP = tt ? hTot * (pt / tt) : 0;
-    const hC = Math.max(tt && ct ? 1 : 0, hTot - hP);
+  // 柱子
+  for (const p of pts) {
+    const cx = xOf(p.t);
+    const x = cx - bw / 2;
+    const hTot = ih * (p.tt / max);
+    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hP.toFixed(1) + '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP - hC).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hC.toFixed(1) + '" fill="var(--ok)" rx="1.5"/>';
-    // 只给稀疏的几根画标签，避免拥挤
-    const every = Math.ceil(series.length / 8);
-    if (i % every === 0) {
-      const lab = p.scope === 'day' ? p.t.slice(5) : p.t.slice(11) + ':00';
-      out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
-        '" text-anchor="middle">' + esc(lab) + '</text>';
+    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
+      '" fill="var(--accent)" rx="1.5"/>';
+    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
+      '" fill="var(--ok)" rx="1.5"/>';
+    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+  }
+
+  // x 轴基线画在柱子之后，避免压在柱底
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
+         '" y2="' + (PT + ih) + '"/>';
+
+  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - target);
+      if (d < best) { best = d; bi = i; }
     }
-    out += '<title>' + esc(p.t) + ' (' + esc(p.scope) + ')  ' +
-      fmtTok(p.prompt_tokens) + ' prompt / ' + fmtTok(p.completion_tokens) + ' completion / ' +
-      (p.requests || 0) + ' 次</title>';
-  });
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi];
+    const d = new Date(p.t);
+    const lab = p.scope === 'day'
+      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+      : String(d.getHours()).padStart(2, '0') + ':00';
+    // 首尾标签靠边对齐，避免被裁掉
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+  }
+
+  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
+  let prevDay = null;
+  for (const p of pts) {
+    const d = new Date(p.t).getDate();
+    if (prevDay !== null && d !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.45"/>';
+    }
+    prevDay = d;
+  }
+
   out += '</svg>';
   host.innerHTML = out;
 }
@@ -1393,6 +1498,118 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+
+/* ── 网关统计 ─────────────────────────────────────────────────────── */
+/* 数据源是 GET /panel/api/stats（透传网关的 GET /v1/stats）。
+ *
+ * 与「用量」页的分工必须写在界面上，否则两页数字对不上会被当成 bug：
+ *   · 本页 = server 包的**纯内存聚合**，进程重启清零，带 since 起点；
+ *   · 用量页 = usage.Recorder 的**持久化分桶**，重启不丢，可按时间窗回看。
+ * 本页独有的：缓存三段与命中率、TTFB、吐字速率、实测扣费。
+ *
+ * 命中率的两个口径细节（与后端一致，别在前端"修正"）：
+ *   · 分母 = 命中 + 未命中，**不含 write**（写入是"为后续命中付的费"，
+ *     计入会压低首次请求的命中率）；
+ *   · 后端在缺 usage 观测时不计入任何 token，所以没有观测的请求不会把命中率拉成 0。
+ */
+
+/* stPct 命中率：后端给的是 0~1 小数。没有观测（分母 0）时后端给 0，
+   与"命中率真的是 0%"无法区分 —— 此时显示 "—" 更诚实，用 hit+miss 是否为 0 判断。 */
+function stPct(rate, hit, miss) {
+  if (!(Number(hit || 0) + Number(miss || 0))) return '—';
+  return (Number(rate || 0) * 100).toFixed(1) + '%';
+}
+
+/* stCredit 实测扣费累计：0 表示"未观测到"（后端只在末帧带 credit 时累加），
+   不要显示成 "0" 让人以为免费。 */
+function stCredit(c) {
+  const n = Number(c || 0);
+  if (!n) return '—';
+  return n >= 1000 ? (n / 1000).toFixed(2) + 'k' : n.toFixed(2);
+}
+
+/* stTime 把后端的 ISO 时间（本地时区）截成 MM-DD HH:MM:SS。 */
+function stTime(s) {
+  const t = String(s || '').replace('T', ' ');
+  return t ? t.slice(5, 19) : '—';
+}
+
+/* stTone 命中率配色：≥80% 好、<30% 警告、无观测不上色。 */
+function stTone(rate, hit, miss) {
+  if (!(Number(hit || 0) + Number(miss || 0))) return '';
+  const r = Number(rate || 0);
+  if (r >= 0.8) return 'good';
+  if (r < 0.3) return 'warn';
+  return '';
+}
+
+function renderStats(d) {
+  if (!d || d.enabled === false) {
+    $('stStats').innerHTML = usStat('—', '统计未启用');
+    $('stModelBody').innerHTML = '<tr><td colspan="13" class="empty">统计端点未启用</td></tr>';
+    $('stNote').textContent = '统计端点未启用';
+    return;
+  }
+  const t = d.total || {};
+  $('stStats').innerHTML =
+    usStat(fmtTok(t.requests), '请求数（成功 ' + fmtTok(t.success) + ' · 失败 ' + fmtTok(t.failed) + '）') +
+    usStat(stPct(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率',
+           stTone(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens)) +
+    usStat(fmtTok(t.prompt_tokens), '输入 token') +
+    usStat(fmtTok(t.completion_tokens), '输出 token') +
+    usStat(fmtMs(t.avg_ttfb_ms), '平均 TTFB') +
+    usStat(fmtRate(t.tokens_per_sec), '吐字速率');
+
+  // 口径写在标题栏：本页数字重启即清零、且不随「用量」页的时间窗变化。
+  $('stNote').textContent = '自 ' + stTime(d.since) + ' 起 · 运行 ' +
+    fmtUptime(d.uptime_sec) + ' · 纯内存（重启清零）';
+
+  $('stModelBody').innerHTML = (d.models || []).map(m =>
+    '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + esc(m.model) + '</td>' +
+      '<td class="num">' + fmtTok(m.requests) + '</td>' +
+      '<td class="num">' + (m.failed ? '<span style="color:var(--warn)">' + fmtTok(m.failed) + '</span>' : '—') + '</td>' +
+      '<td class="num">' + fmtTok(m.streaming) + '</td>' +
+      '<td class="num">' + fmtTok(m.prompt_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(m.completion_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(m.cache_hit_tokens) + '</td>' +
+      '<td class="num">' + stPct(m.cache_hit_rate, m.cache_hit_tokens, m.cache_miss_tokens) + '</td>' +
+      '<td class="num">' + fmtMs(m.avg_ttfb_ms) + '</td>' +
+      '<td class="num">' + fmtMs(m.avg_latency_ms) + '</td>' +
+      '<td class="num">' + fmtRate(m.tokens_per_sec) + '</td>' +
+      '<td class="num">' + stCredit(m.credit) + '</td>' +
+    '</tr>').join('') || '<tr><td colspan="13" class="empty">暂无数据</td></tr>';
+}
+
+/* fmtUptime 把秒数写成 "1h23m" / "5m12s" / "42s"。 */
+function fmtUptime(sec) {
+  let s = Number(sec || 0);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60); s %= 60;
+  if (m < 60) return m + 'm' + s + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h' + (m % 60) + 'm';
+}
+
+async function loadStats(quiet) {
+  try {
+    const d = await api('stats');
+    renderStats(d);
+  } catch (e) {
+    if (!quiet) toast('读取统计失败：' + e.message, 'err');
+  }
+}
+
+if ($('btnStats')) $('btnStats').onclick = () => loadStats();
+if ($('btnStatsReset')) $('btnStatsReset').onclick = async () => {
+  if (!confirm('清零统计聚合？\n\n只清内存聚合（本次运行的数字），\n不影响用量记录、账号状态与成本账本。')) return;
+  try {
+    await api('stats/reset', { method: 'POST' });
+    toast('统计已清零', 'ok');
+    await loadStats();
+  } catch (e) { toast('清零失败：' + e.message, 'err'); }
+};
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
