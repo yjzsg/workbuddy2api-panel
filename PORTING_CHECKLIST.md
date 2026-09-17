@@ -428,6 +428,267 @@ docker run --rm -v /vol4/_rebase_try_B:/src -v /vol4/_gocache:/go/pkg/mod -w /sr
 
 ---
 
+## 12. ⭐ 增量同步第二轮（2026-09-17 20:00–20:10，`fix_iter10.py`）：根上游 48 提交 + 面板 app.js
+
+用户："两个上游 有更新吗？" → 选择**全合** + `max_body_mb` **跟随上游退役**。
+
+### 两侧增量
+
+| 仓库 | 增量 | 规模 |
+|---|---|---|
+| 根上游 `Sliverkiss/workbuddy2api` | `64064ce..a9ccace` = **48 提交** | 46 文件 / +3373 −421 |
+| 上游面板 `linguo2625469/workbuddy2api-panel` | `c192fd1..4f18f7f` = **2 提交** | 仅 `internal/panel/app.js`（+123 −38） |
+
+### 根上游主要内容
+
+- **破坏性**：`server.max_body_mb` 退役（413 预拦截删除，大请求直读交上游）→ PORTING.md §4 第 10 条
+- **新功能**：`prompt.mode=append`（#129）、pool `costTier` 条件探索（#136，默认 30m）、scheduler 迟到唤醒补跑 5s 网络宽限（#152）、`school_season` 校园日（脚本路线，未接线）
+- **日志可读性**：`logfmt.Label(uid,nick)` → 流水行 `昵称(uid8)` + `DisplayWidth/Pad` 中文对齐 + 模型列 26 宽只补不截 → §4 第 11 条
+- **关键修复**：⭐ Expiring 分桶读错字段（`PackageEndTime` → **`CycleEndTime`**，上游从不下发前者）；SSE 非 delta 回退未 latch 致正文重复追加；空 content 帧不 latch；tool_calls Aggregate 三修（残缺参数/缺 index/非 delta 兜底）；usage 缺 `total_tokens` 补齐 + 流式缺失保留 -1 哨兵；models.dev 负缓存 TTL 永不淘汰；GrowthYesterdayDate 夏令时错位；RefreshToken 数据竞争（新增 `auth.RefreshTokenValue()`）；Truncate `n<=0` 守卫
+
+### 执行（`fix_iter10.py`）
+
+1. **分诊**：逐文件 `git apply --check` → **38 干净 / 8 冲突**（净 diff 存 NAS `/vol4/_up_48.patch`，5298 行）
+2. 干净组一次打完（含 8 个新测试文件）；新文件里 `"workbuddy2api/` import 前缀 sed 归一（4 个文件）
+3. 冲突组三方合并（base=`64064ce`）：`config.example.json` / `scheduler.go` / `expiring_test.go` **零冲突**；
+   `config.go`(5 块) / `main.go`(1) / `handler.go`(3) / `logging.go`(2) 共 **11 块**按 ours/theirs/both 逐块解
+4. `max_body_mb` 退役清理：handler 的 `maxBodyBytes`/`SetMaxBodyBytes`/413 分支 + main 的注入/热改/文档行
+   + `config.go` 默认值 + **面板 UI 输入框**（`app.js` 字段映射 + `index.html` 表单）
+5. 面板 `app.js` 三方合并（base=`c192fd1`）：ours(+CNInvite 卡片) × theirs(用量真实时间轴) → **零冲突**，1618 行
+6. 备份：`/vol4/_rebase_backup_2026-09-17_1955.tgz`（换基树）+ `/vol4/_panel_backup_2026-09-17_2004.tgz`（面板目录）
+
+### 验证与上线
+
+- `go build` + `go vet` + `go test`（19 包）**三项 EXIT=0**（无需 TZ）
+- 同步 `internal/` + `cmd/` + `config.example.json`；**Dockerfile 未同步**（L0 本地补丁版）
+- 容器重建 healthy；验收：**11 账号**（10 healthy，cn 5 / global 6）、65 模型（ctx 真值）、面板 200（`1.10.1-panel`）、灰度非流式+流式 200、无 error/panic
+- **新日志格式已生效**：
+  `| #001 | 20:06:26 | global:deepseek-v4.1-flash | stream | 200 | yejzsg@gmail.com(<uid8-3>) | TTFB=6425ms | tok=602 | 60.5tok/s | total=9.9s |`
+
+### 追加（20:25）：effort 降级日志降噪（`fix_iter11.py`）
+
+上线后发现日志被 `WARN: reasoning_effort downgraded` 刷屏（12 分钟 67 条）—— 上游对**每条**被降级的请求都打 WARN，而客户端固定发 `reasoning_effort: max`、`global:deepseek-v4.1-flash` 只支持 `high`，于是每条请求都命中。降级本身是**正确且必要**的（issue #84：国际版传 max 会被上游 400 拒掉），但逐条 WARN 会淹没真错误。
+
+改法：`PrepareBodyOptWithEffortsAndDefault` 拆出 `prepareBodyOptCore(..., realmTag)`，`normalizeReasoningEffort` 按 `realm|model|请求档|结果档` 去重（`effortWarned sync.Map`）并把模型名标成 `global:xxx`；**请求体改写照旧每次执行**。新增 `internal/upstream/effort_warn_dedup_test.go`（3 个用例：去重语义 / 域标注 / 改写不受去重影响）。
+
+验证：3 次 `reasoning_effort: max` 的 `global:deepseek-v4.1-flash` 请求 → 降级日志 **1 条**（`model=global:deepseek-v4.1-flash max -> high (同类降级只记一次)`），原来会是 3 条。全量 build+vet+test 仍全绿。
+
+### 两处"未采纳 / 待办"
+
+- **Dockerfile 的 Go builder 安全更新未采纳**：上游升到 `golang:1.26-alpine`，我们本地补丁版是 `1.23-alpine`（NAS 镜像站绕行 + 国内 proxy）。升 Go 版本是独立风险项，未与本次合并混做；要升请单独验证镜像可拉取 + 构建通过。
+- **生产 `config.json` 仍带 `"server":{"max_body_mb":16}`**：被当作未知字段忽略（无害）；想清理就删掉该段。
+
+### 教训（已写进 PORTING.md §3.1）
+
+**每次同步必须同时检查两个上游**——本次第一轮漏了面板仓库的 `app.js`，容器重建完才发现（第二轮补合）。
+
+---
+
+## 13. ⭐ 冷却相关三处修复（2026-09-17 20:40–21:05，`fix_iter12/13/13b.py`）
+
+用户报告："会话粘性是不是有问题了。还有冷却的账户，为啥在账户面板不显示" → "面板刷新一下，冷却的账号就不冷却了，然后后续还会达到它"。
+
+### 诊断结论
+
+| 用户观察 | 结论 |
+|---|---|
+| 会话粘性"有问题" | **机制正常**（实测：同 `conversation_id` 两次请求固定落同一账号，`sticky_sessions` 0→1）。真实流量落不同账号是因为**客户端没发会话标识**（`ExtractKey` 只认 `conversation_id`/`conversationId`/`metadata.*` 四种形态）→ 设计上退化为纯轮转 |
+| 冷却账号在面板"不显示" | **账号级冷却显示正常**（实测 overview 返回 `cool_remaining_sec`/`cool_kind`，面板渲染出「限流冷却 · X分」）。真正缺口是**模型级 6004 限流**：`CooldownSoftForModel` 带 resetAt 时**不写账号级 until**（代码注释："6004 从不写账号级 until"）→ `Cooling=false` → `cool_remaining_sec` 不输出 → 面板显示「可用」；而 `rate_limited_models` 字段后端一直透出、**面板从未渲染**（上游面板也没有） |
+| ⭐ "刷新一下就不冷却了，后续还会达到它" | **真 bug**：`ReenableIfCredits` → `reviveCoolingLocked` → **无条件 `clearCoolingLocked`**（清整个冷却域，含 429/6004）。而 **每 5 分钟的余额后台刷新** + 面板「刷新」按钮（`balance_all` → `RunBalanceRefreshNow`）都走这条 → 撞 6004 的号 5 分钟内被解冻 → 立刻又被选中 → 再撞，死循环 |
+
+### 修复
+
+| 脚本 | 内容 |
+|---|---|
+| `fix_iter12.py` | 面板 `renderAccounts` 补渲染 `rate_limited_models` → 模型级限流显示「xxx 限流 · 剩余时间」（tooltip 列全部受限模型 + 到期时刻）；**不并入 `frozen`**（账号对其他模型仍可用，不该出现「解冻」按钮） |
+| `fix_iter13.py` | `reviveCoolingLocked` **只清 `CoolHard`**；同步三处文档注释（`transition.go` / `state.go` / `scheduler.go`） |
+| `fix_iter13b.py` | 更新两个锁定旧语义的测试：`TestCooldownSoftStreakResetByReenable` 改断言（不再归零 streak）；`TestTransitionReviveClearsCoolingKeepsBreaker` 拆为 3 例（Reenable 只清 Hard / Reenable 保留软+模型级 / Revive 全清） |
+| 新增测试 | `internal/pool/revive_soft_test.go`（2 例）；`internal/upstream/effort_warn_dedup_test.go`（3 例，属 §12 追加） |
+
+### 验证
+
+- `go build` + `go vet` + `go test`（19 包）**三项 EXIT=0**
+- **行为验证**：制造软冷却（`账号C` remain=254）→ 触发 `POST /panel/api/balance_all` →
+  **修复后 `cooling=True remain=251`**（时间正常流逝、未被解冻）；修复前同样操作会变成 `cooling=False`
+- 面板 overview 同刻：`cooling 计数 = 1`、该账号 `remain=251 kind=soft_rate` ✔
+- 备份 `/vol4/_panel_backup_2026-09-17_2056.tgz`
+
+### 副作用与逃生门
+
+- 签到（每天 09:00/21:00）也**不再解冻限流冷却** —— 限流窗口 8 分钟 vs 签到间隔 12 小时，影响可忽略，且语义正确（余额与配额无关）。
+- 需要强制解冻（含限流/熔断）→ 面板「解冻」按钮 → `Pool.Revive`（显式全清）✔
+
+### 已确认（2026-09-17 22:06，`fix_iter14.py`）：客户端确实不带会话标识
+
+加了一次性探测日志（`session.ProbeMissingKey` —— 只记**键名**不记值、同键集合去重）后，抓到客户端真实请求体：
+
+```
+[session] 未识别会话标识（粘性不生效）顶层键=[max_tokens messages model reasoning_effort stream stream_options tools] metadata 键=[]
+```
+
+→ **客户端（dsh）不带任何会话标识**：既无 `conversation_id`/`conversationId`，也无 `metadata`，
+也没有 `session_id`/`chat_id`/`thread_id` 等别名。与上游注释一致（"dsh / Codex / Cherry Studio 等
+请求体里既无 conversationId 也无 metadata"）。
+
+**结论**：粘性对这类客户端**设计上无法生效**（除非客户端支持注入会话字段）。
+上游已提供 `session.TurnKey(body)`（按最后一条 user 消息派生**轮**级键）做用量归因兜底，
+但那是"轮"不是"会话"，多轮对话无法用于固定账号。
+
+**代价**：`prompt_cache_key` 失去会话段（仅剩账号段）→ 同对话换号时上游前缀缓存 miss。
+
+### 上游对此的立场（2026-09-17 查证 `a9ccace` 源码）
+
+| 层面 | 机制 | 无标识客户端 |
+|---|---|---|
+| **粘性**（同对话固定账号） | `ExtractKey(body)` 只认 body 的 `conversation_id` / `conversationId` / `metadata.*` | **不粘**（设计边界，测试 `TestNoSessionKeyPassthrough` 锁定） |
+| **轮级聚合**（上游后台记账不碎片） | `TurnKey(body)` = **最后一条** user 消息的「序号 + 文本」→ 出站 `X-Conversation-Request-ID` | **能工作**，不依赖客户端配合 |
+| **会话级 ID** | `ResolveConversationID(body)` → 出站 `X-Conversation-ID` | **不发**（注释："透传优先，不伪造…避免误导后台建错会话"） |
+| **prompt_cache_key** | `wb2a-<uid8>-<convHex>`；conv 为空时 convHex = sha256(uid) 的定值 | 只剩**账号隔离段** → 同账号连续请求仍命中，换号即 miss |
+
+上游**明确否决**了"用首条消息推断会话"这条路 —— `TurnKey` 注释原文：
+
+> 为什么不取第一条 user 消息：首条在整个会话内不变，会把一次会话的所有轮并进同一个聚合键（跨对话轮混并）。取最后一条才对齐官方 `X-Conversation-Request-ID` 的「对话轮」语义。
+
+官方 CodeBuddy CLI 的正路是**在 body 里发 `conversationId`**（camelCase；上游 issue #35 就是修"此前只认 snake_case，
+导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss"）。
+
+→ **上游**没有可靠替代方案（`TurnKey` 解决的是**另一个问题**：无标识客户端在上游用量明细里"一条请求一条记录"的
+碎片化；它是轮级键，"用户发下一条消息自动换键"，拿来做粘性等于每轮换号）。
+
+### ⭐ 但**面板层本来就有解**（2026-09-17 22:2x 找到并恢复，`fix_iter15.py`）
+
+上面那段"结论：网关侧没有可靠替代方案"是**只看上游**得出的 —— 实际**面板基线 `3f55d50` 的
+`ExtractKey` 末尾有 `deriveKey` 兜底**，生产一直在用：
+
+```
+面板版：... return deriveKey(obj)      // SHA-256(system 文本 + 首条 user 文本) 前 16 字节，前缀 "d-"
+上游版：... return strOrEmpty(obj["conversationId"])   // 无标识 → 直接空
+```
+
+**换基时漏贴了它**（`deriveKey` 只在 `ExtractKey` 末尾内部调用、外部零引用 → 编译不报错）→ dsh 从"能粘"退化为"纯轮转"。
+恢复后实测：同一 body（仅一条 user）连发 3 次 → 全部落 `当时只道是寻常(<uid8-1>)`，`sticky_sessions` 2→3；
+真实客户端流量也明显集中（6 次同账号）。恢复脚本 `fix_iter15.py`（+`15b/15c` 适配
+`TestHandlerAppendTurnKeyStable`：该用例的反证要用**无开头 system 块**的 body 才成立，
+因为 `prompt.Append` 插在开头连续 system/developer 块**之后**）。
+
+> 教训：**"上游没有"≠"我们没有"**。审计面板层遗漏时必须回到**面板基线**找，不能只读上游源码下结论。
+
+---
+
+## 14. ⭐ 面板层遗漏审计（2026-09-17 22:2x–22:5x，`fix_iter15~20.py`）
+
+用户："继续，完成后再看看有没有其他面板改进了，我们遗漏了的。"
+—— 起因是 `deriveKey` 那次教训：**换基靠编译报错驱动，而"无外部引用"的面板增强不会报错**。
+
+### 14.1 审计方法（已固化成脚本，可重跑）
+
+| 脚本 | 作用 |
+|---|---|
+| `audit_panel_loss.py` | 按文件比对（v1）：能看出"符号搬家"（如 `school.go`→`school_api.go`），但假阳性多 |
+| **`audit_panel_loss2.py`** | **全树并集比对（推荐）**：只列「面板基线有、树里任何文件都没有」的符号，分「生产/测试」两组 |
+| `restore_panel_tests.py` | 按 `(文件, 函数名)` 从面板基线抽取用例（花括号配平 + 上邻注释）追加回树 |
+
+```bash
+python3 audit_panel_loss2.py <家目录>/docker/workbuddy2api-panel 3f55d50 /vol4/_rebase_try_B
+python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> internal/pool/pool_test.go:TestXxx ...
+```
+
+### 14.2 审计结果：生产代码 **49 个符号缺失，全部定性为 ①②**（无真丢失）
+
+| 定性 | 例子 |
+|---|---|
+| ① **上游等价替代**（改名/合并/拆分） | 错误分类表 `softRateMarkers`/`hardMarkers`/`contentBlockedMarkers`/`badParamsMarkerCode`… → `errorRule` 体系（`softRateRule`/`hardRule`/`contentBlockedRule`/`badParamsRule`/`alreadyCheckinRule`/`sessionDeadRule`/`accountFaultRule`）；`ParseSoftRateReset` → `ParseRateReset` + `IsModelRateLimit` 拆分；`PickExcluding`/`PickExcludingForModel` → `PickExcludingForRealm(tried, model, realm)` 三合一；`PickByUID` → `PickByUIDForModel`；`defaultWorkBuddyUA` → `defaultWorkBuddyUAFor`；`mergeGlobalModelInfos`/`parseGlobalModelInfos`/`staticGlobalModelInfos` → `mergeGlobalCatalog`/`parseGlobalModelNames`/`globalModelsProbePaths`；`modelEntry`（131072 兜底）→ `ContextWindowListingV4` 四级链；`fetchGlobalModelInfos`/`globalModels` → `FetchGlobalModelInfos`/`upstream.GlobalModelNames`；`turnSalt`/`requestIDs` → `deriveSalt`；`trunc` → `logfmt.Truncate`（还带 CJK 列宽） |
+| ② **有意退役** | `streak.*`（8 个：`RunStreakBonusNow`/`streakBonusAccount`/`GrowthRedeemTier`/`StreakFull`/`Lottery*`/`compactJSON`，层 1 决定）、`Handler.SetMaxBodyBytes`（max_body 退役）、`GlobalEnabled`（getter，无调用者）、`adoptReportGap`（领养前置上报被上游重构进活跃上报任务）、`cmd/credit` 的 `resourcePackage`/`packageRemainUsed`/`fetchUserResource`（上游改为 `ResourceSummary` 聚合口径，CLI-only） |
+
+### 14.3 测试网：**补回 19 条面板自有用例**（文件在 ≠ 用例在）
+
+面板测试**文件**都在我们树里，但**文件内的面板专属用例**在同步时被上游版覆盖掉了（丢测试不报错）。
+
+**补回并通过（19 条）**：`TestRecordTokenUsage`、`TestTokenUsagePersistsAcrossReload`、
+`TestSoftRateModelClearedByPlainCooldown`（pool）；`TestRunBalanceRefreshNowUpdatesCreditsAndRevives`（scheduler）；
+`TestRequestIDForKeyStability`（session）；`TestModelsDynamicFallsBackToStatic`（server）；
+`TestPrepareBodyDeterministic`、`TestBillingUA_WhenClientNameEmpty`（upstream）；
+`TestWriteDefault`、`TestLoadConfigPathIsDirectory`、`TestBalanceRefreshDefaults`、`TestPromptDefaultPassthrough`（cmd/server）。
+
+**判定为「上游有意反转旧语义」而删除（10 条，删除处都留了依据注释）**：
+
+| 用例 | 上游反转依据 |
+|---|---|
+| `TestModelCooldownsNotPersisted`、`TestSoftRateModelNotPersistedToState` | 上游 `stateAccount.ModelCooldowns` 带 `json:"model_cooldowns"`（**持久化**），上游自带用例反过来断言"必须落盘" |
+| `TestCooldownSoftExponentialBackoff`、`TestApplyErrorPolicySoftRateExponentialBackoff` | 上游只在**进入新冷却**时推进退避；自带 `TestCooldownSoftBoundedBackoffIfNotCooling` + `TestCooldownSoftRateNoDoubleWhenAlreadyCooling`（注释原文："旧实现每次都 softStreak++ 指数翻倍，把全池推到 2h 封顶"） |
+| `TestModelsFetchFailurePenalizesAccount` | 上游 `fetchDynamicModels` 明文"只进负缓存，**不 NoteError**（P1-6/发现 6）：models 端点偶发 5xx 会跨界惩罚 chat 通道健康的账号" |
+| `TestParseSoftRateReset`（我们恢复的那份） | 与上游自带 `TestParseRateReset` 重名；上游注释写明"旧语义（非 6004 带时间 → false）是**有意推翻**的：11140 rate-limiting 变体带重置时间时同样应对齐" |
+| `TestFetchModelsDefaultEffortDualKeyAndSizes` | 上游只把 `reasoning.defaultEffort` 映射到 `DefaultEffort`；`reasoning.effort` 走 `ReasoningEffort`（**单档**语义），自带 `TestParseGlobalModelNamesSingleEffort` 断言 defaults 为空 |
+| `TestMergeModelCapabilitiesKeepsCLIWhenOverlayEmpty`、`TestFetchModelsOverlaysV3ConfigCapabilities` | `mergeModelCapabilities`/`codeBuddyIDEUA` 已被上游 v3 合并机制取代；上游自带 8 个 v3 合并用例（双域/降级/去重/稳定输出）覆盖更全 |
+
+**适配点（上游签名变化）**：`SetCredits(uid,credits,total)`→`(uid,credits)`；
+`PickExcludingForModel(t,m)`→`PickExcludingForRealm(t,m,"")`；`applyErrorPolicy` 补第 5 参 `*upstream.Error`；
+`UserResource` 3 返回值→2；`cmd/server/config_test.go` 补 `time` import。
+
+### 14.4 顺带修正的一条文档结论
+
+§13 里"网关侧没有可靠替代方案"是**只看上游**得出的 —— 面板基线本就有 `deriveKey` 兜底，
+换基时漏贴（无外部引用 → 编译不报错）。已恢复并实测生效。**教训：审计必须回到面板基线找，不能只读上游下结论。**
+
+### 14.5 验证
+
+`go build` + `go vet` + `go test`（19 包）**三项 EXIT=0**（无需 TZ）。
+本轮**只改测试文件**（rsync dry-run 确认 9 个 `_test.go`，无生产文件变更）→ **生产二进制不变，无需重建容器**；
+已 rsync 到面板目录保持仓库一致。
+
+---
+
+## 15. ⭐ 采纳上游未合并 PR #161 的第 ①③ 项（2026-09-18 01:05–01:15，提交 `255711d`）：已上线
+
+用户线索："上游库好像有授权相关的更新"。核查后：**两个上游都没有新提交**
+（`linguo2625469/workbuddy2api-panel` @ `4f18f7f`、`Sliverkiss/workbuddy2api` @ `9d1a21b`，
+`git ls-remote` 双向确认）→ 真正的新东西是**未合并的 PR**：
+`https://github.com/Sliverkiss/workbuddy2api/pull/161`（`cold-summer`，4 提交 / 953 行）。
+
+### 为什么必须落 ①（这是**线上正在踩的 bug**，不是优化）
+
+```
+本仓正则:   softRateResetPattern = `将在 (.+?) 重置`                       ← 只认中文
+线上真实:   {"code":6004,"msg":"usage exceeds frequency limit, but don't worry,
+             your usage will reset at 2026-09-18 13:26:07 UTC+8, ..."}      ← 英文
+```
+→ `ParseRateReset` 解析失败 → 落「无 resetAt」有界退避分支 →
+**① `softStreak` 指数翻倍**（10→20→40→80→120min 封顶，因为冷却刚到期就被新 429 判定为"新限流"）；
+**② 走账号级冷却并清空 `modelCooldowns`** → **一个模型被限流，该号其余模型也全部不可用**
+（而上游文案原话就是"可以切其他模型继续用"）。
+
+日志实证（近 12h）：`账号B` / `账号A` / `账号C` 反复撞该英文 body。
+
+### 落了什么
+
+| 项 | 落否 | 落地要点 |
+|---|---|---|
+| ① `ParseRateReset` 补英文形态 | ✅ | 正则拆 CN/EN；EN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`（**锚定时间格式**，不捕获 `reset at the end of the day` 这类自然语言）；先 CN 后 EN。3 个 hunk 均 `git apply` 干净（offset 1） |
+| ③ `auths` 目录热加载 | ✅ | 新文件 `internal/pool/watch.go`(130) + `watch_test.go`(196)；`cmd/server/main.go` 挂 `p.StartAuthDirWatch(cfg.AuthDir)`（1 hunk，offset 25）。**必改 import**：PR 用 `workbuddy2api/internal/auth`，本仓模块名 `github.com/linguo2625469/workbuddy2api-panel` |
+| ② `/v1/stats` 统计端点 | ❌ | 本仓 `chatStatsReader` 已被**面板层**改写为 pointer 语义（`promptTokens`/`completionTokens`/`has*`），PR 用的 `s.prompt`/`s.tokens` 不存在 → 需手工适配；且本仓面板不调该端点 |
+| `dev.sh` / `.gitignore` | ❌ | 上游开发脚本，与本仓部署方式无关 |
+
+### 验收（实测，非推断）
+
+- `go build` / `go vet` / `go test`（19 包）**三项 EXIT=0**；
+- 新增用例全过：`TestParseRateReset_English`(4 子例) + `TestStartAuthDirWatchNoopOnBadDir` /
+  `TestReloadAuthDirAddsAccount` / `TestReloadAuthDirPreservesState` / `TestReloadAuthDirRemovesDeleted`；
+- **①用线上真实 body 单测**（临时用例，验完即删）：`ParseRateReset` → `2026-09-18 13:26:07 (UTC+8)` ✅；
+- **③端到端**：宿主机用户无权 `touch auths/*.json`（属主是容器 uid 10001）→ 改用同 uid 辅助容器
+  `docker run --rm -u 10001:10001 -v <auths>:/a golang:1.23-alpine touch /a/<f>` →
+  9s 内日志出 `[watch] auths 目录变化：账号数保持 11（已热加载凭证更新）`，
+  且 `/status` 的 `total=12 healthy=11 cooling=1 sticky=3` **与改前完全一致**（状态未被重置）✅；
+- 容器 `Up (healthy)`，重启后立刻有 200 流式请求落库。
+
+### ⚠️ 顺手发现的一个仓库卫生问题（未处理，已写进 PORTING.md 禁止事项）
+
+部署仓库 `<家目录>/docker/workbuddy2api-panel` 的**工作树领先 git HEAD `657856e` 共 63 个文件**
+（+3333/−527，含 `internal/pool/*.go`、`internal/upstream/sse.go` 等**生产文件**）。
+容器是 `build: .`（构建**工作树**而非 HEAD）→ 部署行为正确，但 **HEAD 不是部署真相**。
+**别用 `git checkout .` / `git stash` / `git reset --hard`**，会丢掉未提交的换基成果。
+
+---
+
 ## 附录 A · 上游 59 提交主题分布（供对照）
 
 | 主题 | 关键提交 |
