@@ -9,10 +9,10 @@
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
-//	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支
+//	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
-//	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
-//	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess/reviveCoolingLocked 清
+//	breakerUntil       ← recordBreakerFailureLocked（NoteError 喂入）；NoteSuccess 清
+//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/reviveCoolingLocked 清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：
@@ -38,9 +38,9 @@ func (e *entry) clearCoolingLocked() {
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
 //
-// 旧 Disable 只置 disabled+reason，不碰 until/modelCooldowns/softStreak，会出现
-// 「disabled=true 但 cooling=true / 残留 modelCooldowns」的一致性问题——一个先被
-// 硬冷却（到次日 04:00）再被禁用的账号会同时呈现两种状态。禁用后冷却无意义
+// 疑点 4 修正：旧 Disable 只置 disabled+reason，不碰 until/modelCooldowns/softStreak，
+// 会出现「disabled=true 但 cooling=true / 残留 modelCooldowns」的一致性问题——一个
+// 先被硬冷却（到次日 04:00）再被禁用的账号会同时呈现两种状态。禁用后冷却无意义
 // （账号已退出选号，冷却截止不再被读取），故一并清空。
 //
 // 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
@@ -53,14 +53,13 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 }
 
 // reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits/creditsTotal，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
+// 并更新 credits，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
 // 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
 // 信号）不应被签到覆盖。
 // softStreak 属冷却域（与 until/coolKind 同域），随冷却一并清零——与「解冻只清冷却
-// 不清熔断」的既有语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
+// 不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
 // 历史软冷却累积。调用方必须已持有 p.mu。
-func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
+func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.credits = credits
-	e.creditsTotal = total
 	e.clearCoolingLocked()
 }

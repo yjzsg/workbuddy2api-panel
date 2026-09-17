@@ -95,7 +95,7 @@ func TestTransitionDisablePreservesBreaker(t *testing.T) {
 		t.Errorf("Disable 后 fails=%d（已置 0，不应被 Disable 刻意改动）", fails)
 	}
 	// disabled 优先：即使熔断仍在，账号也不可选。
-	if got := p.Pick(); got != nil {
+	if got := p.Pick(""); got != nil {
 		t.Fatalf("disabled 账号不可选（含熔断期），got %+v", got)
 	}
 }
@@ -142,7 +142,7 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1")
 
-	p.ReenableIfCredits("u1", 700, 0)
+	p.ReenableIfCredits("u1", 700)
 
 	st, _ := p.Status("u1")
 	if st.Credits != 700 {

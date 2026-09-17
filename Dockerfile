@@ -1,7 +1,12 @@
-# syntax=docker/dockerfile:1
+# [local patch] 原第1行为 # syntax=docker/dockerfile:1，已移除：NAS 镜像站 docker.fnnas.com 对该镜像返回 401；本 Dockerfile 未使用 BuildKit 专有语法
 FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod ./
+# [local patch] 国内网络：proxy.golang.org 不可达，改用国内模块代理（可用 --build-arg 覆盖）
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+ARG GOSUMDB=sum.golang.google.cn
+ENV GOSUMDB=${GOSUMDB}
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
@@ -25,6 +30,7 @@ COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
+COPY scripts/global_region.py /app/scripts/global_region.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.json

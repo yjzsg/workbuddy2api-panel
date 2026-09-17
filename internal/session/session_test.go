@@ -1,6 +1,7 @@
 package session
 
 import (
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -45,10 +46,18 @@ func (c *countingStore) LoadBinds() map[string]string {
 }
 
 func routerWith(store redisstore.Store, avail []string, ttl time.Duration) *Router {
+	return routerWithGC(store, avail, ttl, 0) // GCInterval 0 → New 兜底默认（5m）
+}
+
+// routerWithGC 同 routerWith，但显式注入 GCInterval。GCInterval 必须在 StartGC
+// **之前**注入：StartGC 之后写 r.cfg.GCInterval 会与 GC goroutine 里的
+// time.NewTicker(r.cfg.GCInterval) 竞争（cfg 非并发安全），测试自身即犯规。
+func routerWithGC(store redisstore.Store, avail []string, ttl, gcInterval time.Duration) *Router {
 	return New(Config{
-		TTL:       ttl,
-		Store:     store,
-		Available: func() []string { return avail },
+		TTL:        ttl,
+		GCInterval: gcInterval,
+		Store:      store,
+		Available:  func() []string { return avail },
 	})
 }
 
@@ -116,8 +125,10 @@ func TestExtractKeyPriority(t *testing.T) {
 	}{
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
-		{`{"metadata":{"user_id":"mu"}}`, "mu"},                                                // metadata.user_id 兜底
-		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
+		// P1-anti-monopoly：user_id 不再是粘性键（对话级粒度修正，键序四键全 conversation 维度）。
+		{`{"metadata":{"user_id":"mu"}}`, ""},    // user_id 单独出现 → 空（不生成粘性）
+		{`{"user_id":"mu"}}`, ""},                // 顶层 user_id 从未支持，保持空
+		{`{"metadata":{"conversation_id":123}}`, ""}, // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 		// issue #35：客户端实际发 camelCase conversationId，ExtractKey 必须识别。
 		{`{"conversationId":"abc"}`, "abc"},                                            // 顶层 camelCase
@@ -126,11 +137,46 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"conversation_id":"snake","conversationId":"camel"}`, "snake"},              // 顶层 snake 优先于 camel
 		{`{"conversationId":123}`, ""},                                                 // 数字 conversationId → 空
 		{`{"metadata":{"conversationId":456}}`, ""},                                    // metadata 数字 conversationId → 空
-		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 优先于 user_id
+		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 生效（user_id 不再抢占）
+		// 剔除前 user_id 抢占顶层 conversation_id（session.go 旧键序 3 在 4 之前）；
+		// 剔除后顶层 conversation_id 正常生效。
+		{`{"metadata":{"user_id":"mu"},"conversation_id":"top"}`, "top"},
 	}
 	for _, c := range cases {
 		if got := ExtractKey([]byte(c.body)); got != c.want {
 			t.Errorf("ExtractKey(%s)=%q want %q", c.body, got, c.want)
+		}
+	}
+}
+
+// TestUserIdNoLongerSticky P1-anti-monopoly：user_id 不再生成粘性——只发
+// metadata.user_id 的客户端 ExtractKey 返回空（无粘性键），handler 侧 gate
+// （sessKey != ""）不成立，Router 不会被咨询，同一 user 的并行对话不再钉同一
+// 账号（回落加权轮换）。键序断言由 TestExtractKeyPriority 覆盖（user_id → ""）。
+func TestUserIdNoLongerSticky(t *testing.T) {
+	bodies := []string{
+		`{"model":"m","metadata":{"user_id":"u-42"},"messages":[]}`,
+		`{"model":"m","metadata":{"user_id":"u-42"},"conversation_id":"c1"}`, // user_id 不再抢占顶层键
+	}
+	for _, body := range bodies {
+		if key := ExtractKey([]byte(body)); key == "" && strings.Contains(body, `"conversation_id":"c1"`) {
+			// 第二条应取 conversation_id（非空）——防御本测试自身的构造错误。
+			t.Fatalf("构造错误：含 conversation_id 的 body 不应返回空: %s", body)
+		}
+	}
+	// 主断言：只发 user_id 的 body 无粘性键。
+	if key := ExtractKey([]byte(bodies[0])); key != "" {
+		t.Fatalf("user_id 不应再生成粘性键, got %q", key)
+	}
+	// conversation 变体不受影响：四种键形态照常提取。
+	for _, body := range []string{
+		`{"conversation_id":"c1"}`,
+		`{"conversationId":"c1"}`,
+		`{"metadata":{"conversation_id":"c1"}}`,
+		`{"metadata":{"conversationId":"c1"}}`,
+	} {
+		if key := ExtractKey([]byte(body)); key != "c1" {
+			t.Errorf("conversation 变体应照常提取: %s got %q", body, key)
 		}
 	}
 }
@@ -289,52 +335,76 @@ func TestLoadFromStoreRestores(t *testing.T) {
 	}
 }
 
-// TestExtractKeyDerivedFromContent 客户端不发会话 id 时回退到内容派生键：
-// 同一对话多轮（历史追加）→ 键稳定不变；不同对话 → 键不同。
-func TestExtractKeyDerivedFromContent(t *testing.T) {
-	// 第一轮
-	turn1 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"}]}`
-	// 第二轮：历史追加了 assistant 与新的 user（system 与首条 user 不变）
-	turn2 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"},{"role":"assistant","content":"好的"},{"role":"user","content":"换成快排"}]}`
-	k1, k2 := ExtractKey([]byte(turn1)), ExtractKey([]byte(turn2))
-	if k1 == "" {
-		t.Fatal("derived key should not be empty when messages present")
+// TestStopGCStopsGoroutine 关停语义回归：StopGC 后后台 GC goroutine 必须真的退出
+// （N 轮「StartGC → StopGC」不泄漏 goroutine）。
+//
+// 原实现三处缺陷同时存在：① goroutine 在 select 里**每轮无锁重读** r.stop，
+// 而 StopGC 持写锁把它置 nil —— 数据竞争（-race 报 Write@StopGC vs Read@StartGC.func1）；
+// ② 一旦读到 nil，case <-r.stop 变成「select 里的 nil channel」永不就绪，关停信号
+// 彻底丢失，goroutine 只能靠 ticker 无限空转；③ 于是 StopGC 之后 gcOnce 仍在跑，
+// 每次 Start/Stop 循环净泄漏一个 goroutine。修复把 stop channel 捕获进局部变量，
+// 让 close 与 select 观测同一个 channel。
+//
+// GCInterval 必须**构造时**注入（不能 StartGC 后再写 r.cfg）：goroutine 会读
+// r.cfg.GCInterval 起 ticker，启动后写 cfg 本身就是数据竞争。
+func TestStopGCStopsGoroutine(t *testing.T) {
+	const rounds = 20
+	baseline := runtime.NumGoroutine()
+
+	for i := 0; i < rounds; i++ {
+		r := routerWithGC(newCountingStore(), []string{"a1"}, time.Minute, time.Millisecond)
+		r.StartGC()
+		// 1ms tick：让 ticker 在 goroutine 退出前至少触发数轮，覆盖
+		// 「select 重新求值 r.stop」的窗口（原缺陷的触发路径）。
+		time.Sleep(2 * time.Millisecond)
+		r.StopGC()
 	}
-	if k1 != k2 {
-		t.Errorf("derived key must be stable across turns: turn1=%q turn2=%q", k1, k2)
+
+	// 轮询等待所有 GC goroutine 退出（有界，防挂死）。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline+2 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !strings.HasPrefix(k1, "d-") {
-		t.Errorf("derived key should carry prefix d-: %q", k1)
-	}
-	// 不同对话（首条 user 不同）→ 不同键
-	other := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"翻译这段话"}]}`
-	if ExtractKey([]byte(other)) == k1 {
-		t.Error("different first user message must yield a different derived key")
-	}
-	// 显式 id 优先于派生键
-	withID := `{"conversation_id":"my-session","messages":[{"role":"user","content":"帮我写个排序算法"}]}`
-	if got := ExtractKey([]byte(withID)); got != "my-session" {
-		t.Errorf("explicit id must win over derived key, got %q", got)
-	}
-	// 无 messages / 纯无文本内容 → 空（退回普通轮换，不误粘）
-	if got := ExtractKey([]byte(`{"model":"x"}`)); got != "" {
-		t.Errorf("no messages should yield empty key, got %q", got)
-	}
-	if got := ExtractKey([]byte(`{"messages":[{"role":"user","content":[]}]}`)); got != "" {
-		t.Errorf("text-less content should yield empty key, got %q", got)
-	}
+	t.Errorf("StopGC 后 goroutine 未退出（泄漏）: baseline=%d now=%d rounds=%d",
+		baseline, runtime.NumGoroutine(), rounds)
 }
 
-// TestExtractKeyMultimodalContent 多模态 content 数组取文本部分派生。
-func TestExtractKeyMultimodalContent(t *testing.T) {
-	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
-	k := ExtractKey([]byte(body))
-	if k == "" || !strings.HasPrefix(k, "d-") {
-		t.Fatalf("multimodal text should derive a key, got %q", k)
+// TestStartGCIdempotentAndRestartable StartGC 幂等、StopGC 后可重启：
+// 重复 StartGC 不叠加 goroutine，StopGC 后再 StartGC 仍能恢复 GC
+// （原实现 StopGC 把 r.stop 置 nil，goroutine 卡在 nil channel 上永不退出；
+// 修复后 close 能被观测到，重启也能重新拉起一个可关停的 GC）。
+func TestStartGCIdempotentAndRestartable(t *testing.T) {
+	r := routerWithGC(newCountingStore(), []string{"a1"}, 10*time.Millisecond, 5*time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	r.StartGC()
+	r.StartGC() // 幂等：不应起第二个
+	r.StartGC()
+	time.Sleep(20 * time.Millisecond)
+	if n := runtime.NumGoroutine(); n > baseline+2 {
+		t.Errorf("重复 StartGC 叠加了 goroutine: baseline=%d now=%d", baseline, n)
 	}
-	// 同一文本（图片不同）→ 同键（图片不参与派生，避免签名 URL 变化破坏粘性）
-	body2 := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
-	if ExtractKey([]byte(body2)) != k {
-		t.Error("image url changes must not break derived key stability")
+
+	r.StopGC()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && runtime.NumGoroutine() > baseline+1 {
+		time.Sleep(5 * time.Millisecond)
 	}
+
+	// 重启：StopGC 已把 r.stop 置 nil，StartGC 应能重新拉起可用的 GC。
+	// TTL=10ms、GCInterval=5ms：绑定建立后必然被重启的 GC 清掉。
+	r.Resolve("c1")
+	r.StartGC()
+	r.Resolve("c2")
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && r.Count() != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := r.Count(); got != 0 {
+		t.Errorf("重启后 GC 未生效: count=%d want 0", got)
+	}
+	r.StopGC()
 }

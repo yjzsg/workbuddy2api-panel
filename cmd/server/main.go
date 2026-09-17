@@ -30,7 +30,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.9.2-panel"
+const appVersion = "1.10.1-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -44,6 +44,16 @@ func stateSibling(stateFile, name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
+}
+
+// modelJSONPath 由 state.json 路径推导 model.json 路径（同目录同名换缀）：
+// 两者同为数据目录持久化物（Docker ./data volume），配套而非各自配置。
+// state 路径为空（纯内存测试形态）→ 空 = 禁用 model.json 落盘（内存 + 种子仍可用）。
+func modelJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "model.json")
 }
 
 func main() {
@@ -88,7 +98,10 @@ func main() {
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池。
+	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
@@ -147,6 +160,11 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
+	// model.json 本地缓存接线（context_length 四级查找链第 3 级）：数据目录与
+	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
+	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
+	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -154,14 +172,25 @@ func main() {
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		// 面板配置词汇 blackcat_hours ↔ scheduler 内部 Cat 域（夜猫子，23:00–08:00 窗口）。
+		CatHours: cfg.Schedule.BlackcatHours,
+		// 开学季任务（Go API 闭环：四任务 + 抽奖；活动期外静默跳过）。
+		SchoolHours: cfg.Schedule.SchoolHours,
+		// CN 邀请活动（面板层）：绑码 + 每天一次桌面事件链。
+		CNInviteCode:    cfg.Schedule.CNInviteCode,
+		CNInviteHours:   cfg.Schedule.CNInviteHours,
+		CNInviteUntil:   cfg.Schedule.CNInviteUntil,
+		CNInviteDisabled: !cfg.Schedule.CNInviteEnabled,
+		// 活跃上报条数（上游语义：领猫前置需 5 次对话）。
+		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		CatDisabled:        !cfg.Schedule.BlackcatEnabled,
+		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -179,7 +208,7 @@ func main() {
 	case !cfg.Schedule.ActivityEnabled:
 		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
 	default:
-		log.Printf("活跃上报已启用：%v 点（每日 1 次，点亮连登 + 解锁 first_buddy）", cfg.Schedule.ActivityHours)
+		log.Printf("活跃上报已启用：%v 点（每号 %d 条，点亮连登 + 补满领猫对话门槛）", cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
 	}
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
@@ -191,6 +220,19 @@ func main() {
 		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
 	default:
 		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
+	}
+	switch {
+	case !cfg.Schedule.SchoolEnabled:
+		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
+	default:
+		log.Printf("开学季任务已启用：%v 点（Go API 闭环：四任务 + 抽奖）", cfg.Schedule.SchoolHours)
+	}
+	switch {
+	case !cfg.Schedule.CNInviteEnabled:
+		log.Printf("CN 邀请活动已禁用（schedule.cn_invite_enabled=false）")
+	default:
+		log.Printf("CN 邀请活动已启用：%v 点（每号绑码 + 桌面事件链；窗口至 %s，码 %s）",
+			cfg.Schedule.CNInviteHours, cfg.Schedule.CNInviteUntil, cfg.Schedule.CNInviteCode)
 	}
 	switch {
 	case !cfg.Schedule.BalanceRefreshEnabled:
@@ -284,6 +326,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
+		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
+		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。
+		if cErr := store.Close(); cErr != nil {
+			log.Printf("WARN: [server] redisstore close: %v", cErr)
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -311,7 +359,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
+//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
 //
@@ -363,15 +411,21 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
+	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
+		newCfg.Schedule.SchoolHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
+		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
+		!newCfg.Schedule.SchoolEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetCNInvite(newCfg.Schedule.CNInviteCode, newCfg.Schedule.CNInviteHours,
+		newCfg.Schedule.CNInviteUntil, !newCfg.Schedule.CNInviteEnabled)
 	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {

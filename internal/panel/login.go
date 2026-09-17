@@ -246,7 +246,6 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
 	checkinMsg := ""
 	remain := int64(-1)
-	total := int64(0)
 	if sess.realm == "global" {
 		// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
 		// 失败不阻断登录结果（auth 已落盘），只在返回字段里体现。
@@ -268,9 +267,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 			checkinMsg = err.Error()
 		}
 	}
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-		remain, total = rm, tt
-		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
+	if rm, err := p.cfg.Upstream.UserResource(a); err == nil {
+		remain = rm
+		p.cfg.Pool.ReenableIfCredits(acct.UID, rm)
 	}
 
 	p.loginMu.Lock()
@@ -283,7 +282,6 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"nickname":        acct.Nickname,
 		"realm":           sess.realm,
 		"credits":         remain,
-		"credits_total":   total,
 		"checkin_message": checkinMsg,
 	})
 }

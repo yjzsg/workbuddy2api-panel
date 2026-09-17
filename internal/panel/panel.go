@@ -167,6 +167,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
 	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
+	// CN 邀请活动（面板层新增）：只读状态 + 立即执行一轮。
+	p.mux.HandleFunc("GET /panel/api/cninvite/status", p.withAuth(p.cnInviteStatus))
+	p.mux.HandleFunc("POST /panel/api/cninvite/run", p.withAuth(p.cnInviteRun))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
@@ -243,7 +246,7 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 // 无可用账号 503（先添加账号）；上游失败 502。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	acct := p.cfg.Pool.Pick()
+	acct := p.cfg.Pool.Pick("")
 	if acct == nil {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
@@ -255,19 +258,42 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":                   mi.ID,
 			"name":                 mi.Name,
-			"context_length":       mi.ContextWindow,
-			"max_output_tokens":    mi.MaxTokens,
-			"max_allowed_size":     mi.MaxAllowedSize,
 			"default_effort":       mi.DefaultEffort,
 			"supported_efforts":    mi.Efforts,
 			"can_disable_thinking": mi.CanDisableThinking,
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
-		})
+			"description":          mi.Description,
+			"tags":                 mi.Tags,
+			"vendor":               mi.Vendor,
+			"is_default":           mi.IsDefault,
+			"supports_tool_call":   mi.SupportsToolCall,
+			"only_reasoning":       mi.OnlyReasoning,
+			"reasoning_effort":     mi.ReasoningEffort,
+			"reasoning_summary":    mi.ReasoningSummary,
+		}
+		if mi.MaxAllowedSize > 0 {
+			entry["max_allowed_size"] = mi.MaxAllowedSize
+		}
+		// 与 /v1/models 同口径：context_length / max_output_tokens 走四级查找链
+		// （上游动态值 → 静态知识表 → model.json → models.dev → 1M 兜底），
+		// effort 档位走 EffortListing（远端权威 ∪ CN 静态兜底表）——面板展示的
+		// 数值即客户端实际拿到的数值，两侧不再漂移。
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, p.cfg.Upstream.HTTP)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
+			entry["max_output_tokens"] = mo
+		}
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_efforts"] = efforts
+			if def != "" {
+				entry["default_effort"] = def
+			}
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
@@ -357,16 +383,15 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, err := p.cfg.Upstream.UserResource(a)
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	p.cfg.Pool.ReenableIfCredits(uid, remain)
 	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d", uid, checkinMsg, remain)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -378,13 +403,13 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, err := p.cfg.Upstream.UserResource(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	p.cfg.Pool.SetCredits(uid, remain)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。

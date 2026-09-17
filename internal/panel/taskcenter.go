@@ -525,7 +525,7 @@ func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunSchoolNow()
+	go p.cfg.Scheduler.RunSchoolAllNow()
 	log.Printf("panel: 开学季全账号闭环已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }

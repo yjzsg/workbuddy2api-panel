@@ -64,17 +64,21 @@ func (s *chatStat) done() {
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
-	br                  *bufio.Reader
-	start               time.Time
-	ttfb                time.Duration
-	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
+	br        *bufio.Reader
+	start     time.Time
+	ttfb      time.Duration
+	seen      bool // 已见过首个 data 帧（TTFB 只记一次）
+	hasUsage  bool // 末帧是否带 usage
+	hasCredit bool // 是否出现过带 credit 的 usage（缺失≠0，见 Credit() 注释）
+	// 面板层：分字段 pointer 语义（区分「缺失」与「显式 0」），供 Usage() 透出。
 	promptTokens        int
 	completionTokens    int
 	totalTokens         int
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
-	pend                []byte // 已读未返回的行缓存
+	credit              float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
+	pend                []byte  // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -86,9 +90,17 @@ func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
-func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
+func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasUsage }
 
-// Usage 返回流式响应中已收到的 token usage 字段。
+// Credit 返回末帧 usage.credit（本次真实扣费）。ok=true 要求 usage 存在**且** credit
+// 字段显式出现——字段缺失时 ok=false（缺失≠0：不能把"缺观测"当"0 成本"写入账本，
+// 否则收费的号可能被误判 tier0 免费层）。显式 credit:0 仍是合法免费观测（ok=true）。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasUsage && s.hasCredit }
+
+// TotalTokens 返回本次请求总 token 数（prompt + completion），供成本单价折算。
+func (s *chatStatsReader) TotalTokens() int { return s.promptTokens + s.completionTokens }
+
+// Usage 返回流式响应中已收到的 token usage 字段（面板用量记录用）。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	return pool.TokenUsageDelta{
 		HasPromptTokens:     s.hasPromptTokens,
@@ -116,14 +128,16 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			PromptTokens     *int `json:"prompt_tokens"`
-			CompletionTokens *int `json:"completion_tokens"`
-			TotalTokens      *int `json:"total_tokens"`
+			PromptTokens     *int     `json:"prompt_tokens"`
+			CompletionTokens *int     `json:"completion_tokens"`
+			TotalTokens      *int     `json:"total_tokens"`
+			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
+	s.hasUsage = true
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
 		s.promptTokens = *chunk.Usage.PromptTokens
@@ -135,6 +149,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	if chunk.Usage.Credit != nil {
+		s.hasCredit = true
+		s.credit = *chunk.Usage.Credit
 	}
 }
 
@@ -156,27 +174,6 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 	return 0, err
 }
 
-// rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
-// 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
-func rewriteModel(body []byte, bare string) []byte {
-	if len(body) == 0 || bare == "" {
-		return body
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
-	}
-	if cur, ok := obj["model"].(string); !ok || cur == bare {
-		return body
-	}
-	obj["model"] = bare
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
-}
-
 // parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
 func parseModelFromBody(body []byte) string {
 	var obj struct {
@@ -187,6 +184,8 @@ func parseModelFromBody(body []byte) string {
 	}
 	return obj.Model
 }
+
+// ---- 面板层贴回（P4-0 层 4）----
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
 func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
@@ -228,6 +227,7 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	return delta
 }
 
+
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
 func completionTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
@@ -239,6 +239,22 @@ func completionTokens(resp map[string]any) int {
 		return -1
 	}
 	return int(v)
+}
+
+// usageCreditTotal 从聚合响应提取本次真实扣费与总 token 数（供成本账本）。
+// ok=false 表示 usage 缺失或字段类型不符——此时不记录观测，避免污染账本。
+func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
+	u, isMap := resp["usage"].(map[string]any)
+	if !isMap {
+		return 0, 0, false
+	}
+	c, hasCredit := u["credit"].(float64)
+	pt, hasPrompt := u["prompt_tokens"].(float64)
+	ct, hasCompletion := u["completion_tokens"].(float64)
+	if !hasCredit || (!hasPrompt && !hasCompletion) {
+		return 0, 0, false
+	}
+	return c, int(pt) + int(ct), true
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

@@ -16,7 +16,7 @@ func benchPool(b *testing.B) *Pool {
 	p := New("")
 	for i := 0; i < 46; i++ {
 		p.Add(&auth.Auth{UID: fmt.Sprintf("u%02d", i)})
-		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900), 0)
+		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900))
 	}
 	return p
 }
@@ -26,7 +26,7 @@ func BenchmarkPick46Accounts(b *testing.B) {
 	p := benchPool(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.Pick()
+		p.Pick("")
 	}
 }
 

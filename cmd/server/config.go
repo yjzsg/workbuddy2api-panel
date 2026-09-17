@@ -16,6 +16,9 @@ import (
 )
 
 // Config 顶层配置。
+// defaultCNInviteCode CN 邀请活动默认邀请码（九洲的码，2026-09-17 起）。
+const defaultCNInviteCode = "evaxd5iz16ln"
+
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
@@ -46,6 +49,7 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（Go API 闭环，活动期外静默跳过）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -60,6 +64,18 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 关开学季
+
+		// CN 邀请活动（workbuddy.cn）：好友首次使用 +50（基础奖）、7 日内累计使用 3 天 +100（活跃奖）。
+		// 排程每天对每个 CN 账号发一次桌面六事件链（网关对话不算"使用"），并幂等绑码。
+		CNInviteCode    string `json:"cn_invite_code"`    // 邀请码；缺省 evaxd5iz16ln（九洲的码）
+		CNInviteHours   []int  `json:"cn_invite_hours"`   // [10] 每日执行时点
+		CNInviteUntil   string `json:"cn_invite_until"`   // "2026-09-24" 活动窗口截止日（含当天）
+		CNInviteEnabled bool   `json:"cn_invite_enabled"` // 缺省 true；false = 关本任务
+
+		// ActivityReportCount 每号每次活跃上报的条数（上游语义：领猫前置需 5 次对话，
+		// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为）。
+		ActivityReportCount int `json:"activity_report_count"` // 缺省 5
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -132,9 +148,16 @@ type Config struct {
 
 	Pool struct {
 		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
 		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+		// 并存取更长者不叠加。默认 5 次 / 10m。
+		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长，默认 "10m"
+		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权封顶，默认 "2h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
@@ -153,6 +176,8 @@ type Config struct {
 	SoftRateMaxDur         time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
+	DegradeCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownMaxD    time.Duration `json:"-"`
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
@@ -182,6 +207,13 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.SchoolHours = []int{12}
+	c.Schedule.SchoolEnabled = true
+	c.Schedule.CNInviteCode = defaultCNInviteCode
+	c.Schedule.CNInviteHours = []int{10}
+	c.Schedule.CNInviteUntil = "2026-09-24"
+	c.Schedule.CNInviteEnabled = true
+	c.Schedule.ActivityReportCount = 5 // 领猫前置需 5 次对话（上游语义）
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Upstream.TimeoutSeconds = 120
@@ -197,6 +229,10 @@ func Default() *Config {
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
+	c.Pool.MaxInFlightGlobal = 2 // global 域风控更紧，压低单号并发（WAF 403 修复 P1-1）
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
@@ -384,6 +420,12 @@ func (c *Config) normalize() error {
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)
 	}
@@ -396,8 +438,25 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("pool.expiring_soon: %w", err)
 		}
 	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// 连败降权参数缺省归一（非法/未设置回落默认，与 breaker_threshold 同风格）。
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
+	}
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
+	}
+	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
+	if c.Pool.MaxInFlightGlobal <= 0 {
+		c.Pool.MaxInFlightGlobal = 2
 	}
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5
@@ -435,6 +494,22 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
+	}
+	if len(c.Schedule.SchoolHours) == 0 {
+		c.Schedule.SchoolHours = []int{12}
+	}
+	// CN 邀请：老 config 没有这些键 → 补默认（要关就显式 cn_invite_enabled=false）。
+	if c.Schedule.CNInviteCode == "" {
+		c.Schedule.CNInviteCode = defaultCNInviteCode
+	}
+	if len(c.Schedule.CNInviteHours) == 0 {
+		c.Schedule.CNInviteHours = []int{10}
+	}
+	if c.Schedule.CNInviteUntil == "" {
+		c.Schedule.CNInviteUntil = "2026-09-24"
+	}
+	if c.Schedule.ActivityReportCount <= 0 {
+		c.Schedule.ActivityReportCount = 1 // 0/缺省 = 1 条（兼容旧行为）
 	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
@@ -491,7 +566,13 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.cn_invite_hours", "cn_invite_enabled", c.Schedule.CNInviteHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.school_hours", "school_enabled", c.Schedule.SchoolHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

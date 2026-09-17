@@ -43,10 +43,9 @@ const (
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
-// 登录 state 落盘路径（var 便于测试替换临时文件）
-// Portable across OSes: the upstream hardcoded "/tmp/...", which on
-// Windows resolves to <drive>:\tmp\... and aborts the OAuth flow with
-// "The system cannot find the path specified". os.TempDir() is /tmp on Linux.
+// 登录 state 落盘路径（var 便于测试替换临时文件）。
+// 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
+// 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
 var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
@@ -74,14 +73,14 @@ func commonHeaders(origin string) func(*http.Request) {
 	}
 }
 
-// apiEnvelope 与 main.go:429-433 一致
+// apiEnvelope 上游 {code,msg,data} 业务信封（与 upstream doJSON 家族解析口径一致）。
 type apiEnvelope struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
+// doJSON 与 upstream.doJSON 语义一致：{code,msg,data} 信封，code!=0 → error
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -98,7 +97,11 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进 Unmarshal（避免误报 parse failed）。
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
 	}
@@ -242,7 +245,7 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 		fatal("%v", err)
 	}
 	headers := commonHeaders(origin)
-	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
+	// handlePollLogin：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
 	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
 	if errTok != nil {
@@ -311,7 +314,7 @@ func main() {
 	if len(rest) < 1 {
 		fatal("usage: login [--realm=cn|global] <url|poll>")
 	}
-	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
+	// 每个流程独立 cookie jar（多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 

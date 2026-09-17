@@ -4,12 +4,11 @@ package auth
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,11 +31,11 @@ type Auth struct {
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm        string
-	UID          string
-	EnterpriseID string
-	Nickname     string
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	realm          string
+	UID            string
+	EnterpriseID   string
+	Nickname       string
+	FilePath       string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -51,6 +50,42 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
+// AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt
+// （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
+// （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
+// global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
+// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
+// 就是池内同一个对象）。无同步直读构成数据竞争，go test -race 实证：
+//
+//	WARNING: DATA RACE
+//	Write at ... by goroutine:
+//	  (*Client).RefreshToken()  internal/upstream/client.go:929
+//	Previous read at ... by goroutine:
+//	  (*Client).ChatHeaders()   internal/upstream/headers.go:224
+//
+// （回归测试 upstream.TestChatHeadersRacesRefreshToken）。
+func (a *Auth) AccessTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.AccessToken
+}
+
+// DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
+func (a *Auth) DomainValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Domain
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
@@ -63,14 +98,20 @@ func init() { globalEnabled.Store(true) }
 // SetGlobalEnabled 注入 global realm 路由开关（false = 锁死纯 CN，逃生门）。
 func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
 
-// GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
-func GlobalEnabled() bool { return globalEnabled.Load() }
-
 // Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
 // 否则 "cn"。显式 global 优先于 domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked()
+}
+
+// realmLocked Realm 的无锁内部实现：仅限**已持 a.mu** 的调用方使用（sync.Mutex 不可重入，
+// 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
+// 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
+func (a *Auth) realmLocked() string {
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -100,6 +141,8 @@ func ResolveRealm(explicit, domain string) string {
 // （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
 // （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
 func (a *Auth) BackfillRealm() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
@@ -109,25 +152,10 @@ func (a *Auth) BackfillRealm() (bool, string) {
 }
 
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
-func (a *Auth) RealmStored() string { return a.realm }
-
-// BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
-// global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
-// 非法值报错（防写脏）。返回是否发生变更。
-func BackfillRealmFor(a *Auth, realm string) (bool, error) {
-	if a == nil {
-		return false, fmt.Errorf("nil auth")
-	}
-	switch strings.TrimSpace(realm) {
-	case "cn", "global":
-	default:
-		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
-	}
-	if a.realm == realm {
-		return false, nil
-	}
-	a.realm = realm
-	return true, nil
+func (a *Auth) RealmStored() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realm
 }
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
@@ -142,6 +170,8 @@ func isGlobalDomain(d string) bool {
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -175,7 +205,8 @@ func Parse(raw []byte) (*Auth, error) {
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
 			} `json:"account"`
-			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
+			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
+			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
 			DeviceToken string `json:"device_token"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
@@ -262,18 +293,28 @@ func (a *Auth) SaveAtomic() error {
 	}
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
-		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
-		if errors.Is(err, fs.ErrPermission) {
-			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
-				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
-				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
-				"3) compose 设 user: \"0:0\" 以 root 运行）"
-		}
-		return errors.New(msg)
+		return err
 	}
 	return os.Rename(tmp, a.FilePath)
+}
+
+// AuthFileGlob auth 文件的统一 glob 模式（宽侧：workbuddy*.json）。
+// 网关 LoadDir 与 cmd 运维工具（signin/credit/trial）共用此单一来源——
+// 此前 cmd 侧私用 workbuddy-*.json 窄模式，不带连字符的文件（如
+// workbuddy_new.json）被网关加载却被运维工具跳过，排障口径对不上
+// （审查发现 10）。
+const AuthFileGlob = "workbuddy*.json"
+
+// LoadAuthFiles 返回 dir 下按 AuthFileGlob 匹配的 auth 文件清单（已排序）。
+// 供 cmd 运维工具复用：只列文件、不解析不迁移（LoadDir 才做 backfill 等副作用），
+// 保持 signin/credit/trial 原有的「逐文件 Parse、损坏即跳过/报行错」流程不变。
+func LoadAuthFiles(dir string) ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(dir, AuthFileGlob))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
@@ -281,7 +322,7 @@ func (a *Auth) SaveAtomic() error {
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
+	files, err := LoadAuthFiles(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -316,4 +357,25 @@ func LoadDir(dir string) ([]*Auth, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// ---- 面板层贴回（P4-0 层 3）----
+
+// BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
+// global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
+// 非法值报错（防写脏）。返回是否发生变更。
+func BackfillRealmFor(a *Auth, realm string) (bool, error) {
+	if a == nil {
+		return false, fmt.Errorf("nil auth")
+	}
+	switch strings.TrimSpace(realm) {
+	case "cn", "global":
+	default:
+		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
+	}
+	if a.realm == realm {
+		return false, nil
+	}
+	a.realm = realm
+	return true, nil
 }

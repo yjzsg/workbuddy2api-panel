@@ -10,7 +10,17 @@ services:
     #      或写进 .env 文件：PUID=1000 / PGID=1000
     #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
     #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
+    # [本地实测 2026-09-16] 上面解法 1（PUID=宿主 uid）**只对目录挂载有效** ——
+    # 它对"程序要写回的单文件挂载"无效（父目录仍是镜像层权限）。
+    # 已采用解法 2 的等价做法：容器跑镜像内置的 10001，
+    # 宿主机 auths/ data/ 属主 chown 到 10001（NAS 上 sudo 不可用，借容器内 root 完成）。
     user: "${PUID:-10001}:${PGID:-10001}"
+    # [本地补丁] 覆盖 ENTRYPOINT，把配置读写路径改到已挂载目录内。
+    # 原因：./config.json 属"单文件 bind mount"，而保存配置走原子写
+    # （写 .tmp -> rename 覆盖）。内核禁止 rename 覆盖挂载点，报
+    # "device or resource busy"；且 .tmp 与挂载点不同文件系统。
+    # 改到 /app/data/（目录挂载，与 .tmp 同 fs）后即可正常原子写。
+    entrypoint: ["/app/wb2api", "-config", "/app/data/config.json"]
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -18,8 +28,7 @@ services:
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
-      # 注意：宿主机必须先有 config.json（cp config.example.json config.json）。
-      # 缺失时 Docker 会把挂载点创建成目录 → 容器启动失败（程序会自动生成配置，
-      # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
-      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
-      - ./config.json:/app/config.json
+      # [本地补丁] 原为 `- ./config.json:/app/config.json`，已移除：
+      # 单文件挂载点无法被 rename 覆盖，面板保存配置必然失败。
+      # 配置已迁至 ./data/config.json（路径由上面的 entrypoint 指定）。
+      # 仓库根的 config.json 保留作参考，改它不再生效。
