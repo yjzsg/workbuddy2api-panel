@@ -691,35 +691,56 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> internal/pool/pool_te
 容器是 `build: .`（构建**工作树**而非 HEAD）→ 部署行为正确，但 **HEAD 不是部署真相**。
 **别用 `git checkout .` / `git stash` / `git reset --hard`**，会丢掉未提交的换基成果。
 
-### 补：面板侧 UI（同日 01:25–01:35，提交 `7518d78`）
+### 补：面板侧（同日 01:25–01:45）—— 先做「网关统计」页，后按用户要求改为**持久化进用量页**
 
-用户："面板上还没有这些数据"。`/v1/stats` 只在网关侧，面板没有对应 UI。
+用户第一句："面板上还没有这些数据" → 我加了「网关统计」页（提交 `7518d78`，读 `server` 包内存聚合 `/v1/stats`）。
+用户第二句：**"记录要持久化，直接加到用量里面就好。freebuff有类似的统计。"** → 撤掉该页，改为把缓存三段
+**持久化进 `usage.Recorder`**，展示在已有的「用量」页（提交 `d9cf8c2`）。
 
-**新开一页而不是塞进「用量」页** —— 两页是**两套口径**：用量页读 `usage.Recorder` 的持久化分桶
-（按账号/模型/域、可按时间窗回看、重启不丢，**没有缓存字段**）；`/v1/stats` 是 `server` 包的
-纯内存聚合（重启清零）。硬合并要么改持久化格式，要么在前端编造换算 → 并列展示 + 把口径差异写在界面上。
+**撤掉的方式**：`internal/panel/{panel.go,index.html,app.js}` + `cmd/server/main.go` 从加页前的
+`/vol4/_*.bak`（01:24 备份）还原。网关侧 `/v1/stats` **保留**（属上游 PR #161 第②项，不是面板层功能）。
 
-接线（避免 import 环）：`panel.Config` 加 `Stats func() any` / `StatsReset func()`，由 `cmd/server/main.go`
-注入 `func() any { return server.MetricsSnapshotOf() }` / `server.ResetMetrics`。
-`server` 已 import `panel`，面板反向 import 会成环。
-⚠️ 注意 Go **不做** `func() T` → `func() any` 的隐式转换 —— 第一次就是直接写
-`Stats: server.MetricsSnapshotOf` 而编译失败（`cannot use ... as func() any value`），必须包一层闭包。
+**为什么撤**：内存聚合「进程重启清零」与用户要的"持久化"正相反；且用量页已经有按账号/模型/域的
+持久化分桶（可按时间窗回看），把缓存数据并进去比并列第二套口径更合用户直觉。
 
-前端：导航「网关统计」+ `view-stats` 段落；`renderStats`/`loadStats` + 清零按钮（带 confirm）；
-6 张卡片（请求/缓存命中率/输入/输出/TTFB/吐字速率）+ 按模型 13 列表。
-显示纪律：命中率分母（hit+miss）为 0 时显示 `—` 而非 `0.0%`；扣费 0 也显示 `—`（未观测≠免费）。
+**参考实现（用户指的 freebuff）**：`D:\工作区\temp\freebuff2api-docker\panel-metrics.js`
+（+`admin-panel.js` 的 `cache_stats`）。它是**持久化** metrics store（JSON + 版本号 + 小时分桶 + 14 天保留），
+缓存字段用**计数器语义**：`cache_read_input_tokens`（命中）/ `cache_creation_input_tokens`（写入），
+**不设 Has 标志**（缺失即 0）。本仓沿用同一口径。
+
+**落地（数据流全链路，6 处）**：
+```
+chatStatsReader（流式） / usageDeltaFromResponse（非流式）
+  → pool.TokenUsageDelta → recordAttempt → usage.Delta → Recorder.Add → bucket
+  → Rollup → Snapshot → /panel/api/usage → 用量页
+```
+1. `usage.bucket` 加 `CH/CM/CW`（短键 `ch`/`cm`/`cw`，与既有短键风格一致）
+2. `usage.Delta` 加三段，**不设 Has**（编个 Has 只会把"没观测"伪装成"确定是 0"）
+3. `usage.Agg` 加 `cache_{hit,miss,write}_tokens` + `cache_hit_rate`（分母 = 命中+未命中，不含 write）
+4. ⚠️ **`usage.Rollup` 折叠小时桶→日桶是逐字段累加（不是整桶复制）** → 新字段必须同步加，
+   否则折叠后缓存数据**静默丢失**（编译不报错、既有用例也不报错）。这是本仓最容易漏的一处
+5. `chatStatsReader.Usage()` / `usageDeltaFromResponse` 两个取值点带出缓存三段
+6. `recordAttempt`（唯一汇聚点）映射进 `usage.Delta`
+7. 前端：卡片区 6 列→4 列（8 张卡两行，新增「缓存命中」「缓存命中率」）；三张表各加两列
+   （colspan 10→12、7→9）；`usRate()` 分母为 0 时显示 `—` 而非 `0.0%`；标题栏补口径注记
 
 **验收（实测）**：
 
-- `go build` / `go vet` / `go test`（19 包）全绿；
-- ⚠️ **`node --check app.js` 必须在本机单独跑** —— 容器内无 node，`TestAppJSSyntax` 会 **skip**（不是通过）。
-  本机 node v22 校验通过；`index.html` 只有 `<script src="app.js">` 一个外链（CSP `script-src 'self'` 安全）；
-- `GET /panel/api/stats` → 完整快照（含逐模型命中率）；`POST /panel/api/stats/reset` → `{"ok":true}`
-  且计数归零；**未授权 → 401**；
-- **浏览器端到端**（Camoufox，截图 `D:\工作区\chrome_profiles\panel_stats.png`）：过密钥闸门 → 点导航 →
-  `view-stats` 可见、标题「网关统计」、**6 张卡片**、按模型表渲染、口径注记正确、控制台无（本页）错误；
-- ⚠️ 截图时控制台有 1 条 CSP 报错 —— 经**对照实验**确认来自 **Camoufox 注入的 sandbox 脚本**
-  （`{file: "sandbox..."}`；空白页 0 条、面板首页**不点任何东西就有**）→ 与本次改动无关，不修。
+- `go build` / `go vet` / `go test`（19 包）全绿；**新增 4 条用例**（`internal/usage/usage_cache_test.go`）：
+  累计与命中率口径 / 无观测留 0 / **折叠不丢**（锁 Rollup 那个坑）/ **重载仍在**；
+- ⚠️ **`node --check app.js` 必须在本机单独跑**（容器无 node，`TestAppJSSyntax` 会 **skip**，不是通过）。
+  本机 node v22 通过；`index.html` 只有 1 个外链 script；
+- `gofmt`：`usage.go` 加字段后对齐变了 → `gofmt -w` 修正（该文件此前是 clean 的）；
+  `entry.go`/`handler.go` 报的是**既有漂移**（`Status` 结构体对齐），已用 `gofmt -d | grep -c cache` 确认与我无关；
+- 接口：打 3 个请求后 `GET /panel/api/usage` 的 `totals` 出现
+  `cache_hit_tokens/cache_miss_tokens/cache_write_tokens/cache_hit_rate`；
+- **持久化**：落盘 `data/usage.json` 的 **249 个桶全部带上 `ch`/`cm`/`cw`**（旧桶为 0，属预期）；
+  重启容器后累计值不清零；
+- **浏览器端到端**（Camoufox，截图 `D:\工作区\chrome_profiles\panel_usage.png`）：
+  8 张卡片（含「5.28M 缓存命中」「97.6% 缓存命中率」）、三张表都带「缓存命中 / 命中率」两列、
+  口径注记正确；
+- ⚠️ 截图控制台有 1 条 CSP 报错 —— 经**对照实验**确认来自 **Camoufox 注入的 sandbox 脚本**
+  （空白页 0 条、面板首页不点任何东西就有）→ 与改动无关，不修。
 
 ---
 
