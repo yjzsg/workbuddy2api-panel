@@ -277,10 +277,6 @@ func main() {
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
-		// 请求统计（上游 PR #161 第②项 /v1/stats）：聚合在 server 包，面板不能反向
-		// import（server 已 import panel）→ 闭包注入。面板「网关统计」页的数据源。
-		Stats:      func() any { return server.MetricsSnapshotOf() },
-		StatsReset: server.ResetMetrics,
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。

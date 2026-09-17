@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', stats: '网关统计', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -136,7 +136,6 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
-  if (v === 'stats') loadStats();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); loadCNInvite(true); pollQueueOnce(); }
 }
@@ -608,7 +607,6 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') pollQueueOnce();
-  else if (view === 'stats') loadStats(true);
 }
 function start() {
   loadOverview(true);
@@ -1281,6 +1279,23 @@ function fmtMs(ms) {
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
 
+/* usRate 缓存命中率。分母（命中 + 未命中）为 0 表示**没有观测** —— 此时显示 "—"，
+   不能显示 0.0%：那会把"没观测"说成"命中率 0%"，是两回事。
+   口径与后端一致：分母不含 write（写入是"为后续命中付的费"）。 */
+function usRate(rate, hit, miss) {
+  if (!(Number(hit || 0) + Number(miss || 0))) return '—';
+  return (Number(rate || 0) * 100).toFixed(1) + '%';
+}
+
+/* usRateTone 命中率配色：≥80% 好、<30% 警告、无观测不上色。 */
+function usRateTone(rate, hit, miss) {
+  if (!(Number(hit || 0) + Number(miss || 0))) return '';
+  const r = Number(rate || 0);
+  if (r >= 0.8) return 'good';
+  if (r < 0.3) return 'warn';
+  return '';
+}
+
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
          '</div><div class="k">' + esc(k) + '</div></div>';
@@ -1311,6 +1326,8 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.cache_hit_tokens) + '</td>' +
+    '<td class="num">' + usRate(a.cache_hit_rate, a.cache_hit_tokens, a.cache_miss_tokens) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1325,6 +1342,9 @@ function renderUsage(d) {
     usStat(fmtTok(t.total_tokens), '总 token') +
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
+    usStat(fmtTok(t.cache_hit_tokens), '缓存命中') +
+    usStat(usRate(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率',
+           usRateTone(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens)) +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
@@ -1335,18 +1355,19 @@ function renderUsage(d) {
   // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
   $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
     (d.buckets || 0) + ' 个分桶' +
-    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '') +
+    ' · 命中率分母 = 命中 + 未命中（不含 write）';
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="12" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
 
   renderUsageChart(d.series || []);
 }
@@ -1498,118 +1519,6 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
-
-/* ── 网关统计 ─────────────────────────────────────────────────────── */
-/* 数据源是 GET /panel/api/stats（透传网关的 GET /v1/stats）。
- *
- * 与「用量」页的分工必须写在界面上，否则两页数字对不上会被当成 bug：
- *   · 本页 = server 包的**纯内存聚合**，进程重启清零，带 since 起点；
- *   · 用量页 = usage.Recorder 的**持久化分桶**，重启不丢，可按时间窗回看。
- * 本页独有的：缓存三段与命中率、TTFB、吐字速率、实测扣费。
- *
- * 命中率的两个口径细节（与后端一致，别在前端"修正"）：
- *   · 分母 = 命中 + 未命中，**不含 write**（写入是"为后续命中付的费"，
- *     计入会压低首次请求的命中率）；
- *   · 后端在缺 usage 观测时不计入任何 token，所以没有观测的请求不会把命中率拉成 0。
- */
-
-/* stPct 命中率：后端给的是 0~1 小数。没有观测（分母 0）时后端给 0，
-   与"命中率真的是 0%"无法区分 —— 此时显示 "—" 更诚实，用 hit+miss 是否为 0 判断。 */
-function stPct(rate, hit, miss) {
-  if (!(Number(hit || 0) + Number(miss || 0))) return '—';
-  return (Number(rate || 0) * 100).toFixed(1) + '%';
-}
-
-/* stCredit 实测扣费累计：0 表示"未观测到"（后端只在末帧带 credit 时累加），
-   不要显示成 "0" 让人以为免费。 */
-function stCredit(c) {
-  const n = Number(c || 0);
-  if (!n) return '—';
-  return n >= 1000 ? (n / 1000).toFixed(2) + 'k' : n.toFixed(2);
-}
-
-/* stTime 把后端的 ISO 时间（本地时区）截成 MM-DD HH:MM:SS。 */
-function stTime(s) {
-  const t = String(s || '').replace('T', ' ');
-  return t ? t.slice(5, 19) : '—';
-}
-
-/* stTone 命中率配色：≥80% 好、<30% 警告、无观测不上色。 */
-function stTone(rate, hit, miss) {
-  if (!(Number(hit || 0) + Number(miss || 0))) return '';
-  const r = Number(rate || 0);
-  if (r >= 0.8) return 'good';
-  if (r < 0.3) return 'warn';
-  return '';
-}
-
-function renderStats(d) {
-  if (!d || d.enabled === false) {
-    $('stStats').innerHTML = usStat('—', '统计未启用');
-    $('stModelBody').innerHTML = '<tr><td colspan="13" class="empty">统计端点未启用</td></tr>';
-    $('stNote').textContent = '统计端点未启用';
-    return;
-  }
-  const t = d.total || {};
-  $('stStats').innerHTML =
-    usStat(fmtTok(t.requests), '请求数（成功 ' + fmtTok(t.success) + ' · 失败 ' + fmtTok(t.failed) + '）') +
-    usStat(stPct(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率',
-           stTone(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens)) +
-    usStat(fmtTok(t.prompt_tokens), '输入 token') +
-    usStat(fmtTok(t.completion_tokens), '输出 token') +
-    usStat(fmtMs(t.avg_ttfb_ms), '平均 TTFB') +
-    usStat(fmtRate(t.tokens_per_sec), '吐字速率');
-
-  // 口径写在标题栏：本页数字重启即清零、且不随「用量」页的时间窗变化。
-  $('stNote').textContent = '自 ' + stTime(d.since) + ' 起 · 运行 ' +
-    fmtUptime(d.uptime_sec) + ' · 纯内存（重启清零）';
-
-  $('stModelBody').innerHTML = (d.models || []).map(m =>
-    '<tr>' +
-      '<td class="mark" aria-hidden="true"></td>' +
-      '<td>' + esc(m.model) + '</td>' +
-      '<td class="num">' + fmtTok(m.requests) + '</td>' +
-      '<td class="num">' + (m.failed ? '<span style="color:var(--warn)">' + fmtTok(m.failed) + '</span>' : '—') + '</td>' +
-      '<td class="num">' + fmtTok(m.streaming) + '</td>' +
-      '<td class="num">' + fmtTok(m.prompt_tokens) + '</td>' +
-      '<td class="num">' + fmtTok(m.completion_tokens) + '</td>' +
-      '<td class="num">' + fmtTok(m.cache_hit_tokens) + '</td>' +
-      '<td class="num">' + stPct(m.cache_hit_rate, m.cache_hit_tokens, m.cache_miss_tokens) + '</td>' +
-      '<td class="num">' + fmtMs(m.avg_ttfb_ms) + '</td>' +
-      '<td class="num">' + fmtMs(m.avg_latency_ms) + '</td>' +
-      '<td class="num">' + fmtRate(m.tokens_per_sec) + '</td>' +
-      '<td class="num">' + stCredit(m.credit) + '</td>' +
-    '</tr>').join('') || '<tr><td colspan="13" class="empty">暂无数据</td></tr>';
-}
-
-/* fmtUptime 把秒数写成 "1h23m" / "5m12s" / "42s"。 */
-function fmtUptime(sec) {
-  let s = Number(sec || 0);
-  if (s < 60) return s + 's';
-  const m = Math.floor(s / 60); s %= 60;
-  if (m < 60) return m + 'm' + s + 's';
-  const h = Math.floor(m / 60);
-  return h + 'h' + (m % 60) + 'm';
-}
-
-async function loadStats(quiet) {
-  try {
-    const d = await api('stats');
-    renderStats(d);
-  } catch (e) {
-    if (!quiet) toast('读取统计失败：' + e.message, 'err');
-  }
-}
-
-if ($('btnStats')) $('btnStats').onclick = () => loadStats();
-if ($('btnStatsReset')) $('btnStatsReset').onclick = async () => {
-  if (!confirm('清零统计聚合？\n\n只清内存聚合（本次运行的数字），\n不影响用量记录、账号状态与成本账本。')) return;
-  try {
-    await api('stats/reset', { method: 'POST' });
-    toast('统计已清零', 'ok');
-    await loadStats();
-  } catch (e) { toast('清零失败：' + e.message, 'err'); }
-};
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

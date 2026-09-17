@@ -59,6 +59,12 @@ type TokenUsageDelta struct {
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+
+	// prompt cache 三段：只作为载体透传给面板用量记录器，本包的 token 累计不使用
+	// （RecordTokenUsage 只读上面几个字段，多出来的字段被忽略）。
+	CacheHitTokens   int64
+	CacheMissTokens  int64
+	CacheWriteTokens int64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
@@ -453,7 +459,10 @@ type modelCostEntry struct {
 	Samples   int
 }
 
-// modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录（运行态，不持久化）。
+// modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。**已持久化**（stateAccount.ModelCooldowns
+// → stateModelCooldown，见 2f4c77b）：Until/ResetAt/Reason 三字段落盘往返无损，Hits 不落盘
+// （见字段注释）。本注释此前写「运行态，不持久化」，是 908abbd 引入本结构体时的旧状态描述，
+// 在 2f4c77b 加上持久化后未同步更新，与上方 stateModelCooldown 的「落盘/恢复往返无损」自相矛盾。
 // 承载两种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
 //   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
@@ -511,13 +520,21 @@ const sessionDeadThreshold = 3
 //   - defaultDegradeCooldown=10m：出池时长。取软冷却封顶（2h）与熔断基数（30m）
 //     之间：长于单次软冷却（60s 级），短于熔断基数——连败的证据强度低于熔断，
 //     惩罚不应重于熔断。
-//   - defaultDegradeCooldownMax=2h：指数退避封顶，对齐 defaultSoftRateMax（同一
-//     「不知道何时恢复」的退避族）。
+//   - defaultDegradeCooldownMax=2h：降权时长的**上限钳制**（非指数退避封顶——
+//     连败降权为固定时长，见 degrade.go 注释「不做指数升级」），对齐
+//     defaultSoftRateMax 的量级。仅当显式配置的 degrade_cooldown 大于该值时钳制。
 const (
 	defaultDegradeThreshold   = 5
 	defaultDegradeCooldown    = 10 * time.Minute
 	defaultDegradeCooldownMax = 2 * time.Hour
 )
+
+// defaultCostExploreInterval costTier 条件探索的默认窗口（issue #136 方案 a′）。
+// 取 30m：≤ 48 次/天/模型 的探索上限算术（24h/30m=48），与池规模和 QPS 无关。
+// 探索=搭车改道（把一个既有真实用户请求改道给 tier 1 号），零新增上游请求；
+// 增量成本只是「该请求本可打免费号、实际打了可能收费的号」的期望计费差，
+// 且 tier 1 枯竭（活跃模型全号已学）后税基收敛到 0。config 显式 "0" 关停。
+const defaultCostExploreInterval = 30 * time.Minute
 
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"

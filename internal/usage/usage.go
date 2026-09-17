@@ -44,15 +44,21 @@ const (
 // bucket 一个 (时间片, realm, uid, model) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`
-	UID   string  `json:"u"`
-	Model string  `json:"m"`
-	Req   int64   `json:"q"`  // 请求数（含失败）
-	Err   int64   `json:"e"`  // 失败数
-	PT    int64   `json:"p"`  // prompt tokens
-	CT    int64   `json:"c"`  // completion tokens
-	TT    int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	Scope string `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string `json:"r"`
+	UID   string `json:"u"`
+	Model string `json:"m"`
+	Req   int64  `json:"q"` // 请求数（含失败）
+	Err   int64  `json:"e"` // 失败数
+	PT    int64  `json:"p"` // prompt tokens
+	CT    int64  `json:"c"` // completion tokens
+	TT    int64  `json:"t"` // total tokens（上游给什么用什么的合计）
+	// prompt cache 三段（计数器语义：缺失即 0，不区分「缺观测」与「显式 0」——
+	// 与 freebuff 的 cache_read/cache_creation 同口径）。命中率的"无观测"
+	// 由 hit+miss==0 在展示侧判定。
+	CH    int64   `json:"ch"` // 缓存命中 token
+	CM    int64   `json:"cm"` // 缓存未命中 token
+	CW    int64   `json:"cw"` // 缓存写入 token
 	LatMs int64   `json:"l"`  // 延迟累计（ms）
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
@@ -138,6 +144,14 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+
+	// prompt cache 三段。计数器语义（缺失即 0），**不设 Has 标志**：
+	// 上游同一帧里给不给这三项就是"有没有观测"，而我们无法区分"没给"与"给了 0"，
+	// 编一个 Has 只会把"没观测"伪装成"确定是 0"。命中率的无观测由聚合侧
+	// hit+miss==0 判定，前端据此显示 "—"。
+	CacheHitTokens   int64
+	CacheMissTokens  int64
+	CacheWriteTokens int64
 }
 
 // Add 记录一次请求尝试。
@@ -181,6 +195,9 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		// 上游没给 total：用 pt+ct 兜底，保证总量口径连续。
 		b.TT += d.PromptTokens + d.CompletionTokens
 	}
+	b.CH += d.CacheHitTokens
+	b.CM += d.CacheMissTokens
+	b.CW += d.CacheWriteTokens
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
 		b.LatN++
@@ -237,6 +254,11 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
+			// 缓存三段必须一起搬：Rollup 是**逐字段**累加（不是整桶复制），
+			// 漏一行就会让折叠后的日桶静默丢掉缓存数据。
+			dst.CH += src.CH
+			dst.CM += src.CM
+			dst.CW += src.CW
 		}
 		delete(r.buckets, m.from)
 	}
@@ -317,6 +339,14 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+
+	CacheHitTokens   int64 `json:"cache_hit_tokens"`
+	CacheMissTokens  int64 `json:"cache_miss_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	// CacheHitRate = 命中 / (命中 + 未命中)，分母为 0 时留 0。
+	// **不含 write**：写入是"为后续命中付的费"，计入会压低首次请求的命中率。
+	// 前端用 hit+miss==0 判"无观测"并显示 "—"，所以这里的 0 不会被误读成"命中率 0%"。
+	CacheHitRate float64 `json:"cache_hit_rate"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -335,6 +365,9 @@ func (g *aggAcc) add(b *bucket) {
 	g.PromptTokens += b.PT
 	g.CompletionTok += b.CT
 	g.TotalTokens += b.TT
+	g.CacheHitTokens += b.CH
+	g.CacheMissTokens += b.CM
+	g.CacheWriteTokens += b.CW
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -348,6 +381,9 @@ func (g *aggAcc) finish() Agg {
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+	}
+	if d := g.CacheHitTokens + g.CacheMissTokens; d > 0 {
+		a.CacheHitRate = float64(g.CacheHitTokens) / float64(d)
 	}
 	return a
 }

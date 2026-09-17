@@ -53,14 +53,6 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
-	// Stats 返回网关运行期请求统计快照（与 GET /v1/stats 同源）；nil 时统计接口返回 501。
-	//
-	// 走闭包注入而非直接调用：internal/server 已 import 本包（挂载面板），
-	// 本包反向 import 会成环。由 cmd/server/main.go 注入 server.MetricsSnapshotOf。
-	Stats func() any
-	// StatsReset 清零统计聚合（since 重置为当前时刻）；nil 时重置接口返回 501。
-	StatsReset func()
-
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 
@@ -153,8 +145,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
-	p.mux.HandleFunc("GET /panel/api/stats", p.withAuth(p.stats))
-	p.mux.HandleFunc("POST /panel/api/stats/reset", p.withAuth(p.statsReset))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
@@ -245,33 +235,6 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
 	})
-}
-
-// stats 透传网关的运行期请求统计（与 GET /v1/stats 同源）。
-//
-// 与「用量」页的分工：用量页读 usage.Recorder 的**持久化分桶**（按账号/模型/域，
-// 可按时间窗回看，重启不丢）；本接口是 server 包的**纯内存聚合**，多出缓存三段与
-// 命中率、TTFB、吐字速率、实测扣费，且自带 since 起点 —— 适合看"本次运行"的增量。
-// 两者互补，别合并：把内存聚合落盘会污染成本账本"只采信上游 usage"的纪律。
-func (p *Panel) stats(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Stats == nil {
-		writeErr(w, http.StatusNotImplemented, "stats api not available")
-		return
-	}
-	writeJSON(w, http.StatusOK, p.cfg.Stats())
-}
-
-// statsReset 清零统计聚合，便于观察增量。
-//
-// 只清内存聚合，**不动任何持久化数据**（用量分桶、账号状态、成本账本均不受影响）。
-func (p *Panel) statsReset(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.StatsReset == nil {
-		writeErr(w, http.StatusNotImplemented, "stats api not available")
-		return
-	}
-	p.cfg.StatsReset()
-	log.Printf("panel: 请求统计已清零（仅内存聚合）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。

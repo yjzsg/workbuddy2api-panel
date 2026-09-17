@@ -672,6 +672,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				// 缓存三段：与 token 同源（同一帧 usage），在此一并落盘。
+				CacheHitTokens:   delta.CacheHitTokens,
+				CacheMissTokens:  delta.CacheMissTokens,
+				CacheWriteTokens: delta.CacheWriteTokens,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}

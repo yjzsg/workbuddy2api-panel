@@ -144,6 +144,9 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		CompletionTokens:    int64(s.completionTokens),
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
+		CacheHitTokens:      int64(s.cacheHit),
+		CacheMissTokens:     int64(s.cacheMiss),
+		CacheWriteTokens:    int64(s.cacheWr),
 	}
 }
 
@@ -267,6 +270,16 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	}
 	if n, ok := read("total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
+	}
+	// 缓存三段：计数器语义，缺失即 0（不设 Has —— 见 usage.Delta 的注释）。
+	if n, ok := read("prompt_cache_hit_tokens"); ok {
+		delta.CacheHitTokens = n
+	}
+	if n, ok := read("prompt_cache_miss_tokens"); ok {
+		delta.CacheMissTokens = n
+	}
+	if n, ok := read("prompt_cache_write_tokens"); ok {
+		delta.CacheWriteTokens = n
 	}
 	return delta
 }

@@ -177,7 +177,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
+  display: grid; grid-template-columns: repeat(4, 1fr);
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
@@ -420,9 +420,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
-      <li><a href="#stats" data-view="stats">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 2.5v11h11"/><path d="M5 10.5V7M8 10.5V4.5M11 10.5V8.5"/></svg>
-        网关统计</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -615,6 +612,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中</th><th class="num">命中率</th>
               <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
@@ -630,6 +628,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中</th><th class="num">命中率</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
@@ -644,44 +643,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中</th><th class="num">命中率</th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- 网关统计：server 包的运行期内存聚合（GET /v1/stats）。
-         与「用量」页是两套口径，页面里已写明差异，避免数字对不上被当成 bug。 -->
-    <section class="view" id="view-stats" hidden>
-      <div class="box">
-        <header>
-          <h3>本次运行</h3>
-          <span class="grow"></span>
-          <span class="note" id="stNote">—</span>
-          <button class="xs" id="btnStats">刷新</button>
-          <button class="xs" id="btnStatsReset">清零</button>
-        </header>
-        <div class="stats" id="stStats"></div>
-        <div class="pad">
-          <div class="note">纯内存聚合，进程重启即清零；「用量」页是持久化分桶（可按时间窗、按账号回看）。
-            本页多出缓存命中率 / TTFB / 吐字速率 / 实测扣费 —— 两页口径不同，数字对不上是正常的。</div>
-        </div>
-      </div>
-
-      <div class="box">
-        <header><h3>按模型</h3><span class="grow"></span>
-          <span class="note">命中率分母 = 命中 + 未命中（不含 write）</span></header>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>模型</th>
-              <th class="num">请求</th><th class="num">失败</th><th class="num">流式</th>
-              <th class="num">Prompt</th><th class="num">Completion</th>
-              <th class="num">缓存命中</th><th class="num">命中率</th>
-              <th class="num">TTFB</th><th class="num">均延迟</th><th class="num">tok/s</th><th class="num">扣费</th>
-            </tr></thead>
-            <tbody id="stModelBody"></tbody>
           </table>
         </div>
       </div>
