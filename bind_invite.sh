@@ -4,7 +4,7 @@
 # 用法:
 #   sh bind_invite.sh                      # 全部账号，默认码 6G9QTTY3
 #   sh bind_invite.sh 6G9QTTY3             # 指定邀请码
-#   sh bind_invite.sh 6G9QTTY3 quantumlynx907   # 只处理某个昵称（逐个入库时用）
+#   sh bind_invite.sh 6G9QTTY3 账号D   # 只处理某个昵称（逐个入库时用）
 #
 # 输出: nickname<TAB>uid<TAB>code<TAB>message
 #
@@ -18,7 +18,7 @@
 # ⚠️ token 全程只在 NAS 本地/容器内流转，不落盘、不外传。
 CODE="${1:-6G9QTTY3}"
 ONLY="$2"
-DIR=/home/yeying/docker/workbuddy2api-panel/auths
+DIR=$HOME/docker/workbuddy2api-panel/auths
 cd "$DIR" || exit 1
 
 for f in *.json; do

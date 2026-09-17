@@ -85,7 +85,7 @@ docker run --rm -v <tree>:/src -v /vol4/_gocache:/go/pkg/mod -w /src \
   sh -c 'go build ./... && go vet ./... && go test -count=1 -timeout 480s ./...'
 
 # ④ 落地（备份 → 替换 → 重建 → 验收）
-cd /home/yeying/docker/workbuddy2api-panel
+cd <家目录>/docker/workbuddy2api-panel
 tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz internal cmd scripts go.mod go.sum login.sh signin.sh credit.sh Dockerfile docker-compose.yml config.example.json
 rsync -a --delete <tree>/internal/ internal/
 rsync -a --delete <tree>/cmd/ cmd/
@@ -107,7 +107,7 @@ cd <tree> && git apply --check -p1 /tmp/up.patch && git apply -p1 /tmp/up.patch
 
 # B) 面板仓库新增提交 → 只合「面板层独有」文件，其余不反向合
 #    每个文件三方合并：git merge-file -p <ours> <base=面板仓库上次已合的 SHA> <theirs=origin/main>
-git -C /home/yeying/docker/workbuddy2api-panel cat-file -p origin/main:internal/panel/app.js > /tmp/theirs
+git -C <家目录>/docker/workbuddy2api-panel cat-file -p origin/main:internal/panel/app.js > /tmp/theirs
 ```
 
 **判据（关键）**：上游派生文件（`pool/`、`server/`、`upstream/`、`session/`、`cmd/*`）**永远以我们的树为准**——

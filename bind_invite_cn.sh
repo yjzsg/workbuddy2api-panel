@@ -25,7 +25,7 @@
 CODE="${1:-evaxd5iz16ln}"
 ONLY="$2"
 BASE="${BASE:-https://www.workbuddy.cn}"
-DIR=/home/yeying/docker/workbuddy2api-panel/auths
+DIR=$HOME/docker/workbuddy2api-panel/auths
 cd "$DIR" || exit 1
 
 MYCODE=0

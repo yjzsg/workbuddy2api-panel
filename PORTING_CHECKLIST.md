@@ -2,7 +2,7 @@
 
 生成时间：2026-09-17 00:35 (GMT+8)
 对比对象：`Sliverkiss/workbuddy2api`（根上游） → `linguo2625469/workbuddy2api-panel`（我们跑的）
-部署位置：NAS `fnos` (`192.168.123.6`) `/home/yeying/docker/workbuddy2api-panel`，容器 `workbuddy2api`，端口 `7863`
+部署位置：NAS `fnos` (`<面板IP>`) `<家目录>/docker/workbuddy2api-panel`，容器 `workbuddy2api`，端口 `7863`
 
 ---
 
@@ -107,7 +107,7 @@
 
 - [x] **P4-0 试编译量化 —— ✅ 2026-09-17 00:45 完成，结论见 §8**（层 1/2 已修，层 3 报 16 处，均在 `internal/panel`）
   ```bash
-  U=/vol4/_upstream_wb2api ; P=/home/yeying/docker/workbuddy2api-panel
+  U=/vol4/_upstream_wb2api ; P=<家目录>/docker/workbuddy2api-panel
   rm -rf /vol4/_rebase_try && mkdir -p /vol4/_rebase_try
   rsync -a --exclude=.git --exclude=auths --exclude=data --exclude='config.json' \
         --exclude='Dockerfile*' --exclude='docker-compose*' $U/ /vol4/_rebase_try/
@@ -154,7 +154,7 @@
 
 1. **打快照**（必做，非 git 方式也要）
    ```bash
-   ssh fnos "tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz -C /home/yeying/docker/workbuddy2api-panel internal cmd Dockerfile docker-compose.yml"
+   ssh fnos "tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz -C <家目录>/docker/workbuddy2api-panel internal cmd Dockerfile docker-compose.yml"
    ```
 2. **取上游文件 → 改前缀**（见 P4-0 的两条 sed）
 3. **接线**：只改 hook 点，不重写上游逻辑；每次改前记录改了哪个文件哪一行
@@ -306,7 +306,7 @@ docker run --rm -v /vol4/_rebase_try_B:/src -v /vol4/_gocache:/go/pkg/mod -w /sr
 
 ### 落地待办（§5 流程，待用户确认后执行）
 
-1. 备份：`tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz -C /home/yeying/docker/workbuddy2api-panel internal cmd Dockerfile docker-compose.yml`
+1. 备份：`tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz -C <家目录>/docker/workbuddy2api-panel internal cmd Dockerfile docker-compose.yml`
 2. 替换：以 `_rebase_try_B` 覆盖面板仓库的 `internal/` `cmd/`（⚠️ **保留 L0**：Dockerfile / docker-compose.yml / config.example.json / data/config.json / auths/，rsync 时排除）
 3. 重建容器：`docker compose up -d --build` → 单号灰度 → 面板 UI 回归（§7 验收清单）
 4. 写 `PORTING.md`（P4-2）
@@ -338,7 +338,7 @@ docker run --rm -v /vol4/_rebase_try_B:/src -v /vol4/_gocache:/go/pkg/mod -w /sr
 | 替换 | `rsync -a --delete` internal/ + cmd/；`cp` go.mod/go.sum/login.sh；`cp scripts/global_region.py` | 代码与换基树完全一致 |
 | L0 补丁 | Dockerfile 加一行 `COPY scripts/global_region.py /app/scripts/global_region.py`（新 login.sh 的 global 注册流程依赖它） | 仅此一处改动，其余 L0 未动 |
 | 测试保留 | rsync 本会删掉 4 个面板测试（`auth/permhint_test.go`、`upstream/{tasks,school_mp,desktop}_test.go`）→ 提前拷回换基树；`tasks_test` 依赖的 `WebBaseCN` 字段被 fix_iter1 简化掉 → **`fix_iter7.py` 恢复**（字段+默认值+覆盖分支） | 树与仓库一致且全绿（19 包） |
-| 构建 | `docker compose build`（首次在 `alpine:3.20` 报镜像站 401 → `docker pull alpine:3.20` 落本地库后成功） | 新镜像 `sha256:c260585f…` |
+| 构建 | `docker compose build`（首次在 `alpine:3.20` 报镜像站 401 → `docker pull alpine:3.20` 落本地库后成功） | 新镜像 `sha256:<uid8-2>…` |
 | 上线 | `docker compose up -d` | 容器 `workbuddy2api` Up (healthy) |
 
 ### 验收结果（§7 清单逐项）
@@ -357,7 +357,7 @@ docker run --rm -v /vol4/_rebase_try_B:/src -v /vol4/_gocache:/go/pkg/mod -w /sr
 1. **auths/ 现为 9 个账号**（清单早先写的 10 已过期）——本次替换**未触碰 auths/**，是替换前的既有状态。
 2. **回滚命令**（5 分钟级）：
    ```bash
-   cd /home/yeying/docker/workbuddy2api-panel
+   cd <家目录>/docker/workbuddy2api-panel
    tar -xzf /vol4/_panel_backup_2026-09-17_0136.tgz
    docker compose build && docker compose up -d
    ```
