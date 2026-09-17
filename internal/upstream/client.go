@@ -252,7 +252,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
