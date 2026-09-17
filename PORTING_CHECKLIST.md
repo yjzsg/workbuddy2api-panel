@@ -638,7 +638,7 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> internal/pool/pool_te
 
 ---
 
-## 15. ⭐ 采纳上游未合并 PR #161 的第 ①③ 项（2026-09-18 01:05–01:15，提交 `255711d`）：已上线
+## 15. ⭐ 采纳上游未合并 PR #161 **全部三项**（2026-09-18 01:05–01:20，提交 `255711d` + `1b02815`）：已上线
 
 用户线索："上游库好像有授权相关的更新"。核查后：**两个上游都没有新提交**
 （`linguo2625469/workbuddy2api-panel` @ `4f18f7f`、`Sliverkiss/workbuddy2api` @ `9d1a21b`，
@@ -665,14 +665,18 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> internal/pool/pool_te
 |---|---|---|
 | ① `ParseRateReset` 补英文形态 | ✅ | 正则拆 CN/EN；EN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`（**锚定时间格式**，不捕获 `reset at the end of the day` 这类自然语言）；先 CN 后 EN。3 个 hunk 均 `git apply` 干净（offset 1） |
 | ③ `auths` 目录热加载 | ✅ | 新文件 `internal/pool/watch.go`(130) + `watch_test.go`(196)；`cmd/server/main.go` 挂 `p.StartAuthDirWatch(cfg.AuthDir)`（1 hunk，offset 25）。**必改 import**：PR 用 `workbuddy2api/internal/auth`，本仓模块名 `github.com/linguo2625469/workbuddy2api-panel` |
-| ② `/v1/stats` 统计端点 | ❌ | 本仓 `chatStatsReader` 已被**面板层**改写为 pointer 语义（`promptTokens`/`completionTokens`/`has*`），PR 用的 `s.prompt`/`s.tokens` 不存在 → 需手工适配；且本仓面板不调该端点 |
+| ② `/v1/stats` 统计端点 | ✅ | 新增 `GET /v1/stats` + `POST /v1/stats/reset`（按模型聚合 token/缓存/延迟/扣费，纯内存、重启清零）。`metrics.go`(313)+`metrics_test.go`(148) **直接抄 PR 原文件**；**必须手工适配**：`logging.go`（`chatStat` 加 metrics 字段 / `done()` 落 `recordChatMetric` 单一埋点 / `chatStatsReader` 加缓存三段 + `PromptTokens()` 取 `promptTokens` + `CacheTokens()` / `parseSSELine` 解析 `prompt_cache_{hit,miss,write}_tokens`）与 `handler.go`（2 个路由 + 流式/非流式各一处取值）—— 本仓 `chatStatsReader` 是面板层 pointer 语义，PR 的 `s.prompt`/`s.tokens` 不存在 |
 | `dev.sh` / `.gitignore` | ❌ | 上游开发脚本，与本仓部署方式无关 |
 
 ### 验收（实测，非推断）
 
 - `go build` / `go vet` / `go test`（19 包）**三项 EXIT=0**；
 - 新增用例全过：`TestParseRateReset_English`(4 子例) + `TestStartAuthDirWatchNoopOnBadDir` /
-  `TestReloadAuthDirAddsAccount` / `TestReloadAuthDirPreservesState` / `TestReloadAuthDirRemovesDeleted`；
+  `TestReloadAuthDirAddsAccount` / `TestReloadAuthDirPreservesState` / `TestReloadAuthDirRemovesDeleted`
+  + `TestMetrics*`(6 条：按模型聚合 / 缺 usage 不计成 0 / 总量=各模型之和 / reset 清空 / 空模型名兜底 / 容量上限)；
+- **②线上实测**：重启后打 2 个请求 → `GET /v1/stats` 返回 `total`：3 请求 / 输入 **189,862** token
+  vs 输出 **1,839**（≈103 倍，印证 PR 作者"成本几乎全在输入侧"）/ `cache_hit_rate` 15.4% /
+  `avg_ttfb_ms` / `tokens_per_sec` / 逐模型 `models[]`，字段结构正常 ✅；
 - **①用线上真实 body 单测**（临时用例，验完即删）：`ParseRateReset` → `2026-09-18 13:26:07 (UTC+8)` ✅；
 - **③端到端**：宿主机用户无权 `touch auths/*.json`（属主是容器 uid 10001）→ 改用同 uid 辅助容器
   `docker run --rm -u 10001:10001 -v <auths>:/a golang:1.23-alpine touch /a/<f>` →

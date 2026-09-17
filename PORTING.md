@@ -236,7 +236,7 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> <file:TestName> [...]
 上游 PR 里**未合并**但有价值的改动可以单独落 —— **只挑相关项，别整包搬**，落完在下方登记
 （来源、落了哪几项、为什么没落其余项、怎么验收的）。
 
-### PR #161 `cold-summer`（2026-09-18 落第 ①③ 项，提交 `255711d`）
+### PR #161 `cold-summer`（2026-09-18 落**全部三项**，提交 `255711d`（①③）+ `1b02815`（②））
 
 来源 `https://github.com/Sliverkiss/workbuddy2api/pull/161`（4 提交 / 953 行）。
 拉取与取补丁：
@@ -250,15 +250,18 @@ git -C /vol4/_rebase_try_B apply -v /vol4/_pr161_x.patch      # _rebase_try_B �
 | 项 | 内容 | 落否 | 说明 |
 |---|---|---|---|
 | ① | `fix(upstream)`：`ParseRateReset` 补英文文案形态 | ✅ **落** | **修线上正在踩的 bug**。global 域 429 body 是英文 `… will reset at 2026-09-18 13:26:07 UTC+8 …`，而原正则只认中文「将在 … 重置」→ 解析失败 → 落「无 resetAt」有界退避分支 → `softStreak` 指数翻倍（10→20→40→80→120min 封顶），**且走账号级冷却清空 `modelCooldowns`**（一个模型限流 → 该号全模型不可用，而上游原话正是"可以切其他模型继续用"）。落法：正则拆 `softRateResetPatternCN`/`EN`，EN 锚定 `reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`（不捕获自然语言），`ParseRateReset` 先 CN 后 EN |
-| ② | `feat(server)`：`/v1/stats` 统计端点 | ❌ 未落 | 本仓 `chatStatsReader` 已被**面板层**改写为 pointer 语义（`promptTokens`/`completionTokens`/`has*` 标志位），PR 用的 `s.prompt`/`s.tokens` 字段在本仓不存在 → 需手工适配；且本仓面板不调该端点。要用时照抄新文件 `internal/server/metrics.go`，再改 `logging.go`（`chatStat` 字段 + `done()` 埋点 + `PromptTokens()/CacheTokens()`）与 `handler.go`（两个路由 + 两处取值） |
+| ② | `feat(server)`：`/v1/stats` 请求统计端点 | ✅ **落** | 新增 `GET /v1/stats` + `POST /v1/stats/reset`（按模型聚合 token/缓存/延迟/扣费，纯内存、重启清零）。`metrics.go`(313)/`metrics_test.go`(148) **直接抄 PR 原文件**（自包含，只用标准库 + `chatStat`）。**必须手工适配**（本仓 `chatStatsReader` 已被面板层改写为 pointer 语义，PR 的 `s.prompt`/`s.tokens` 不存在）：<br>· `logging.go`：`chatStat` 加 metrics 字段；`done()` 落 `recordChatMetric`（单一埋点，流式/非流式/错误路径全覆盖）；`chatStatsReader` 加缓存三段 + `PromptTokens()`（取 `promptTokens`）/`CacheTokens()`；`parseSSELine` 解析 `prompt_cache_{hit,miss,write}_tokens`<br>· `handler.go`：挂两个路由；流式/非流式各补一处取值（非流式走 `fillStatFromUsage(st, resp)`，`resp` 本就是 `map[string]any`）<br>· `client.go`：顺手修 `reModelRateLimit` 在 var 块里的 gofmt 对齐（加 EN 正则后名字变长） |
 | ③ | `feat(pool)`：`auths` 目录热加载 | ✅ **落** | 新文件 `internal/pool/watch.go` + `watch_test.go`，`cmd/server/main.go` 挂 `p.StartAuthDirWatch(cfg.AuthDir)` → **加完账号免手动重启**（此前 `SyncToDir` 只在启动时跑一次，面板显示"已添加"但状态"未加载"）。落地**必改**：PR 的 import 是 `workbuddy2api/internal/auth`，本仓模块名是 `github.com/linguo2625469/workbuddy2api-panel` |
 | — | `dev.sh` / `.gitignore` | ❌ 未落 | 上游开发脚本，与本仓部署方式无关 |
 
 **验收（都实测过，不是"应该没问题"）**：
 
-- `go build` / `go vet` / `go test`（19 包）三项 EXIT=0；新增用例 `TestParseRateReset_English`(4 子例) 与
-  `TestReloadAuthDir*`/`TestStartAuthDirWatchNoopOnBadDir`(4 条) 全过；
+- `go build` / `go vet` / `go test`（19 包）三项 EXIT=0；新增用例 `TestParseRateReset_English`(4 子例)、
+  `TestReloadAuthDir*`/`TestStartAuthDirWatchNoopOnBadDir`(4 条)、`TestMetrics*`(6 条) 全过；
 - **①用线上真实 body 单测**：`ParseRateReset` → `2026-09-18 13:26:07 (UTC+8)`（临时用例，验完即删）；
+- **②线上实测**：重启后打 2 个请求 → `GET /v1/stats` 返回按模型聚合（`total`: 3 请求 / 输入 **189,862**
+  token vs 输出 **1,839** / `cache_hit_rate` 15.4% / `avg_ttfb_ms` / `tokens_per_sec` / 逐模型 `models[]`），
+  字段结构正常（—— 顺手印证 PR 作者那句"成本几乎全在输入侧"）；
 - **③端到端**：用同 uid 辅助容器 `touch auths/<f>.json`（宿主机用户无权 touch，文件属主是容器 uid 10001）
   → 9s 内日志出 `[watch] auths 目录变化：账号数保持 11（已热加载凭证更新）`，
   且 `/status` 的 `total/healthy/cooling/sticky` **完全不变**（状态未被重置 —— 正是 PR 用例
