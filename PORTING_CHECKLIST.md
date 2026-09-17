@@ -691,6 +691,36 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> internal/pool/pool_te
 容器是 `build: .`（构建**工作树**而非 HEAD）→ 部署行为正确，但 **HEAD 不是部署真相**。
 **别用 `git checkout .` / `git stash` / `git reset --hard`**，会丢掉未提交的换基成果。
 
+### 补：面板侧 UI（同日 01:25–01:35，提交 `7518d78`）
+
+用户："面板上还没有这些数据"。`/v1/stats` 只在网关侧，面板没有对应 UI。
+
+**新开一页而不是塞进「用量」页** —— 两页是**两套口径**：用量页读 `usage.Recorder` 的持久化分桶
+（按账号/模型/域、可按时间窗回看、重启不丢，**没有缓存字段**）；`/v1/stats` 是 `server` 包的
+纯内存聚合（重启清零）。硬合并要么改持久化格式，要么在前端编造换算 → 并列展示 + 把口径差异写在界面上。
+
+接线（避免 import 环）：`panel.Config` 加 `Stats func() any` / `StatsReset func()`，由 `cmd/server/main.go`
+注入 `func() any { return server.MetricsSnapshotOf() }` / `server.ResetMetrics`。
+`server` 已 import `panel`，面板反向 import 会成环。
+⚠️ 注意 Go **不做** `func() T` → `func() any` 的隐式转换 —— 第一次就是直接写
+`Stats: server.MetricsSnapshotOf` 而编译失败（`cannot use ... as func() any value`），必须包一层闭包。
+
+前端：导航「网关统计」+ `view-stats` 段落；`renderStats`/`loadStats` + 清零按钮（带 confirm）；
+6 张卡片（请求/缓存命中率/输入/输出/TTFB/吐字速率）+ 按模型 13 列表。
+显示纪律：命中率分母（hit+miss）为 0 时显示 `—` 而非 `0.0%`；扣费 0 也显示 `—`（未观测≠免费）。
+
+**验收（实测）**：
+
+- `go build` / `go vet` / `go test`（19 包）全绿；
+- ⚠️ **`node --check app.js` 必须在本机单独跑** —— 容器内无 node，`TestAppJSSyntax` 会 **skip**（不是通过）。
+  本机 node v22 校验通过；`index.html` 只有 `<script src="app.js">` 一个外链（CSP `script-src 'self'` 安全）；
+- `GET /panel/api/stats` → 完整快照（含逐模型命中率）；`POST /panel/api/stats/reset` → `{"ok":true}`
+  且计数归零；**未授权 → 401**；
+- **浏览器端到端**（Camoufox，截图 `D:\工作区\chrome_profiles\panel_stats.png`）：过密钥闸门 → 点导航 →
+  `view-stats` 可见、标题「网关统计」、**6 张卡片**、按模型表渲染、口径注记正确、控制台无（本页）错误；
+- ⚠️ 截图时控制台有 1 条 CSP 报错 —— 经**对照实验**确认来自 **Camoufox 注入的 sandbox 脚本**
+  （`{file: "sandbox..."}`；空白页 0 条、面板首页**不点任何东西就有**）→ 与本次改动无关，不修。
+
 ---
 
 ## 附录 A · 上游 59 提交主题分布（供对照）

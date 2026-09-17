@@ -228,6 +228,14 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> <file:TestName> [...]
 - `internal/scheduler/blackcat.go` / `school_api.go` — 上述功能的排程闭环
 - `internal/upstream/cninvite.go` + `internal/scheduler/cn_invite.go` + `internal/panel/cninvite.go` — **CN 邀请活动**（绑码 + 每日桌面事件链；面板 `/panel/api/cninvite/{status,run}` + 任务中心卡片）
 - `scripts/` — 面板自有脚本（`probe_active.py`/`probe_max_tokens.py`/`task_*.py`）+ 上游带过来的 `global_region.py`
+- **「网关统计」页**（2026-09-18 加）— 把上游 `/v1/stats`（PR #161 第②项）的数据接进面板：
+  `GET /panel/api/stats` + `POST /panel/api/stats/reset`（均走 `withAuth`），
+  经 `panel.Config.Stats/StatsReset` **闭包注入** `server.MetricsSnapshotOf/ResetMetrics`
+  （`server` 已 import `panel`，面板反向 import 会成环）。**与「用量」页是两套口径，别合并**：
+  用量页 = `usage.Recorder` 的持久化分桶（按账号/模型/域、可按时间窗回看、重启不丢）；
+  本页 = `server` 包的内存聚合（重启清零，多出**缓存命中率 / TTFB / 吐字速率 / 实测扣费**）。
+  前端显示纪律：命中率分母（hit+miss）为 0 时显示 `—` 而不是 `0.0%`（后端缺观测时也给 0，
+  直接显示等于把"没观测"说成"命中率 0%"）；扣费 0 同理显示 `—`（未观测≠免费）。
 
 ---
 
