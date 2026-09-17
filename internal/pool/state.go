@@ -74,11 +74,16 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却域（余额恢复）。
-// 迁移经 transition.reviveCoolingLocked：只清冷却域（until/coolKind/softStreak/
-// modelCooldowns）并更新 credits，不动熔断器（fails/retryCount/breakerUntil）——
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。remain==0 或禁用时只更新 credits（不动冷却/禁用）。
+// ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，更新 credits
+// 并解除**余额型冷却**（CoolHard，余额不足 → 冷却到次日 04:00）。
+//
+// 迁移经 transition.reviveCoolingLocked：只清 CoolHard 的冷却域并更新 credits，不动
+// 熔断器（fails/retryCount/breakerUntil）——签到成功只证明余额恢复与 billing 通道健康，
+// 不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
+//
+// 限流类软冷却（CoolSoft：429/6004 配额窗口）**不解**：余额充足不代表配额恢复，而本函数
+// 被余额后台刷新每 5 分钟调用一次，解它会造成「冷却→刷新解冻→再撞」死循环。
+// remain==0 或禁用时只更新 credits（不动冷却/禁用）。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

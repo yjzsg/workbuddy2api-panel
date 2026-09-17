@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefault(t *testing.T) {
@@ -518,60 +519,17 @@ func TestBadSessionTTL(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=8。
-func TestMaxBodyDefault(t *testing.T) {
-	c := Default()
-	if err := c.normalize(); err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	if c.Server.MaxBodyMB != 8 {
-		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyExplicit 显式设置 max_body_mb。
-func TestMaxBodyExplicit(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":16}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 16 {
-		t.Errorf("max_body_mb=%d want 16", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
-// 与其误导不如 fail fast 提示显式配大上限。
-func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"0", "-1"} {
+// TestMaxBodyLegacyKeyIgnored max_body_mb 已移除（BREAKING）：旧配置文件里仍带该键
+// （含非法值形态 0/-1 与 server 段整体存在）必须解析成功、启动不报错——字段已删，
+// JSON 未知键天然忽略（非 DisallowUnknownFields 严格模式），无 deprecation 噪音。
+func TestMaxBodyLegacyKeyIgnored(t *testing.T) {
+	for _, v := range []string{"8", "16", "0", "-1"} {
 		dir := t.TempDir()
 		fp := filepath.Join(dir, "c.json")
 		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)
-		_, err := Load(fp)
-		if err == nil {
-			t.Fatalf("want error for max_body_mb=%s", v)
+		if _, err := Load(fp); err != nil {
+			t.Fatalf("legacy max_body_mb=%s must not fail startup: %v", v, err)
 		}
-		if !strings.Contains(err.Error(), "server.max_body_mb") {
-			t.Errorf("error should name config key server.max_body_mb: %v", err)
-		}
-	}
-}
-
-// TestMaxBodyEnvOverride env WB2A_MAX_BODY_MB 非空覆盖 JSON 值。
-func TestMaxBodyEnvOverride(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":4}}`), 0o600)
-	t.Setenv("WB2A_MAX_BODY_MB", "12")
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 12 {
-		t.Errorf("max_body_mb=%d want env 12", c.Server.MaxBodyMB)
 	}
 }
 
@@ -730,4 +688,174 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 	if c3.Upstream.UserAgent != "EnvAgent/9" {
 		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
 	}
+}
+
+// ---- prompt.mode=append（issue #129 三模式） ----
+
+// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（内置默认，
+// 与 custom 同加载路径）。
+func TestPromptAppendModeAccepted(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"append"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "append" {
+		t.Errorf("mode=%q want append", c.Prompt.Mode)
+	}
+	if c.PromptText == "" {
+		t.Error("append should load PromptText (built-in default)")
+	}
+}
+
+// TestPromptAppendFileOverride B2：append + file → PromptText 为文件内容。
+func TestPromptAppendFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	want := "我的 append 模式人格"
+	os.WriteFile(pf, []byte(want), 0o600)
+	cf := filepath.Join(dir, "c.json")
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"append","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != want {
+		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptAppendFileMissingFailsFast B3：append + 不可读 file → 启动报错（同 custom）。
+func TestPromptAppendFileMissingFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"append","file":"/nonexistent/p.md"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for missing prompt file in append mode")
+	}
+}
+
+// TestPromptInvalidModeStillErrors B4：非法值报错文案含三值说明。
+func TestPromptInvalidModeStillErrors(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"replace"}}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for invalid prompt.mode")
+	}
+	if !strings.Contains(err.Error(), "custom / append / passthrough") {
+		t.Errorf("error should mention (custom / append / passthrough): %v", err)
+	}
+}
+
+func TestWriteDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "sub", "config.json") // 顺带验证父目录自动创建
+	key, err := WriteDefault(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// key 形如 sk-<24字符随机串>，两次生成不重复
+	if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+		t.Errorf("key=%q want sk-<random>", key)
+	}
+	if key2, _ := WriteDefault(filepath.Join(dir, "another.json")); key2 == key {
+		t.Errorf("two generated keys identical: %q", key)
+	}
+	// 落盘文件可被 Load 正常加载，推荐值齐备且 api_key 生效
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load generated config: %v", err)
+	}
+	if c.APIKey != key {
+		t.Errorf("api_key=%q want %q", c.APIKey, key)
+	}
+	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+		t.Errorf("generated defaults off: %+v", c)
+	}
+	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
+		t.Errorf("generated schedule off: %+v", c.Schedule)
+	}
+	// 已存在的文件不覆盖：二次写入同一路径必须报错
+	if _, err := WriteDefault(fp); err == nil {
+		t.Error("WriteDefault must refuse to overwrite existing file")
+	}
+}
+
+// TestLoadConfigPathIsDirectory config 路径是目录时给出可操作提示（Docker bind mount 陷阱）。
+// 复现：compose 挂载 ./config.json 但宿主机缺该文件 → Docker 创建同名目录 → 启动失败。
+// 旧行为只报 "read config: ... Incorrect function" 之类晦涩错误，无从排查。
+func TestLoadConfigPathIsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	asDir := filepath.Join(dir, "config.json")
+	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(asDir)
+	if err == nil {
+		t.Fatal("want error when config path is a directory")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "是目录") {
+		t.Errorf("error should explain it is a directory: %v", err)
+	}
+	if !strings.Contains(msg, "config.example.json") {
+		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	}
+}
+
+func TestBalanceRefreshDefaults(t *testing.T) {
+	// 缺省：启用 + 30 分钟
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.BalanceRefreshEnabled || c.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("default balance refresh: enabled=%v interval=%v", c.Schedule.BalanceRefreshEnabled, c.BalanceRefreshInterval)
+	}
+	// 显式配置 10 分钟
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":10}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.BalanceRefreshInterval != 10*time.Minute {
+		t.Errorf("interval=%v want 10m", c2.BalanceRefreshInterval)
+	}
+	// 显式关闭：interval 归零（不启动）
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_enabled":false}}`), 0o600)
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.BalanceRefreshInterval != 0 {
+		t.Errorf("disabled interval=%v want 0", c3.BalanceRefreshInterval)
+	}
+	// 启用但 minutes<=0 → 回落默认 30
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":-5}}`), 0o600)
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("fallback interval=%v want 30m", c4.BalanceRefreshInterval)
+	}
+}
+
+// TestPromptDefaultPassthrough 默认 prompt.mode=passthrough（对齐上游：透传客户端
+// 原始 system 是更保守的缺省）；custom 由用户显式选择，此时 PromptText 为内置默认（非空）。
+func TestPromptDefaultPassthrough(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
+	}
+	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
 }

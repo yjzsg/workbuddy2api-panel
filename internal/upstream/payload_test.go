@@ -190,3 +190,26 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 		})
 	}
 }
+
+// TestPrepareBodyDeterministic 序列化稳定性：同输入跑多遍出站字节级一致
+// （prompt_cache_key 前缀命中的前提——链中不得注入时间/随机/ID 类不确定源）。
+func TestPrepareBodyDeterministic(t *testing.T) {
+	inputs := []string{
+		`{"model":"glm-5.2","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"你好"}],"reasoning_effort":"high"}`,
+		`{"model":"deepseek-v4","messages":[{"role":"user","content":"写个函数"}],"tool_choice":{"type":"auto"},"tools":[{"type":"function","function":{"name":"f"}}]}`,
+		`{"model":"glm-5.3","messages":[{"role":"developer","content":"sys"},{"role":"user","content":[{"type":"text","text":"hi"}]}]}`,
+	}
+	for i, in := range inputs {
+		var first []byte
+		for round := 0; round < 5; round++ {
+			out := PrepareBodyOptWithEfforts([]byte(in), true, map[string][]string{"glm-5.2": {"off", "low", "high"}})
+			if round == 0 {
+				first = out
+				continue
+			}
+			if string(out) != string(first) {
+				t.Fatalf("input #%d round %d differs from round 0:\n%s\n%s", i, round, first, out)
+			}
+		}
+	}
+}

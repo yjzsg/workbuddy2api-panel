@@ -134,3 +134,29 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestIDForKeyStability 同 key 恒稳定、异 key 各不同、空 key 每次新值。
+func TestRequestIDForKeyStability(t *testing.T) {
+	// 预热清空包级缓存，避免其他测试污染 key（测试隔离）。
+	k1a := RequestIDForKey("conv-a")
+	k1b := RequestIDForKey("conv-a")
+	if k1a != k1b {
+		t.Errorf("same key should be stable: %q vs %q", k1a, k1b)
+	}
+	k2 := RequestIDForKey("conv-b")
+	if k1a == k2 {
+		t.Errorf("different keys should differ: %q", k1a)
+	}
+	// 空 key：每次调用生成新值（无会话则无"会话内稳定"语义）。
+	e1 := RequestIDForKey("")
+	e2 := RequestIDForKey("")
+	if e1 == e2 {
+		t.Errorf("empty key should yield fresh values each call: %q", e1)
+	}
+	// 稳定值自身也须是 32 hex（可作 B3 TraceId 直接使用）。
+	for _, id := range []string{k1a, k2, e1} {
+		if len(id) != 32 {
+			t.Errorf("RequestIDForKey value %q len=%d want 32", id, len(id))
+		}
+	}
+}

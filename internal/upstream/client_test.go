@@ -124,7 +124,7 @@ func TestIsWafBlocked(t *testing.T) {
 	}{
 		{403, "", true},
 		{403, "<html>blocked</html>", true},
-		{403, `{"code":1}`, false},               // 有 "code": 字段
+		{403, `{"code":1}`, false},                // 有 "code": 字段
 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
 		{402, "", false},                          // 非 403
 		{429, "", false},
@@ -976,3 +976,53 @@ func TestChatHeadersRacesRefreshToken(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestRefreshTokenExpiresInSanityCap expiresIn 量级上限：上游脏值（如
+// 99999999999 秒 ≈ 3170 年）不得把 ExpiresAt 推到荒谬未来（NeedsRefresh 永假
+// → token 永不刷新反而真过期失效）。依据 pr134-watchlist-analysis.md #4 可选加固：
+// 上限 10 年（实测 R-D 响应恒 expiresIn=5184000=60d，10 年是纯防御量级）。
+// 超限按脏值处理：保留旧 ExpiresAt（与缺省分支同语义）。
+func TestRefreshTokenExpiresInSanityCap(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":99999999999}}`), nil
+	})
+	oldExpiry := time.Now().Add(time.Hour).Unix()
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: oldExpiry}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if a.ExpiresAt != oldExpiry {
+		t.Errorf("脏 expiresIn 应保留旧 ExpiresAt=%d, got %d（被推到荒谬未来）", oldExpiry, a.ExpiresAt)
+	}
+	// token 本身仍应写回（脏 expiresIn 只否决过期时间，不否决凭证）。
+	if a.AccessToken != "newat" || a.RefreshToken != "newrt" {
+		t.Errorf("tokens not updated: %+v", a)
+	}
+}
+
+// TestRefreshTokenExpiresInWithinCapApplied 正常量级（60d，实测 R-D 恒 5184000）
+// 不受上限影响：ExpiresAt 照常推进。
+func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+	before := time.Now().Unix()
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	want := before + 5184000
+	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
+		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
+}
+
+// （面板基线 TestParseSoftRateReset 已删：上游 client_test.go 自带同名 TestParseRateReset，
+// 且注释写明"旧语义（非 6004 带时间 → false）是有意推翻的：11140 的 rate-limiting 变体
+// 带重置时间时同样应被精确对齐到上游重置墙钟"。）
+
+// TestFetchModelsDefaultEffortDualKeyAndSizes（面板基线）已删：断言 legacy 键
+// reasoning.effort 要填 ModelInfo.DefaultEffort。上游**有意改变**该解释 ——
+// client.go 只把 reasoning.defaultEffort 映射到 DefaultEffort；reasoning.effort 走
+// ReasoningEffort（**单档**语义），上游自带 TestParseGlobalModelNamesSingleEffort
+// 明确断言「reasoning.effort 单档字符串 → 视作单档表，defaults 为空」。

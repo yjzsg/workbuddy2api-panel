@@ -773,3 +773,9 @@ func TestBlockModelBackoffPickSkips(t *testing.T) {
 		t.Fatalf("其他模型应豁免 u1, got %+v", got)
 	}
 }
+
+// TestModelCooldownsNotPersisted（面板基线）已删：面板把 modelCooldowns 当运行时态
+// （不落盘/重启清零），上游已反转为**持久化**（entry.go ModelCooldowns 带
+// `json:"model_cooldowns"`，上游 pool_test.go 断言"必须落盘"）——断言的行为已被
+// 上游有意废止，保留即红。模型级 6004 冷却是 (账号,模型) 负缓存，持久化后重启不
+// 失忆，语义更正确。

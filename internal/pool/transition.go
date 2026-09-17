@@ -52,14 +52,27 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	p.dirty.Store(true)
 }
 
-// reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。
-// softStreak 属冷却域（与 until/coolKind 同域），随冷却一并清零——与「解冻只清冷却
-// 不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
-// 历史软冷却累积。调用方必须已持有 p.mu。
+// reviveCoolingLocked 解冻「余额型冷却」并更新 credits，不动熔断器
+// （fails/retryCount/breakerUntil）。签到/余额刷新走这里：签到成功只证明余额恢复与
+// billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
+//
+// **只清 CoolHard**（余额不足 → 冷却到次日 04:00）：调用方都以「余额恢复」为依据，
+// 而 CoolSoft（429/6004 配额窗口）的解除条件是上游配额重置，与 credits 无关 ——
+// 无条件清会让每 5 分钟的余额刷新把限流冷却抹掉，形成「冷却 → 刷新解冻 → 再撞」死循环。
+// 软冷却到期后由 healthy 判定自然放行；需强制解冻走 Pool.Revive。
+// 调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.credits = credits
-	e.clearCoolingLocked()
+	// 只解冻「余额型冷却」（CoolHard）：本函数两个调用方（签到 CheckinAll、余额后台
+	// 刷新 RunBalanceRefreshNow —— 后者每 5 分钟一次）都以「余额恢复」为解冻依据，而
+	// 余额充足**不代表限流解除**：CoolSoft（429/6004 的配额窗口）的解除条件是上游
+	// 配额重置，与 credits 无关。
+	//
+	// 原实现无条件 clearCoolingLocked，会把限流冷却一并抹掉：账号撞 6004 → 冷却 8
+	// 分钟 → 5 分钟内的余额刷新把它解冻 → 立刻又被选中 → 再撞 6004，形成
+	// 「冷却 → 刷新解冻 → 再撞」死循环（实测 账号C 反复 6004）。
+	// 需要强制解冻（含限流/熔断）时走面板「解冻」按钮 → Pool.Revive（显式全清）。
+	if e.coolKind == CoolHard {
+		e.clearCoolingLocked()
+	}
 }

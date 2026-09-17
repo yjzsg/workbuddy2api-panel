@@ -44,3 +44,8 @@ docs/
 /cmd/desktopverify*/
 *.zip
 server.exe
+
+# 本地备份（换基/调试期间的手工备份，勿入库）
+Dockerfile.bak*
+Dockerfile.orig
+docker-compose.yml.bak*

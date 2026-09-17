@@ -10,8 +10,12 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -299,6 +303,9 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
+//  5. 内容派生兜底（deriveKey）：system + 首条 user 文本的 SHA-256 —— 无标识客户端
+//     （dsh / Codex / Cherry Studio 等）靠它拿到**对话级**稳定键；取不到用户文本
+//     （纯图片等）返回空串，退回普通轮换（安全降级）。
 //
 // 全部为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
 //（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
@@ -329,11 +336,130 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["conversation_id"]); v != "" {
 		return v
 	}
-	return strOrEmpty(obj["conversationId"])
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	// 无显式会话标识 → 内容派生兜底（面板层增强，见 deriveKey 注释）。
+	return deriveKey(obj)
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
 func strOrEmpty(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
+// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
+const derivedKeyPrefix = "d-"
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+//
+// 【面板层增强，2026-09-17 fix_iter15 恢复】根上游 ExtractKey 无此兜底 —— 只认显式
+// conversation_id/conversationId/metadata，无标识客户端（dsh / Codex / Cherry Studio
+// 等 OpenAI 兼容协议）恒返回空串 → 粘性完全不生效、同对话轮转不同账号、上游前缀缓存
+// miss。面板版一直有本函数（生产在用），P4 换基时漏贴，本函数恢复"之前"的粘性。
+//
+// 为什么用「system + 首条 user」而不是全部消息：
+//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
+//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
+//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//
+// 与 ids.go 的 TurnKey **不冲突**（目标不同，取消息位置相反）：TurnKey 取**最后一条**
+// user 消息，服务「对话**轮**级聚合」（每次 user send 一个 ID，上游后台记账用）；
+// 本函数取**首条**，服务「**对话**级粘性」（整段对话一个 ID，固定账号 + 缓存命中）。
+//
+// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
+func deriveKey(obj map[string]any) string {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	systemText, firstUserText := "", ""
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := messageText(msg["content"])
+		switch strOrEmpty(msg["role"]) {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = text
+			}
+		case "user":
+			if firstUserText == "" {
+				firstUserText = text
+			}
+		}
+		if firstUserText != "" && systemText != "" {
+			break // 都已拿到：停止遍历长历史
+		}
+	}
+	if firstUserText == "" {
+		return "" // 无用户消息：无从归属会话
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// messageText 提取消息 content 的文本表示。
+// 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
+// 只取 text 部分：图片 URL 可能是签名地址（每次不同），参与派生会破坏键稳定性。
+func messageText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, part := range v {
+			if p, ok := part.(map[string]any); ok {
+				sb.WriteString(strOrEmpty(p["text"]))
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
+// missingKeyLogged 抑制重复的「未识别会话标识」探测日志（同键集合只记一次）。
+var missingKeyLogged sync.Map
+
+// ProbeMissingKey 在 ExtractKey 返回空时记一条一次性日志，输出请求体的顶层键与
+// metadata 子键名（**只键名，不含值**，无内容泄漏），用于判断客户端是否带了
+// ExtractKey 未支持的别名（session_id / chat_id / thread_id / conversation 等）。
+//
+// 背景：OpenAI 兼容客户端（dsh / Codex / Cherry Studio 等）请求体里既无 conversationId
+// 也无 metadata → sessKey 恒空 → 粘性不生效、prompt_cache_key 失去会话段（同对话可能
+// 换号，上游前缀缓存命中率下降）。若实测发现客户端确实带了某个可用标识，扩展
+// ExtractKey 即可启用粘性。同键集合只记一次，不刷屏。
+func ProbeMissingKey(body []byte) {
+	if len(body) == 0 {
+		return
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	metaKeys := ""
+	if m, ok := obj["metadata"].(map[string]any); ok {
+		mk := make([]string, 0, len(m))
+		for k := range m {
+			mk = append(mk, k)
+		}
+		sort.Strings(mk)
+		metaKeys = strings.Join(mk, " ")
+	}
+	probe := strings.Join(keys, ",") + "|" + metaKeys
+	if _, loaded := missingKeyLogged.LoadOrStore(probe, struct{}{}); loaded {
+		return
+	}
+	log.Printf("[session] 未识别会话标识（粘性不生效）顶层键=[%s] metadata 键=[%s]；"+
+		"若客户端用的是 session_id/chat_id/thread_id 等别名，扩展 ExtractKey 即可启用粘性",
+		strings.Join(keys, " "), metaKeys)
 }

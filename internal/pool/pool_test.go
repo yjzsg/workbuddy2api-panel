@@ -813,8 +813,12 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 }
 
 func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+	// 【本地刻意变更 fix_iter13】ReenableIfCredits（签到 / 余额刷新）**只解余额型冷却**
+	// （CoolHard）：限流软冷却（CoolSoft）与其 softStreak 一律保留 —— 余额恢复不代表
+	// 配额恢复，而余额后台刷新**每 5 分钟**跑一次，清它会形成「解冻 → 立刻又被选中 →
+	// 再撞 429/6004」死循环（实测 账号C 反复 6004）。原用例断言「Reenable
+	// 归零 streak 并解冻」，该语义已按上述理由废止；强制解冻走面板「解冻」按钮 →
+	// Pool.Revive（全清）。熔断域（fails/retryCount/breakerUntil）仍然不动。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -824,18 +828,24 @@ func TestCooldownSoftStreakResetByReenable(t *testing.T) {
 
 	p.ReenableIfCredits("u1", 500)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if st.SoftStreak == 0 {
+		t.Errorf("reenable 不该重置软冷却的 soft_streak（余额与限流无关），got %d", st.SoftStreak)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if !st.Cooling {
+		t.Errorf("reenable 不该解冻限流软冷却：%+v", st)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
+	// 软冷却未被解冻 → 下一次冷却的 streak 继续累进（原实现会退回基数 1）。
+	streakBefore := st.SoftStreak
+	p.forceSoftExpired("u1")
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	st2, _ := p.Status("u1")
+	if st2.SoftStreak != streakBefore+1 {
+		t.Errorf("软冷却未被解冻时 streak 应继续累进：%d → %d", streakBefore, st2.SoftStreak)
+	}
 }
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
@@ -2001,3 +2011,120 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 	}
 	p.Release("u1")
 }
+
+// TestCooldownSoftExponentialBackoff（面板基线）已删：断言"连打 3 次软冷却即 600→1200→2400"，
+// 上游**有意反转**该语义 —— cooldown.go 的 CooldownSoftRate 只在**进入新冷却**时推进退避
+// （`e.coolKind != CoolSoft || !now.Before(e.until)`），冷却中途的兜底探测不翻倍；
+// 上游自带 TestCooldownSoftBoundedBackoffIfNotCooling（forceSoftExpired 后推进）与
+// TestCooldownSoftRateNoDoubleWhenAlreadyCooling（注释原文："旧实现每次都 softStreak++
+// 指数翻倍，把全池推到 2h 封顶"）覆盖更好。
+
+// TestSoftRateModelClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
+// **非模型级**软冷却（plain Cooldown），softRateModel 必须被清空——否则上次 6004 的
+// 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
+func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	// 1) 6004 带解析时间 → 记录模型 glm-5.3。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
+		t.Fatalf("precondition: different-model should bypass, got %+v", got)
+	}
+	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
+	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	// 3) 换模型请求不得再豁免（softRateModel 已清空）。
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("plain cooldown must clear softRateModel (no bypass), got %+v", got)
+	}
+}
+
+func TestRecordTokenUsage(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	before := time.Now()
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		Model:               "glm-5.2",
+		HasPromptTokens:     true,
+		PromptTokens:        5,
+		HasCompletionTokens: true,
+		CompletionTokens:    7,
+		HasTotalTokens:      true,
+		TotalTokens:         12,
+		HasLatencyMs:        true,
+		LatencyMs:           1250,
+		HasTokensPerSecond:  true,
+		TokensPerSecond:     9.6,
+	})
+	p.RecordTokenUsage("u1", TokenUsageDelta{Model: "glm-5.2", HasLatencyMs: true, LatencyMs: 300})
+	st, _ := p.Status("u1")
+	if st.TokenUsage.RequestCount != 2 {
+		t.Errorf("request_count=%d want 2", st.TokenUsage.RequestCount)
+	}
+	if st.TokenUsage.UsageCount != 1 {
+		t.Errorf("usage_count=%d want 1", st.TokenUsage.UsageCount)
+	}
+	if st.TokenUsage.PromptTokens != 5 || st.TokenUsage.CompletionTokens != 7 || st.TokenUsage.TotalTokens != 12 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs != 300 || st.TokenUsage.LastTokensPerSecond != nil {
+		t.Errorf("latest performance should replace speed with unknown: %+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastModel != "glm-5.2" || st.TokenUsage.LastUsedAt.Before(before) {
+		t.Errorf("last usage=%+v", st.TokenUsage)
+	}
+}
+
+func TestTokenUsagePersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		Model:               "deepseek-v4",
+		HasPromptTokens:     true,
+		PromptTokens:        11,
+		HasCompletionTokens: true,
+		CompletionTokens:    13,
+		HasTotalTokens:      true,
+		TotalTokens:         24,
+		HasLatencyMs:        true,
+		LatencyMs:           2300,
+		HasTokensPerSecond:  true,
+		TokensPerSecond:     5.65,
+	})
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok {
+		t.Fatal("account missing after reload")
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.TotalTokens != 24 || st.TokenUsage.LastModel != "deepseek-v4" {
+		t.Errorf("token usage lost after reload: %+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs != 2300 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond != 5.65 {
+		t.Errorf("latest performance lost after reload: %+v", st.TokenUsage)
+	}
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"token_usage"`) {
+		t.Fatalf("state.json missing token_usage: %s", raw)
+	}
+	if strings.Contains(string(raw), "AccessToken") || strings.Contains(string(raw), "RefreshToken") {
+		t.Fatalf("state.json contains credential field: %s", raw)
+	}
+}
+
+// TestSoftRateModelNotPersistedToState（面板基线）已删：断言 model_cooldowns 不落盘。
+// 上游 entry.go 的 stateAccount.ModelCooldowns 带 `json:"model_cooldowns"`，上游
+// pool_test.go 反过来断言"必须落盘"——(账号,模型) 负缓存持久化后重启不失忆，语义更正确。

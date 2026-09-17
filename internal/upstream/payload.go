@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
@@ -32,7 +33,16 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 
 // PrepareBodyOptWithEffortsAndDefault 在 PrepareBodyOptWithEfforts 基础上按模型
 // reasoning.defaultEffort 补默认档（缺显式 effort 时优先用模型声明档，空串/未知回退硬编码）。
+//
+// 不带域标签（降级日志只显示模型裸名）；client 内部走 prepareBodyOptCore 并传 realm。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return prepareBodyOptCore(src, sanitize, efforts, defaultEfforts, "")
+}
+
+// prepareBodyOptCore 是 PrepareBodyOptWithEffortsAndDefault 的实现体，额外接受 realmTag
+// 用于 effort 降级日志的域标注：cn/global 同名模型的档位表不同（deepseek-v4.1-flash
+// CN 是 low/high/max、global 只有 high），只打裸名无法定位是哪个域被降级。
+func prepareBodyOptCore(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, realmTag string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -78,7 +88,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	model, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, model))
-	normalizeReasoningEffort(obj, efforts)
+	normalizeReasoningEffort(obj, efforts, realmTag)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -136,7 +146,7 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
 //   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
-func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
+func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string, realmTag string) {
 	if len(efforts) == 0 {
 		return
 	}
@@ -176,7 +186,11 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("WARN: [upstream] reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			// 改写每次都要做（不能因日志去重而跳过）；只有日志按组合去重。
+			if effortWarnOnce(realmTag, model, reqStr, best) {
+				log.Printf("WARN: [upstream] reasoning_effort downgraded model=%s %s -> %s (同类降级只记一次)",
+					effortModelLabel(realmTag, model), reqStr, best)
+			}
 		}
 		return
 	}
@@ -190,8 +204,32 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("WARN: [upstream] reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		if effortWarnOnce(realmTag, model, reqStr, lowest) {
+			log.Printf("WARN: [upstream] reasoning_effort floored model=%s %s -> %s (同类降级只记一次)",
+				effortModelLabel(realmTag, model), reqStr, lowest)
+		}
 	}
+}
+
+// effortWarned 抑制重复的 effort 降级日志：键为 realm|model|请求档|结果档，只打第一条。
+//
+// 降级是按模型能力表做的**预期行为**（issue #84：国际版只认 high），不是异常；客户端
+// 固定发 max 时每条请求都命中，逐条 WARN 会把真错误淹掉（实测 12 分钟 67 条）。出现新
+// 组合（换模型 / 换档位 / 换域）仍会打一条，可观测性不被去重吃掉。
+var effortWarned sync.Map
+
+// effortWarnOnce 该组合首次出现返回 true（调用方据此打日志）。
+func effortWarnOnce(realm, model, req, got string) bool {
+	_, loaded := effortWarned.LoadOrStore(realm+"|"+model+"|"+req+"|"+got, struct{}{})
+	return !loaded
+}
+
+// effortModelLabel 给模型名补域前缀（已带 ":" 或 realm 为空则原样返回）。
+func effortModelLabel(realmTag, model string) string {
+	if realmTag == "" || strings.Contains(model, ":") {
+		return model
+	}
+	return realmTag + ":" + model
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。

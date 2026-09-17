@@ -324,3 +324,35 @@ func TestBillingUA_WhenClientNameSaaS(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// TestBillingUA_WhenClientNameEmpty client_name 空 = 默认对齐官方桌面端：
+// billing UA 单段 WorkBuddy/<clientVersion>；显式 client_name="SaaS" 才不设 UA。
+func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	var ua string
+	const fullResp = `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`
+	c := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			ua = r.Header.Get("User-Agent")
+			return jsonResp(200, fullResp), nil
+		})},
+		ChatBaseCN:    "https://chat.example",
+		BillingBaseCN: "https://billing.example",
+		ClientVersion: "6.0.0",
+	}
+	// 上游 UserResource 收窄为 (remain, err)：面板时代的 used/size 已并入 UserResourceDetailed。
+	if _, err := c.UserResource(a); err != nil {
+		t.Errorf("userResource: %v", err)
+	}
+	if ua != "WorkBuddy/6.0.0" {
+		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
+	}
+	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
+		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
+	}
+	// 显式 SaaS 还原旧行为（不设 UA）。
+	c.ClientName = "SaaS"
+	if got := c.billingUA(); got != "" {
+		t.Errorf("billingUA() SaaS = %q want empty", got)
+	}
+}

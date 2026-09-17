@@ -128,17 +128,18 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	}
 }
 
-// TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
-// 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
-// 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
-func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+// TestTransitionReenableClearsHardOnlyKeepsBreaker ReenableIfCredits（签到 / 余额刷新
+// 解冻）语义：只清**余额型冷却**（CoolHard）+ 更新 credits，不动熔断域。
+//
+// 【本地刻意变更 fix_iter13】原实现无条件 clearCoolingLocked（含限流软冷却）。但本函数
+// 被余额后台刷新**每 5 分钟**调用一次，而余额充足不代表配额恢复 → 撞 429/6004 的账号
+// 会被反复解冻、立刻又被选中再撞（实测 账号C 反复 6004）。现只清 CoolHard。
+func TestTransitionReenableClearsHardOnlyKeepsBreaker(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
-	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	// 熔断域：独立信号，签到不解冻。
+	// 余额型冷却：余额恢复 → 应被清。
+	p.Cooldown("u1", CoolHard, 6*time.Hour, "credits exhausted")
+	// 熔断域：独立信号，解冻不覆盖。
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1")
 
@@ -146,18 +147,59 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
 
 	st, _ := p.Status("u1")
 	if st.Credits != 700 {
-		t.Errorf("revive 后 credits=%d want 700", st.Credits)
+		t.Errorf("reenable 后 credits=%d want 700", st.Credits)
 	}
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
 	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+		t.Errorf("CoolHard 应被清：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
 			until, kind, reason, streak, mc)
 	}
 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
-		t.Fatal("revive 不得清熔断（chat 通道健康未证明）")
+		t.Fatal("reenable 不得清熔断（chat 通道健康未证明）")
 	}
-	// 熔断域保留 → 账号不进 normal 候选（仅全冷却兜底仍可能选中，与熔断兜底语义一致）。
-	if p.internalHealthy("u1") {
-		t.Fatal("revive 后熔断期内不应 healthy（熔断域未被签到覆盖）")
+}
+
+// TestTransitionReenableKeepsSoftAndModelCooldowns ReenableIfCredits **不**清限流类冷却：
+// 软冷却（until/coolKind/softStreak）与 6004 模型级冷却（modelCooldowns）全保留。
+func TestTransitionReenableKeepsSoftAndModelCooldowns(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 用 CooldownSoftRate（429 真实路径）而非 Cooldown：前者才累计 softStreak。
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+
+	p.ReenableIfCredits("u1", 700)
+
+	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
+	if until.IsZero() || kind != CoolSoft || reason == "" || streak == 0 || mc == 0 {
+		t.Errorf("限流类冷却不该被余额解冻清：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+			until, kind, reason, streak, mc)
+	}
+	if st, _ := p.Status("u1"); !st.Cooling {
+		t.Errorf("软冷却期内应仍 Cooling：%+v", st)
+	}
+}
+
+// TestTransitionReviveClearsEverything Pool.Revive（面板「解冻」按钮，**显式**操作）
+// 仍是全清：冷却域 + 熔断域 + 会话失败计数，与 ReenableIfCredits（自动、只清 CoolHard）
+// 形成明确分工 —— 自动路径保守，人工路径给逃生门。
+func TestTransitionReviveClearsEverything(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1")
+
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true")
+	}
+	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
+	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
+		t.Errorf("Revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+			until, kind, reason, streak, mc)
+	}
+	if bt, ok := p.breakerUntil("u1"); ok && !bt.IsZero() {
+		t.Errorf("Revive（显式解冻）应清熔断，got %v", bt)
 	}
 }
