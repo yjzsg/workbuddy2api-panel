@@ -2624,13 +2624,10 @@ func TestHandlerAppendContentBlockedSecondFailPassthrough(t *testing.T) {
 	}
 }
 
-// TestHandlerAppendTurnKeyStable C7：append 改写不得影响聚合键——
-// handler 在改写前提取会话键（§3.4 槽位纪律），出站 X-Conversation-Request-ID
-// 应等于按**原始 body**（改写前）派生的值，而非按 append 后 body 派生的。
-//
-// 本体的形态刻意取「只有 user、无 system」：prompt.Append 把网关 system 插在
-// 开头连续 system/developer 块之后 —— 无 system 时插到下标 0，deriveKey 的
-// system 输入从 "" 变为网关人格，派生键必然改变，反证才有判别力。
+// TestHandlerAppendTurnKeyStable C7：append 改写不得影响轮级聚合键——
+// handler 在改写前提取 turnKey（§3.4 槽位纪律），出站 X-Conversation-Request-ID
+// 应等于按**原始 body**（改写前）派生的 TurnRequestID(TurnKey(原))，而非按
+// append 后 body 派生的（TurnKey 键含最后一条 user 的下标，插 system 会移位）。
 func TestHandlerAppendTurnKeyStable(t *testing.T) {
 	var reqIDs []string
 	var bodies [][]byte
@@ -2652,6 +2649,7 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
 
 	original := `{"model":"glm-5.2","messages":[
+		{"role":"system","content":"项目规范"},
 		{"role":"user","content":"你好"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(original)))
@@ -2663,27 +2661,12 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 		t.Fatalf("outbound body should be append-rewritten: %s", bodies[0])
 	}
 	// 聚合键按原始 body 派生（改写前提取）。
-	//
-	// 【fix_iter15】恢复面板层的 deriveKey 兜底后，无显式会话 id 的 body 会得到**派生会话
-	// 键**（SHA-256(system 文本 + 首条 user 文本)）→ handler 走 RequestIDForKey(会话键)，
-	// 而非无键时的 TurnRequestID(轮级键)。断言分两步：
-	//   ① 出站头 == 按**原始 body** 派生的键（证明 handler 在 prompt.Rewrite 之前提取）；
-	//   ② 反证：按**改写后** body 派生的键必然不同（本 body 无 system，append 把网关
-	//      system 插到下标 0 → deriveKey 的 system 输入改变）。
-	preKey := session.ExtractKey([]byte(original))
-	want := session.RequestIDForKey(preKey)
-	if preKey == "" || want == "" {
-		t.Fatal("want non-empty session key / request id for original body")
+	want := session.TurnRequestID(session.TurnKey([]byte(original)))
+	if want == "" {
+		t.Fatal("want non-empty TurnRequestID for original body")
 	}
 	if len(reqIDs) != 1 || reqIDs[0] != want {
 		t.Errorf("X-Conversation-Request-ID=%v want %q (derived from pre-rewrite body)", reqIDs, want)
-	}
-	postKey := session.ExtractKey(bodies[0])
-	if postKey == preKey {
-		t.Errorf("反证失效：改写后会话键 %q 与改写前相同，本用例失去判别力", postKey)
-	}
-	if got := session.RequestIDForKey(postKey); got == want {
-		t.Errorf("反证失效：改写后聚合键 %q 与改写前相同", got)
 	}
 }
 

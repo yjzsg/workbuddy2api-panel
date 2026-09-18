@@ -303,11 +303,9 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. 内容派生兜底（deriveKey）：system + 首条 user 文本的 SHA-256 —— 无标识客户端
-//     （dsh / Codex / Cherry Studio 等）靠它拿到**对话级**稳定键；取不到用户文本
-//     （纯图片等）返回空串，退回普通轮换（安全降级）。
+//  5. prompt_cache_key（第 5 项，见下）
 //
-// 全部为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
 //（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
 // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
 // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
@@ -317,6 +315,11 @@ func hashIndex(key string, n int) int {
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
 // snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// 第 5 项 prompt_cache_key：pi-ai 驱动的客户端（dsh 等）把会话 ID 放在这个 OpenAI
+// 前缀缓存字段里（而非 conversation_id），网关在 upstream 侧本就认它（见
+// InjectPromptCacheKey 优先级 1：客户端自带则原值保留）。纳入识别后，这类客户端
+// 无需改配置即可命中粘性。置于最后，绝不抢占 conversation 维度的优先级。
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -339,87 +342,104 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["conversationId"]); v != "" {
 		return v
 	}
-	// 无显式会话标识 → 内容派生兜底（面板层增强，见 deriveKey 注释）。
-	return deriveKey(obj)
+	// 5. prompt_cache_key：OpenAI 系的会话级前缀缓存键，语义就是"同一会话复用同一
+	//    前缀"，与粘性诉求同源。部分客户端（pi-ai 驱动的 dsh 等）把会话 ID 放在这里
+	//    而非 conversation_id——见 upstream.InjectPromptCacheKey 的优先级 1：客户端
+	//    自带 key 即原值保留。放最后，不抢占 conversation 维度的优先级。
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	return ""
+}
+
+// StickyFallbackKey 为**无会话标识**的客户端派生会话级稳定粘性键。
+//
+// 为什么需要：OpenAI 兼容协议本身没有会话 ID 字段。dsh / Codex / Cherry Studio 等
+// 客户端的请求体里既无 conversationId 也无 metadata，ExtractKey 恒返回空串 →
+// 粘性路由永不参与 → 同一段连续请求在账号池里逐请求轮换换号（上游前缀缓存也被打散，
+// 费用上升）。本函数给这类客户端一个不依赖其配合的会话级键：
+// body 里**首条** role=="user" 消息文本的 sha256 前 16 字节。
+//
+// 为什么取首条：会话内历史不断追加，但首条 user 消息在整段会话中恒定 → 同会话恒同键；
+// 用户开新会话（首条消息不同）→ 自然换键。
+//
+// 与 TurnKey 的区别（勿混用）：TurnKey 取**最后一条** user 消息，是**轮级**键，供上游
+// 会话头族按"对话轮"聚合；本函数取**首条**，是**会话级**键，供粘性绑定长期复用。
+//
+// 抑制条件（P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
+// metadata.user_id 或顶层 user_id 时**恒返回 ""**。ExtractKey 有意剔除 user_id
+// 作粘性键（user 维度粒度过粗——一个 user 的全部并行对话会被钉到同一账号，远粗于
+// 上游对话级缓存边界），这类客户端按契约回落加权轮换。若 fallback 不设此闸，
+// 只发 user_id 的请求会借首条 prompt 重新获得粘性，使该契约在 handler 侧失效。
+//
+// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（调用方回落无粘性，
+// 保持旧行为；不伪造会话）。
+func StickyFallbackKey(body []byte) string {
+	if hasUserID(body) {
+		return ""
+	}
+	text := firstUserText(body)
+	if text == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(text))
+	return "fb:" + hex.EncodeToString(sum[:16])
+}
+
+// hasUserID 报告 body 是否携带 user 维度标识（metadata.user_id 或顶层 user_id）。
+// 只判"字段存在且为非空字符串"，与 ExtractKey 的 strOrEmpty 口径一致。
+// 解析失败按"无 user_id"处理（不因坏 body 抑制 fallback——坏 body 本就在
+// firstUserText 里返回 ""，两条路径都收敛到无粘性）。
+func hasUserID(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
+		}
+	}
+	return strOrEmpty(obj["user_id"]) != ""
+}
+
+// firstUserText 取 body 里**首条** role=="user" 消息的内容签名（去首尾空白）；
+// 无则 ""。签名走 ids.go contentSignature：纯文本与旧 contentText 结果一致
+// （存量粘性键零漂移），纯图片轮可签名（首图会话的粘性盲区修复，G1）。
+func firstUserText(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	for i := range obj.Messages {
+		if obj.Messages[i].Role != "user" {
+			continue
+		}
+		if text := strings.TrimSpace(contentSignature(obj.Messages[i].Content)); text != "" {
+			return text
+		}
+		// 首条 user 消息无可签名内容（空/null 等）→ 不继续往后找：往后找会让
+		// 键随会话推进而漂移（一旦某轮该位置带上文本），破坏"同会话恒同键"。
+		return ""
+	}
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
 func strOrEmpty(v any) string {
 	s, _ := v.(string)
 	return s
-}
-
-// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
-// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
-const derivedKeyPrefix = "d-"
-
-// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
-//
-// 【面板层增强，2026-09-17 fix_iter15 恢复】根上游 ExtractKey 无此兜底 —— 只认显式
-// conversation_id/conversationId/metadata，无标识客户端（dsh / Codex / Cherry Studio
-// 等 OpenAI 兼容协议）恒返回空串 → 粘性完全不生效、同对话轮转不同账号、上游前缀缓存
-// miss。面板版一直有本函数（生产在用），P4 换基时漏贴，本函数恢复"之前"的粘性。
-//
-// 为什么用「system + 首条 user」而不是全部消息：
-//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
-//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
-//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
-//
-// 与 ids.go 的 TurnKey **不冲突**（目标不同，取消息位置相反）：TurnKey 取**最后一条**
-// user 消息，服务「对话**轮**级聚合」（每次 user send 一个 ID，上游后台记账用）；
-// 本函数取**首条**，服务「**对话**级粘性」（整段对话一个 ID，固定账号 + 缓存命中）。
-//
-// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
-func deriveKey(obj map[string]any) string {
-	msgs, ok := obj["messages"].([]any)
-	if !ok || len(msgs) == 0 {
-		return ""
-	}
-	systemText, firstUserText := "", ""
-	for _, m := range msgs {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		text := messageText(msg["content"])
-		switch strOrEmpty(msg["role"]) {
-		case "system", "developer":
-			if systemText == "" {
-				systemText = text
-			}
-		case "user":
-			if firstUserText == "" {
-				firstUserText = text
-			}
-		}
-		if firstUserText != "" && systemText != "" {
-			break // 都已拿到：停止遍历长历史
-		}
-	}
-	if firstUserText == "" {
-		return "" // 无用户消息：无从归属会话
-	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
-	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
-}
-
-// messageText 提取消息 content 的文本表示。
-// 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
-// 只取 text 部分：图片 URL 可能是签名地址（每次不同），参与派生会破坏键稳定性。
-func messageText(content any) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case []any:
-		var sb strings.Builder
-		for _, part := range v {
-			if p, ok := part.(map[string]any); ok {
-				sb.WriteString(strOrEmpty(p["text"]))
-			}
-		}
-		return sb.String()
-	}
-	return ""
 }
 
 // missingKeyLogged 抑制重复的「未识别会话标识」探测日志（同键集合只记一次）。
@@ -429,10 +449,11 @@ var missingKeyLogged sync.Map
 // metadata 子键名（**只键名，不含值**，无内容泄漏），用于判断客户端是否带了
 // ExtractKey 未支持的别名（session_id / chat_id / thread_id / conversation 等）。
 //
-// 背景：OpenAI 兼容客户端（dsh / Codex / Cherry Studio 等）请求体里既无 conversationId
-// 也无 metadata → sessKey 恒空 → 粘性不生效、prompt_cache_key 失去会话段（同对话可能
-// 换号，上游前缀缓存命中率下降）。若实测发现客户端确实带了某个可用标识，扩展
-// ExtractKey 即可启用粘性。同键集合只记一次，不刷屏。
+// 【面板层增强，保留】纯诊断：不改变任何出站请求，只记日志。
+// 与上游 StickyFallbackKey 互补 —— 后者让无标识客户端也能命中粘性（不依赖其配合），
+// 本函数用于**发现**客户端还带了哪些可用字段：上游已认 conversationId / metadata /
+// prompt_cache_key，若实测发现新的别名，扩展 ExtractKey 即可进一步提命中率。
+// 同键集合只记一次，不刷屏。
 func ProbeMissingKey(body []byte) {
 	if len(body) == 0 {
 		return
@@ -459,7 +480,7 @@ func ProbeMissingKey(body []byte) {
 	if _, loaded := missingKeyLogged.LoadOrStore(probe, struct{}{}); loaded {
 		return
 	}
-	log.Printf("[session] 未识别会话标识（粘性不生效）顶层键=[%s] metadata 键=[%s]；"+
-		"若客户端用的是 session_id/chat_id/thread_id 等别名，扩展 ExtractKey 即可启用粘性",
+	log.Printf("[session] 未识别会话标识（粘性走 StickyFallbackKey 兜底）顶层键=[%s] metadata 键=[%s]；"+
+		"若客户端用的是 session_id/chat_id/thread_id 等别名，扩展 ExtractKey 可进一步提命中率",
 		strings.Join(keys, " "), metaKeys)
 }
