@@ -294,4 +294,7 @@ git -C /vol4/_rebase_try_B apply -v /vol4/_pr161_x.patch      # _rebase_try_B �
 - ⛔ 别把 `internal/session/session.go` 的 `deriveKey` 兜底退回上游版（面板层增强，见 §4 第 17 条）——退回即"无会话标识客户端粘性失效"
 - ⛔ 别在同步时整批覆盖**面板自有测试用例**（`internal/pool/*_test.go`、`internal/server/handler_test.go`、`cmd/server/config_test.go`、`internal/upstream/client_test.go` 等）——文件在≠用例在，丢了不报错
 - ⛔ 别把 `internal/pool/watch.go` / `watch_test.go` 的 import 退回上游写法 `workbuddy2api/internal/auth`——本仓模块名是 `github.com/linguo2625469/workbuddy2api-panel`，退回即编译不过（见 §5.1）
-- ⚠️ **部署仓库的工作树领先 git HEAD 63 个文件**（2026-09-18 发现，含生产文件如 `internal/pool/*.go`、`internal/upstream/sse.go`）→ 改前先 `git status --short`；**别用 `git checkout .` / `git stash` / `git reset --hard` 回退**，那会丢掉未提交的换基成果。容器 `build: .` 构建的是**工作树**，不是 HEAD
+- ⚠️ **别用 `git checkout .` / `git stash` / `git reset --hard` 回退**。2026-09-18 曾发现工作树领先 HEAD 63 个文件（含生产文件），已提交让 **HEAD == 工作树**（`f204e68`）；但容器是 `build: .`，**部署真相始终是工作树** → 改前先 `git status --short`，回退用 `git revert`/逐文件恢复
+- ⛔ **别为了本机某个客户端的现象去改 `internal/upstream/thinking.go`**（`injectThinking` / `backfillReasoningContent`）—— 那是上游面向**全部客户端**的契约：**issue #43** 的验收项就是「无 effort 裸请求也开思考」（非它则只发 `thinking` 的客户端拿不到思维链）；**issue #157** 维护者结论是「**客户端配置问题，非网关缺陷**」；**issue #91** 明确 `reasoning_content` 是**要被传递出去**的字段。
+  2026-09-18 曾偏离两处（① 不注入 thinking ② 不回放历史 reasoning），**A/B/C 同参数多组对照证明收益不成立**（不注入 vs 注入都退化），**已于 `94b2aee` 全部回滚**，5 个文件与两个上游逐字节一致。
+  → 若再遇到「卡循环 / 反复 `finish_reason=length` 空正文」，先走**客户端侧**（`maxInputTokens` 压缩点、`reasoning_effort` 档位、`max_tokens` 预算），别动网关。详见技能 `workbuddy-compact-threshold` §九。
