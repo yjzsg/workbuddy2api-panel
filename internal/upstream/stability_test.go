@@ -64,9 +64,8 @@ func TestUpstreamRewriteStableSerialization(t *testing.T) {
 // （确定性由注入物 string 决定，非时间/随机）。
 func TestDeepSeekEffortDefaultsDeterministic(t *testing.T) {
 	t.Parallel()
-	// 首次跑注入 thinking.type=enabled + reasoning_effort=high（无时间/随机参与）；
-	// reasoning_summary 提供思考意图（按需注入契约，2026-09-18 起）。
-	in := []byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[{"role":"user","content":"hi"}]}`)
+	// 首次跑注入 thinking.type=enabled + reasoning_effort=high（无时间/随机参与）。
+	in := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
 	first := PrepareBodyOptWithEfforts(in, false, nil)
 	second := PrepareBodyOptWithEfforts(in, false, nil)
 	if !bytes.Equal(first, second) {
