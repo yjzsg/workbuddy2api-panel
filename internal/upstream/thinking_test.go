@@ -26,40 +26,39 @@ func getThinkingType(t *testing.T, out []byte) (typ string, present bool) {
 
 // TestInjectThinkingDeepSeekEnabled 开思考开关注入：deepseek 系模型请求体不带
 // thinking 时必须注入 {type:"enabled"}，否则上游默认按不思考应答（思维链不显示）。
-// TestInjectThinkingDeepSeekEnabled 按需注入契约（2026-09-18 起）：
-// 有思考意图（reasoning_effort / reasoning_summary / reasoning.effort）→ 注入 enabled；
-// 无思考意图 → 不注入（保持上游默认「不思考」，避免 only_reasoning 模型 reasoning 膨胀）。
+// TestInjectThinkingDeepSeekEnabled v2 契约（2026-09-18）：
+// **不再注入 thinking**（实测单独无效、与 effort 叠加会放大 reasoning 直至挤空 content），
+// 只按需补默认档 reasoning_effort；无思考意图则两者都不动。
 func TestInjectThinkingDeepSeekEnabled(t *testing.T) {
 	withIntent := []struct {
-		name    string
-		body    string
-		wantTyp string
+		name string
+		body string
+		want string // 期望补出的 reasoning_effort
 	}{
-		{"deepseek 带 reasoning_effort 注入 enabled",
-			`{"model":"deepseek-v4-flash","reasoning_effort":"medium","messages":[]}`, "enabled"},
-		{"DeepSeek 大小写不敏感（带意图）",
-			`{"model":"DeepSeek-v4.1-flash","reasoning_summary":"auto","messages":[]}`, "enabled"},
-		{"DEEPSEEK 全大写不敏感（带意图）",
-			`{"model":"DEEPSEEK-R1","reasoning_summary":"auto","messages":[]}`, "enabled"},
-		{"deepseek thinking 对象 type 空 + 有意图 → 补 enabled",
-			`{"model":"deepseek-v4-flash","thinking":{},"reasoning_summary":"auto","messages":[]}`, "enabled"},
+		{"deepseek 带 reasoning_effort → 不覆盖",
+			`{"model":"deepseek-v4-flash","reasoning_effort":"medium","messages":[]}`, "medium"},
+		{"DeepSeek 大小写不敏感（带 summary）→ 补默认 high",
+			`{"model":"DeepSeek-v4.1-flash","reasoning_summary":"auto","messages":[]}`, "high"},
+		{"DEEPSEEK 全大写不敏感（带 summary）→ 补默认 high",
+			`{"model":"DEEPSEEK-R1","reasoning_summary":"auto","messages":[]}`, "high"},
+		{"显式 thinking=enabled（无 effort）→ 补默认 high",
+			`{"model":"deepseek-v4-flash","thinking":{"type":"enabled"},"messages":[]}`, "high"},
 	}
 	for _, c := range withIntent {
 		t.Run(c.name, func(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
-			typ, present := getThinkingType(t, out)
-			if !present {
-				t.Fatalf("thinking 字段缺失 (out=%s)", out)
+			// 关键：**不得**注入 thinking.type=enabled
+			if typ, present := getThinkingType(t, out); present && typ == "enabled" && !strings.Contains(c.body, "enabled") {
+				t.Errorf("v2 不应注入 thinking.type=enabled (out=%s)", out)
 			}
-			if typ != c.wantTyp {
-				t.Errorf("thinking.type = %q want %q (out=%s)", typ, c.wantTyp, out)
+			eff, _ := objFieldString(t, out, "reasoning_effort")
+			if eff != c.want {
+				t.Errorf("reasoning_effort=%q want %q (out=%s)", eff, c.want, out)
 			}
 		})
 	}
 
-	// 无思考意图：不得把 thinking.type 置为 enabled，也不得补 reasoning_effort。
-	// 注意：客户端自带的 `thinking:{}`（type 为空）**保留原样**即可 —— 上游见 type 为空
-	// 按默认（不思考）处理，网关无需删字段。
+	// 无思考意图：不得补 effort，也不得注入 thinking。
 	noIntent := []struct{ name, body string }{
 		{"deepseek 裸请求不注入", `{"model":"deepseek-v4-flash","messages":[]}`},
 		{"deepseek thinking 空对象不注入", `{"model":"deepseek-v4-flash","thinking":{},"messages":[]}`},
@@ -68,7 +67,7 @@ func TestInjectThinkingDeepSeekEnabled(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
 			if typ, present := getThinkingType(t, out); present && typ == "enabled" {
-				t.Errorf("无思考意图不应把 thinking.type 置为 enabled (out=%s)", out)
+				t.Errorf("无思考意图不应注入 thinking.type=enabled (out=%s)", out)
 			}
 			if _, ok := objFieldString(t, out, "reasoning_effort"); ok {
 				t.Errorf("无思考意图不应补 reasoning_effort (out=%s)", out)
@@ -77,18 +76,15 @@ func TestInjectThinkingDeepSeekEnabled(t *testing.T) {
 	}
 }
 
-// TestInjectThinkingDefaultEffort 打回修复主证据：无 effort 裸请求必须同时带
-// thinking.type=enabled 与默认档 reasoning_effort（否则上游 deepseek-v4-flash 不开思维链）。
+// TestInjectThinkingDefaultEffort 默认档补全：有思考意图但缺 effort 时补默认档
+// reasoning_effort（v2 起**不再注入 thinking.type=enabled** —— 实测该字段单独无效，
+// 与 effort 叠加反而放大 reasoning 挤空 content）。
 // 默认档 = 官方客户端兜底 "high"，并带上 supportedEfforts 时经降级管线落到合法档。
 func TestInjectThinkingDefaultEffort(t *testing.T) {
-	// 有思考意图（reasoning_summary）但无 effort → 注入 enabled + 默认档 reasoning_effort="high"。
+	// 有思考意图（reasoning_summary）但无 effort → 补默认档 reasoning_effort="high"。
 	out := PrepareBodyOptWithEfforts(
 		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[{"role":"user","content":"hi"}]}`),
 		false, nil)
-	typ, present := getThinkingType(t, out)
-	if !present || typ != "enabled" {
-		t.Fatalf("thinking.type=%q present=%v want enabled (out=%s)", typ, present, out)
-	}
 	eff, ok := objFieldString(t, out, "reasoning_effort")
 	if !ok || eff != "high" {
 		t.Errorf("reasoning_effort=%q ok=%v want high（默认档）(out=%s)", eff, ok, out)
@@ -112,7 +108,7 @@ func TestInjectThinkingDefaultEffort(t *testing.T) {
 		t.Errorf("supportedEfforts=[minimal low] 下默认档降级=%q want low (out=%s)", eff, out)
 	}
 
-	// 显式 enabled + 缺 effort → 同样补默认档（官方 configure thinking 行为）。
+	// 显式 enabled + 缺 effort → 补默认档（v2：仍补 effort，但**不注入** thinking）。
 	out = PrepareBodyOptWithEfforts(
 		[]byte(`{"model":"deepseek-v4-flash","thinking":{"type":"enabled"},"messages":[]}`),
 		false, nil)
@@ -136,9 +132,14 @@ func TestInjectThinkingEffortNotOverridden(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
-			typ, _ := getThinkingType(t, out)
-			if typ != "enabled" {
-				t.Fatalf("thinking.type=%q want enabled (out=%s)", typ, out)
+			// v2：网关不再注入 thinking。输入自带 enabled 的应原样保留；没带的不得凭空出现。
+			typ, present := getThinkingType(t, out)
+			if strings.Contains(c.body, `"enabled"`) {
+				if !present || typ != "enabled" {
+					t.Fatalf("输入自带 enabled 应原样保留, got typ=%q present=%v (out=%s)", typ, present, out)
+				}
+			} else if present && typ == "enabled" {
+				t.Fatalf("v2 不应注入 thinking.type=enabled (out=%s)", out)
 			}
 			// camel 分支：输入只有 camel，injectThinking 不得另加 snake 默认档。
 			if strings.Contains(c.body, "reasoningEffort") {

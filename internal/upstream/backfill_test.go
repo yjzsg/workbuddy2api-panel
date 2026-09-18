@@ -34,8 +34,12 @@ func assistantRC(t *testing.T, out []byte) []string {
 }
 
 // TestBackfillReasoningContentDeepSeek DeepSeek 多轮一致性：历史 assistant 消息有
-// reasoning 痕迹时，所有 assistant 消息必须带 reasoning_content（string）。
-// 对齐官方 requiresReasoningContentOnAssistantMessages 行为。
+// reasoning 痕迹时，所有 assistant 消息必须带 reasoning_content 字段（string）。
+//
+// 【v3 契约 2026-09-18】字段值**一律补空串**，不再复制 `reasoning` 的值 ——
+// 实测复制会导致 16 万 token 的历史推理被重放（prompt 448875 → 287559），
+// 模型自我强化、reasoning 膨胀吃满预算（用户侧「卡循环」）。
+// 上游只要求字段存在，不要求内容非空。
 func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 	cases := []struct {
 		name string
@@ -45,31 +49,31 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 		wantCount int
 		wantVals  []string // 与 assistant 消息一一对应；空串表示任意 string
 	}{
-		{"assistant 带 reasoning 无 reasoning_content → 复制",
+		{"assistant 带 reasoning 无 reasoning_content → 补空串（v3：不复制）",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"user","content":"u"},
 				{"role":"assistant","content":"a","reasoning":"thought text"}]}`,
-			1, []string{"thought text"}},
+			1, []string{""}},
 		{"assistant 带 reasoning_content 原样保留",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning_content":"already there"}]}`,
 			1, []string{"already there"}},
-		{"混合会话全量补上：无 reasoning 的 assistant 补空串",
+		{"混合会话全量补上：均补空串",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"user","content":"u"},
 				{"role":"assistant","content":"a1","reasoning":"t1"},
 				{"role":"user","content":"u2"},
 				{"role":"assistant","content":"a2"}]}`,
-			2, []string{"t1", ""}},
+			2, []string{"", ""}},
 		{"assistant reasoning 为空串视为无 reasoning 痕迹",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":""}]}`,
 			1, []string{"<absent>"}},
-		{"多 assistant 都带 reasoning 全部复制",
+		{"多 assistant 都带 reasoning 均补空串",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a1","reasoning":"r1"},
 				{"role":"assistant","content":"a2","reasoning":"r2"}]}`,
-			2, []string{"r1", "r2"}},
+			2, []string{"", ""}},
 		{"reasoning 非 string 值（数字）按空串处理",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":123}]}`,
@@ -137,7 +141,8 @@ func TestBackfillReasoningContentNonDeepSeek(t *testing.T) {
 }
 
 // TestBackfillReasoningContentBothFields 同时带 reasoning 与 reasoning_content：
-// 以 reasoning_content 为准（不覆盖），reasoning 字段保留（兼容）——对齐客户端 matches 规则。
+// reasoning_content 以已有值为准（不覆盖）；reasoning 字段保留但**值被清空**
+// （v3：历史推理不进上下文，省 16 万 token/请求）。
 func TestBackfillReasoningContentBothFields(t *testing.T) {
 	body := `{"model":"deepseek-v4-flash","messages":[
 		{"role":"assistant","content":"a","reasoning":"t","reasoning_content":"existing"}]}`
@@ -146,28 +151,31 @@ func TestBackfillReasoningContentBothFields(t *testing.T) {
 	if len(got) != 1 || got[0] != "existing" {
 		t.Errorf("reasoning_content 应以已有值为准: got %v (out=%s)", got, out)
 	}
-	// 同时确认 reasoning 字段仍原样保留。
+	// 同时确认 reasoning 字段**存在但值已清空**（v3）。
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatal(err)
 	}
 	msgs, _ := m["messages"].([]any)
 	first, _ := msgs[0].(map[string]any)
-	if r, ok := first["reasoning"].(string); !ok || r != "t" {
-		t.Errorf("reasoning 字段被改动: %v (out=%s)", first, out)
+	r, ok := first["reasoning"].(string)
+	if !ok {
+		t.Errorf("reasoning 字段应保留: %v (out=%s)", first, out)
+	} else if r != "" {
+		t.Errorf("reasoning 值应被清空（v3），实际 %q (out=%s)", r, out)
 	}
 }
 
 // TestBackfillComposesWithInjectThinking backfill 与 injectThinking 相互独立：
-// 显式 disabled 时 reasoning_effort 被删，但 backfill 照常生效（多轮一致性不因关思维链而丢）。
+// 显式 disabled 时 reasoning_effort 被删，但 backfill 照常生效（补字段，v3 补空串）。
 func TestBackfillComposesWithInjectThinking(t *testing.T) {
 	body := `{"model":"DEEPSEEK-v4-flash","thinking":{"type":"disabled"},"reasoning_effort":"high","messages":[
 		{"role":"user","content":"u"},
 		{"role":"assistant","content":"a","reasoning":"thought"}]}`
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	got := assistantRC(t, out)
-	if len(got) != 1 || got[0] != "thought" {
-		t.Errorf("disabled 时 backfill 仍应生效: got %v (out=%s)", got, out)
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("disabled 时 backfill 仍应生效（v3 补空串）: got %v (out=%s)", got, out)
 	}
 	if typ, present := getThinkingType(t, out); !present || typ != "disabled" {
 		t.Errorf("thinking.type 应保留 disabled, got %q present=%v", typ, present)
