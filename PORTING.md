@@ -182,6 +182,8 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> <file:TestName> [...]
 | 面板独有生产逻辑 | `session.deriveKey`（无会话标识客户端的内容派生粘性兜底） | 只在 `ExtractKey` 末尾内部调用，外部无引用 → 静默丢失，客户端从"能粘"变"纯轮转" |
 | 面板自有测试用例 | 30 条（pool 软退避/TokenUsage 持久化、server 静态兜底、cmd/server 配置…） | 测试丢了不报错，回归网静默变薄 |
 
+> ⚠️ **2026-09-19 更新**：`session.deriveKey` 已**退役** —— 上游 `8058019`/`10eefa8` 把同一能力**官方化**为 `session.StickyFallbackKey`（且更完善：多认 `prompt_cache_key`、带 `user_id` 抑制、`stickyKey` 与 `sessKey` 分离不污染头族聚合语义）。本仓已迁移到上游实现。上表保留为历史案例。
+
 **判据**：审计列出的「基线有、树里没有」的符号要逐条定性 ——
 ① **上游等价替代**（改名/合并/拆分，如 `softRateMarkers`→`softRateRule`、`PickExcluding*`→`PickExcludingForRealm`）；
 ② **有意退役**（`streak.*`、`SetMaxBodyBytes`）；
@@ -210,7 +212,7 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> <file:TestName> [...]
 | 14 | **面板渲染模型级 6004 限流（2026-09-17 加）** | `renderAccounts` 补渲染 `rate_limited_models`：账号级 healthy 但对某模型不可用时，原实现显示「可用」（面板从不渲染该字段，上游面板也没有）→ 现显示「xxx 限流 · 剩余时间」标签（带 tooltip 列全部受限模型与到期时刻）。**账号级冷却/熔断/降权的既有渲染不变** |
 | 15 | **内容拦截回的是上游原文 + 英文 hint（跟随上游，2026-09-17 审计确认）** | 面板版把内容拦截改写成中文分类文案（`触发网站风控违禁词…内容命中网关内容防火墙规则[色情]`，按 色情/暴力/政治/赌博/毒品 归类）；上游改为 **error-passthrough**：`message` 装上游 body 原文，`gateway_hint` = `request content was rejected by content policy; adjust the prompt and retry`（**不含上游字样**，有泄漏守卫测试）。要恢复中文分类需在 `hintOf` 里按 `upstream` 的关键词表拼一句 —— 属面板层增强，可做但会分叉 |
 | 16 | **`model_cooldowns` 现在落盘（跟随上游）** | 面板把模型级 6004 冷却当**运行时态**（不落盘、重启清零，两个用例锁定）；上游 `stateAccount.ModelCooldowns` 带 `json:"model_cooldowns"` → **持久化**，重启不失忆。面板那两条断言已删 |
-| 17 | ⭐ **`session.deriveKey` 内容派生粘性兜底（面板独有，2026-09-17 恢复 `fix_iter15.py`）** | 上游 `ExtractKey` 只认显式 `conversation_id`/`conversationId`/`metadata.*`，无标识客户端（dsh/Codex/Cherry Studio）恒空 → 不粘、同对话换号、上游前缀缓存 miss。面板版末尾有兜底：`SHA-256(system 文本 + 首条 user 文本)` 前 16 字节 → 键前缀 `d-`（与显式 id 命名空间隔离）。**换基时漏贴了它**（无外部引用 → 编译不报错），导致 dsh 从"能粘"变"纯轮转"。恢复后实测：同 body 连发 3 次固定落同一账号 |
+| 17 | ✅ **`session.deriveKey` 已退役（2026-09-19 迁到上游实现）** | 上游 `8058019`+`10eefa8` 把该能力**官方化**为 `session.StickyFallbackKey`（首条 user 文本 sha256 前 16 字节，前缀 `fb:`），且比我们原来更完善：① `ExtractKey` 多认 **`prompt_cache_key`**（pi-ai/dsh 系客户端把会话 ID 放这里，网关 upstream 侧本就认它）；② **`hasUserID` 抑制**（带 `metadata.user_id` / 顶层 `user_id` 的请求不参与 fallback，守 P1-anti-monopoly 契约）；③ ⭐ **`stickyKey` 与 `sessKey` 分离** —— 上游注释明确「不能直接改 `sessKey`：那会连带改变上游头族 `RequestIDForKey` 的聚合语义（会话级 vs 轮级兜底），属于另一条链路的契约」，而我们原来的 `deriveKey` 正是**塞在 `ExtractKey` 内部返回**，属设计偏差，本次一并纠正。另 `a767465` 的 `contentSignature` 让 `firstUserText` 也吃多模态 parts（纯图片轮/首图会话不再碎片化），我们原来只取文本。本仓现仅保留纯诊断的 **`session.ProbeMissingKey`**（只记键名、不改任何出站请求） |
 
 ---
 
@@ -280,7 +282,33 @@ git -C /vol4/_rebase_try_B apply -v /vol4/_pr161_x.patch      # _rebase_try_B �
   且 `/status` 的 `total/healthy/cooling/sticky` **完全不变**（状态未被重置 —— 正是 PR 用例
   `TestReloadAuthDirPreservesState` 锁的契约："热加载不得重置既有账号的冷却/计数状态"）。
 
-> ⚠️ PR 若后续被上游合并（或内容有变），**要回来重审这一节**：本仓是"提前采纳"，不是"已对齐上游"。
+> ✅ **2026-09-19 复核：PR #161 已被上游合并**（`4b6db7c` Merge pull request #161，含 `f044e5c` ① / `733d348` ② / `c2c0201` ③ + `480ade3` dev.sh）。
+> 逐文件核对：`client_english_test.go` **逐字节一致**；`watch.go`/`watch_test.go` 仅差 2 行（**模块路径**，预期差异）；
+> 英文限流正则最终形态 `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})` **与本仓一致**。
+> → 当时的"提前采纳"落得准确，**无需返工**；本节从"提前采纳"转为"**已对齐上游**"。
+
+---
+
+## 5.2 2026-09-19 增量同步（根上游 `9d1a21b → a767465`，13 提交）
+
+本次采纳 3 组：
+
+| 上游提交 | 内容 | 落地要点 |
+|---|---|---|
+| `3b048ec` | `backfillReasoningContent` 门控对齐官方（`thinkingEnabled \|\| hasTrace`）+ 非 string 值归一化（#165） | 补丁**干净应用**（`thinking.go` + `backfill_test.go`）。注意：仍是**复制** `reasoning` 值 —— 再次确认"历史 reasoning 回放"是上游设计而非 bug |
+| `4ac68b7` | global chat 固定走 `/v2/chat/completions`（绕开 `/console` 的腾讯云 WAF 内容规则，#119） | `client.go` 6 hunk 干净应用；`handler_global_test.go` 因上下文不同**手工改 3 处路径断言**；旧 console→v2 fallback 已移除 |
+| `8058019`+`10eefa8`+`a767465` | session 兜底键**官方化**：`StickyFallbackKey` / `hasUserID` / `prompt_cache_key` / `contentSignature` | **覆盖** `internal/session/{session,ids,session_test,ids_test}.go` + 新增 `ids_signature_test.go`；`handler.go` **手工移植 4 处**（stickyKey 派生 + 粘性判断/解析/解绑/绑定切到 stickyKey，**会话头族保持 sessKey**）；`handler_test.go` 的 `TestHandlerAppendTurnKeyStable` 恢复上游版（原断言依赖已删的 `deriveKey`）；`handler_ids_test.go` 同步（含新增 `TestChatImageTurnAggregation`） |
+
+**本仓保留的唯一 session 包增强**：`session.ProbeMissingKey`（纯诊断，只记键名；已补 `import "sort"`）。
+**必改 import**：session 包与 `handler_ids_test.go` 里的 `workbuddy2api/internal/...` → `github.com/linguo2625469/workbuddy2api-panel/internal/...`。
+
+**未采纳**（有意）：
+- `a20d06f` admin 账号临时停用/恢复/复活（+1367 行，含 `config admin.enabled` 开关与 `/admin/accounts/{uid}/...` 路由）—— 上游新功能，本仓暂不需要；
+- `4f574ce` Windows 原生服务脚本、`480ade3` dev.sh —— 与本仓 docker 部署方式无关。
+
+**验收**：`go build` / `go vet` / `go test`（**19 包**）全绿。`gofmt` 报的 `session.go`/`client.go`/`handler.go` 差异均为**上游/既有**（注释缩进风格、`handler.go` map 对齐老问题），非本次引入。
+
+> ⚠️ 上游做过 **rebase**（先前记录的 `d2cd004` 等 SHA 已不在 `origin/master` 历史里）→ 引用上游提交 SHA 时**要重新核对**。
 
 ## 6. 禁止事项
 
@@ -291,7 +319,7 @@ git -C /vol4/_rebase_try_B apply -v /vol4/_pr161_x.patch      # _rebase_try_B �
 - ⚠️ 上游带 Revert 历史的改动不要跟着搬（先看 `git log`）
 - ✅ 日期敏感测试的 TZ 坑已由上游 **#130** 修掉（测试桩改 CST 自然日口径）→ **2026-09-17 起不再需要 `TZ=Asia/Shanghai`**
 - ⛔ 别把 `internal/panel/*`（app.js/index.html/panel.go）退回旧版——面板仓库 1.10.0 的 UI 增量（连败降权显示、成本台账 tooltip、模型能力徽标）必须保留
-- ⛔ 别把 `internal/session/session.go` 的 `deriveKey` 兜底退回上游版（面板层增强，见 §4 第 17 条）——退回即"无会话标识客户端粘性失效"
+- ✅ **`deriveKey` 已于 2026-09-19 退役**（上游 `8058019`/`10eefa8` 官方化为 `StickyFallbackKey`，比我们原实现更完善）→ **别再补回 `deriveKey`**；同步 session 包时只需保留纯诊断的 `session.ProbeMissingKey`（见 §4 第 17 条）
 - ⛔ 别在同步时整批覆盖**面板自有测试用例**（`internal/pool/*_test.go`、`internal/server/handler_test.go`、`cmd/server/config_test.go`、`internal/upstream/client_test.go` 等）——文件在≠用例在，丢了不报错
 - ⛔ 别把 `internal/pool/watch.go` / `watch_test.go` 的 import 退回上游写法 `workbuddy2api/internal/auth`——本仓模块名是 `github.com/linguo2625469/workbuddy2api-panel`，退回即编译不过（见 §5.1）
 - ⚠️ **别用 `git checkout .` / `git stash` / `git reset --hard` 回退**。2026-09-18 曾发现工作树领先 HEAD 63 个文件（含生产文件），已提交让 **HEAD == 工作树**（`f204e68`）；但容器是 `build: .`，**部署真相始终是工作树** → 改前先 `git status --short`，回退用 `git revert`/逐文件恢复
