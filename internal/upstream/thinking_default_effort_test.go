@@ -8,7 +8,7 @@ import (
 // → 注入 medium 而非硬编码 high。
 func TestInjectThinkingUsesModelDefaultEffort(t *testing.T) {
 	out := PrepareBodyOptWithEffortsAndDefault(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false, nil,
 		map[string]string{"deepseek-v4-flash": "medium"})
 	eff, _ := objFieldString(t, out, "reasoning_effort")
@@ -20,7 +20,7 @@ func TestInjectThinkingUsesModelDefaultEffort(t *testing.T) {
 // TestInjectThinkingFallsBackToHardcoded P1：缓存无该模型 → 用硬编码 high（向后兼容）。
 func TestInjectThinkingFallsBackToHardcoded(t *testing.T) {
 	out := PrepareBodyOptWithEffortsAndDefault(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false, nil, nil)
 	eff, _ := objFieldString(t, out, "reasoning_effort")
 	if eff != "high" {
@@ -32,7 +32,7 @@ func TestInjectThinkingFallsBackToHardcoded(t *testing.T) {
 // → 回退硬编码 high。
 func TestInjectThinkingEmptyDefaultEffortFallsBack(t *testing.T) {
 	out := PrepareBodyOptWithEffortsAndDefault(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false, nil,
 		map[string]string{"deepseek-v4-flash": ""})
 	eff, _ := objFieldString(t, out, "reasoning_effort")
@@ -46,7 +46,7 @@ func TestInjectThinkingEmptyDefaultEffortFallsBack(t *testing.T) {
 // 此用例验证默认档也走降级：medium 在 [low,high] 中无匹配，向下取 low。
 func TestInjectThinkingDefaultEffortDowngrades(t *testing.T) {
 	out := PrepareBodyOptWithEffortsAndDefault(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false,
 		map[string][]string{"deepseek-v4-flash": {"low", "high"}},
 		map[string]string{"deepseek-v4-flash": "medium"})
@@ -58,4 +58,3 @@ func TestInjectThinkingDefaultEffortDowngrades(t *testing.T) {
 }
 
 // objFieldString 见 thinking_test.go（复用）。
-

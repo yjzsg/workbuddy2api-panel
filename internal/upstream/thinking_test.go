@@ -26,24 +26,25 @@ func getThinkingType(t *testing.T, out []byte) (typ string, present bool) {
 
 // TestInjectThinkingDeepSeekEnabled 开思考开关注入：deepseek 系模型请求体不带
 // thinking 时必须注入 {type:"enabled"}，否则上游默认按不思考应答（思维链不显示）。
+// TestInjectThinkingDeepSeekEnabled 按需注入契约（2026-09-18 起）：
+// 有思考意图（reasoning_effort / reasoning_summary / reasoning.effort）→ 注入 enabled；
+// 无思考意图 → 不注入（保持上游默认「不思考」，避免 only_reasoning 模型 reasoning 膨胀）。
 func TestInjectThinkingDeepSeekEnabled(t *testing.T) {
-	cases := []struct {
+	withIntent := []struct {
 		name    string
 		body    string
 		wantTyp string
 	}{
-		{"deepseek 无 thinking 注入 enabled",
-			`{"model":"deepseek-v4-flash","messages":[]}`, "enabled"},
-		{"DeepSeek 大小写不敏感",
-			`{"model":"DeepSeek-v4.1-flash","messages":[]}`, "enabled"},
-		{"DEEPSEEK 全大写不敏感",
-			`{"model":"DEEPSEEK-R1","messages":[]}`, "enabled"},
-		{"deepseek 带 reasoning_effort 无 thinking 注入 enabled",
+		{"deepseek 带 reasoning_effort 注入 enabled",
 			`{"model":"deepseek-v4-flash","reasoning_effort":"medium","messages":[]}`, "enabled"},
-		{"deepseek thinking 对象 type 空 补 enabled",
-			`{"model":"deepseek-v4-flash","thinking":{},"messages":[]}`, "enabled"},
+		{"DeepSeek 大小写不敏感（带意图）",
+			`{"model":"DeepSeek-v4.1-flash","reasoning_summary":"auto","messages":[]}`, "enabled"},
+		{"DEEPSEEK 全大写不敏感（带意图）",
+			`{"model":"DEEPSEEK-R1","reasoning_summary":"auto","messages":[]}`, "enabled"},
+		{"deepseek thinking 对象 type 空 + 有意图 → 补 enabled",
+			`{"model":"deepseek-v4-flash","thinking":{},"reasoning_summary":"auto","messages":[]}`, "enabled"},
 	}
-	for _, c := range cases {
+	for _, c := range withIntent {
 		t.Run(c.name, func(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
 			typ, present := getThinkingType(t, out)
@@ -55,15 +56,34 @@ func TestInjectThinkingDeepSeekEnabled(t *testing.T) {
 			}
 		})
 	}
+
+	// 无思考意图：不得把 thinking.type 置为 enabled，也不得补 reasoning_effort。
+	// 注意：客户端自带的 `thinking:{}`（type 为空）**保留原样**即可 —— 上游见 type 为空
+	// 按默认（不思考）处理，网关无需删字段。
+	noIntent := []struct{ name, body string }{
+		{"deepseek 裸请求不注入", `{"model":"deepseek-v4-flash","messages":[]}`},
+		{"deepseek thinking 空对象不注入", `{"model":"deepseek-v4-flash","thinking":{},"messages":[]}`},
+	}
+	for _, c := range noIntent {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+			if typ, present := getThinkingType(t, out); present && typ == "enabled" {
+				t.Errorf("无思考意图不应把 thinking.type 置为 enabled (out=%s)", out)
+			}
+			if _, ok := objFieldString(t, out, "reasoning_effort"); ok {
+				t.Errorf("无思考意图不应补 reasoning_effort (out=%s)", out)
+			}
+		})
+	}
 }
 
 // TestInjectThinkingDefaultEffort 打回修复主证据：无 effort 裸请求必须同时带
 // thinking.type=enabled 与默认档 reasoning_effort（否则上游 deepseek-v4-flash 不开思维链）。
 // 默认档 = 官方客户端兜底 "high"，并带上 supportedEfforts 时经降级管线落到合法档。
 func TestInjectThinkingDefaultEffort(t *testing.T) {
-	// 裸请求无任何思考参数 → 注入 enabled + reasoning_effort="high"。
+	// 有思考意图（reasoning_summary）但无 effort → 注入 enabled + 默认档 reasoning_effort="high"。
 	out := PrepareBodyOptWithEfforts(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[{"role":"user","content":"hi"}]}`),
 		false, nil)
 	typ, present := getThinkingType(t, out)
 	if !present || typ != "enabled" {
@@ -76,7 +96,7 @@ func TestInjectThinkingDefaultEffort(t *testing.T) {
 
 	// 模型只支持 low/high → 默认 high 经降级管线后仍是 high（合法档）。
 	out = PrepareBodyOptWithEfforts(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false, map[string][]string{"deepseek-v4-flash": {"low", "high"}})
 	eff, _ = objFieldString(t, out, "reasoning_effort")
 	if eff != "high" {
@@ -85,7 +105,7 @@ func TestInjectThinkingDefaultEffort(t *testing.T) {
 
 	// 模型只支持 minimal/low → 默认 high 降级到 low（≤high 的最高支持档）。
 	out = PrepareBodyOptWithEfforts(
-		[]byte(`{"model":"deepseek-v4-flash","messages":[]}`),
+		[]byte(`{"model":"deepseek-v4-flash","reasoning_summary":"auto","messages":[]}`),
 		false, map[string][]string{"deepseek-v4-flash": {"minimal", "low"}})
 	eff, _ = objFieldString(t, out, "reasoning_effort")
 	if eff != "low" {

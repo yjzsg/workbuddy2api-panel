@@ -142,14 +142,46 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		return
 	}
 	// 无 thinking（或 thinking 非法非对象值）或 thinking 对象 type 缺失/为空：
-	// 注入 enabled（客户端 case "deepseek" 行为）。有 reasoning_effort 也走此分支
-	// （effort 保留给既有降级逻辑，开关照开）。
+	//
+	// 【2026-09-18 修复】只有客户端**表达了思考意图**时才注入 enabled，否则保持上游默认
+	// （不思考）——对齐官方客户端 `isThinkingEnabled = !!(reasoning_summary ||
+	// reasoning_effort || reasoning?.effort)`。
+	//
+	// 原实现无条件注入：实测对 `global:deepseek-v4.1-flash`（only_reasoning:true）这类模型，
+	// 会把「客户端根本没要思考」的请求也强制开思考 → reasoning 膨胀吃满 max_tokens →
+	// **content 被挤空**（finish_reason=length、clen=0）→ 用户侧表现为「卡循环」。
+	// 同一任务实测对照：经网关（强制开思考）reasoning 987→4250、content 多次为 0；
+	// 显式 thinking=disabled 则全程 reasoning=0、content 正常增长、全部 finish=stop。
+	//
+	// 注意 #43 不回退：该 issue 的场景是「客户端带了 reasoning_effort 但没带 thinking 开关」，
+	// 此时 hasThinkingIntent 为真，仍会注入 —— 思维链照常返回。
+	if !hasThinkingIntent(obj) {
+		return
+	}
 	if !ok {
 		obj["thinking"] = map[string]any{"type": "enabled"}
 	} else {
 		th["type"] = "enabled"
 	}
 	ensureDeepSeekEffort(obj, defaultEffort)
+}
+
+// hasThinkingIntent 报告请求体是否表达了「要思考」的意图，口径对齐官方客户端
+// `isThinkingEnabled`：reasoning_summary / reasoning_effort / reasoning.effort 任一存在即真。
+// 用于避免无条件注入 thinking.enabled 把「客户端没要思考」的请求强制拉进思考模式。
+func hasThinkingIntent(obj map[string]any) bool {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort", "reasoning_summary", "reasoningSummary"} {
+		if v, ok := obj[k]; ok && v != nil {
+			return true
+		}
+	}
+	// reasoning:{effort:...} 形态（官方 reasoning?.effort）
+	if r, ok := obj["reasoning"].(map[string]any); ok {
+		if v, ok := r["effort"]; ok && v != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
