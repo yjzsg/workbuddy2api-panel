@@ -301,16 +301,37 @@ func TestChatTurnKeyStableAcrossAgentSteps(t *testing.T) {
 	}
 }
 
-// TestChatSessionKeyBeatsTurnKey 会话键优先于轮级兜底：带 conversationId 时聚合键是
-// 会话级的（跨轮同键，不随末条 user 消息变化），与无会话键的轮级行为明确区分。
-func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
+// TestChatSessionKeyTurnLevel issue #170：带会话键的客户端也统一走轮级聚合
+// （对齐官方桌面 CLI 的 X-Conversation-Request-ID 轮级语义——TraceStartHook 每次
+// USER_PROMPT_SUBMIT 清空重生成）。会话键以复合键 sessKey+":"+turnKey 入键：
+// 同轮内稳定（含 agent 多步与换号重试），跨轮换键；不同会话的同轮文本不互撞。
+//
+// ⚠️ 本测试替换了原 TestChatSessionKeyBeatsTurnKey —— 原断言「带会话键则跨轮同键」
+// 是 #170 之前的行为，已被有意改掉（不是回归）。
+func TestChatSessionKeyTurnLevel(t *testing.T) {
+	// 同一会话、不同轮 → 必换键（轮级）。
 	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
 	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第二问"}]}`)
 	if a == "" {
 		t.Fatal("X-Conversation-Request-ID missing")
 	}
-	if a != b {
-		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
+	if a == b {
+		t.Errorf("#170 起会话键路径按轮聚合（跨轮必换键）: %q", a)
+	}
+
+	// 同一会话、同一轮内 agent 多步（末条 user 不变）→ 同键。
+	a2 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[`+
+		`{"role":"user","content":"第一问"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"pwsh"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"结果"}]}`)
+	if a != a2 {
+		t.Errorf("轮内追加消息不应改变聚合键: %q vs %q", a, a2)
+	}
+
+	// 不同会话、同轮文本 → 不互撞（会话段入复合键）。
+	c := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-y","messages":[{"role":"user","content":"第一问"}]}`)
+	if c == a {
+		t.Errorf("不同会话的同轮文本不应互撞: %q", c)
 	}
 }
 
