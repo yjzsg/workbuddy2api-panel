@@ -292,6 +292,10 @@ $('btnKeepaliveAll').onclick = async () => {
   try { await api('keepalive_all', { method: 'POST' }); toast('全部保活已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
+$('btnDailyChatAll').onclick = async () => {
+  try { await api('dailychat_all', { method: 'POST' }); toast('每日对话保底已开始，结果见日志', 'ok'); }
+  catch (e) { toast(e.message, 'err'); }
+};
 $('btnTravelAll').onclick = async () => {
   try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }

@@ -174,6 +174,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
+	p.mux.HandleFunc("POST /panel/api/dailychat_all", p.withAuth(p.dailyChatAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
@@ -480,6 +481,18 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	}
 	go p.cfg.Scheduler.RunKeepaliveNow()
 	log.Printf("panel: 手动全量保活已触发")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// dailyChatAll 手动触发全量每日对话保底（异步执行）：国际版 30 分硬条件
+// （当天须至少 1 次有效对话）的即时补打入口。模型按 realm 取 x0.00 免费档。
+func (p *Panel) dailyChatAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	go p.cfg.Scheduler.RunDailyChatNow()
+	log.Printf("panel: 手动全量每日对话保底已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
