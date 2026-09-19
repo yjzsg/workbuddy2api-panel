@@ -9,6 +9,7 @@ package scheduler
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -47,11 +48,23 @@ func (s *Scheduler) RunDailyChatNow() {
 		go func(a *auth.Auth, uid, nickname string) {
 			defer wg.Done()
 			model := dailyChatModel(a)
-			if err := s.cfg.Upstream.DesktopDailyChat(a, model); err != nil {
-				log.Printf("daily chat %s (%s): %v", logfmt.Label(uid, nickname), model, err)
-				return
+			// 一次重试（间隔 2s）：并发下偶发流形态异常——实测 29 号两轮各失败 1 号，
+			// 且失败账号每轮不同（单号复测恒 200），重试一次即可覆盖。
+			var err error
+			for attempt := 1; attempt <= 2; attempt++ {
+				if attempt > 1 {
+					time.Sleep(2 * time.Second)
+				}
+				if err = s.cfg.Upstream.DesktopDailyChat(a, model); err == nil {
+					suffix := ""
+					if attempt > 1 {
+						suffix = " [retry]"
+					}
+					log.Printf("daily chat %s: ok (%s)%s", logfmt.Label(uid, nickname), model, suffix)
+					return
+				}
 			}
-			log.Printf("daily chat %s: ok (%s)", logfmt.Label(uid, nickname), model)
+			log.Printf("daily chat %s (%s): %v", logfmt.Label(uid, nickname), model, err)
 		}(a, st.UID, st.Nickname)
 	}
 	wg.Wait()

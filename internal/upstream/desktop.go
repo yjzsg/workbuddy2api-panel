@@ -417,19 +417,26 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (string, string, error) {
-	return c.desktopChat(a, "fast-model", expertID)
+	return c.desktopChat(a, "fast-model", expertID, true)
 }
 
 // DesktopDailyChat 每日对话保底：与桌面指纹 chat 同形，模型由调用方指定（按 realm
 // 选免费档，见 scheduler.dailyChatModel），用于满足「当天须至少 1 次有效对话」的
 // 积分硬条件。成功判据同 DesktopChatWithExpert——SSE 里拿到服务端 requestId。
 func (c *Client) DesktopDailyChat(a *auth.Auth, model string) error {
-	_, _, err := c.desktopChat(a, model, "")
+	_, _, err := c.desktopChat(a, model, "", false)
 	return err
 }
 
 // desktopChat DesktopChatWithExpert / DesktopDailyChat 的共同实现：model 参数化。
-func (c *Client) desktopChat(a *auth.Auth, model, expertID string) (conversationID, requestID string, err error) {
+// requireID 决定成功判据：
+//
+//	true  （专家链路）——必须在 SSE 里解析出**服务端 requestId**：expert_actual_use
+//	      等 JOIN 事件的 requestId 必须是它，自造 UUID 不计数。
+//	false （每日对话保底）——HTTP 200 且流里出现 data 帧即算成功（真发生了一次
+//	      对话）。实测并发跑 29 号时偶有 1 号解析不到 id，且**失败账号每轮不同**
+//	      （单号复测恒 200），属流形态差异，对「当天是否发生过对话」无影响。
+func (c *Client) desktopChat(a *auth.Auth, model, expertID string, requireID bool) (conversationID, requestID string, err error) {
 	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
 	body := map[string]any{
 		"model": model,
@@ -541,6 +548,11 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string) (conversation
 		if rerr != nil || len(buf) > 1<<20 {
 			break
 		}
+	}
+	if !requireID && bytes.Contains(buf, []byte("data:")) {
+		// 宽松判据（每日对话保底）：HTTP 200 且流里有 data 帧 = 真发生了一次对话。
+		// id 为空不影响调用方（DesktopDailyChat 不消费返回值）。
+		return conversationID, "", nil
 	}
 	return "", "", fmt.Errorf("SSE 中未找到服务端 requestId")
 }
