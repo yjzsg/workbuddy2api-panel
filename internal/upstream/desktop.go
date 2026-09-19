@@ -451,6 +451,17 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string) (conversation
 		return "", "", err
 	}
 	h := req.Header
+	// 客户端身份（沿用激活账号 / 常规 chat 出站的口径）：上游的判据是
+	// 「通过 WorkBuddy / CodeBuddy 客户端发起」，出站必须像真实客户端——
+	// 只带 UA + X-Domain 是不够的。CommonHeaders 注入 Origin / Referer /
+	// X-Requested-With / X-CodeBuddy-Request / Accept-Language 与按 uid
+	// 稳定派生（跨重启固定、账号间互异）的 X-Machine-ID / X-Session-ID；
+	// 再叠 X-Device-Token（每号 auth > 全局 config > 文件，缺省不注入）与
+	// global 域的 X-No-Enterprise-Id 声明。桌面实测 UA / X-Domain / X-Product
+	// 在最后覆盖（CommonHeaders 的 UA 按 realm 切品牌段，这里统一用桌面值）。
+	c.CommonHeaders(req, a)
+	c.injectDeviceToken(req, a)
+	c.injectGlobalChatHeaders(req, a)
 	h.Set("Authorization", "Bearer "+a.AccessToken)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
@@ -501,17 +512,30 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string) (conversation
 				}
 				fmt.Printf("[dbg-rd %d] %q\n", n, dbg)
 			}
-			if i := bytes.Index(buf, []byte(`"id":"`)); i >= 0 {
-				rest := buf[i+6:]
-				if end := bytes.IndexByte(rest, '"'); end > 0 {
-					id := string(rest[:end])
-					if os.Getenv("WB2A_DEBUG_CHAT") != "" {
-						fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
-					}
-					if idRegex.MatchString(id) {
-						return conversationID, id, nil
-					}
+			// 遍历 buffer 内**所有** `"id":"` 出现位置，取第一个形状合法的。
+			// 原实现只看第一个出现位置：若它不是 requestId 形态（流首帧可能是心跳
+			// 或其他对象），就永远匹配不上，直到 buffer > 1MB 才报「未找到」——
+			// 实测 29 号里 1 号 cn 账号（hy3）即因此失败，同号单独复测为 200。
+			off := 0
+			for {
+				i := bytes.Index(buf[off:], []byte(`"id":"`))
+				if i < 0 {
+					break
 				}
+				i += off
+				rest := buf[i+6:]
+				end := bytes.IndexByte(rest, '"')
+				if end <= 0 {
+					break // id 值跨帧截断：等下一轮 Read 补全后再扫
+				}
+				id := string(rest[:end])
+				if os.Getenv("WB2A_DEBUG_CHAT") != "" {
+					fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
+				}
+				if idRegex.MatchString(id) {
+					return conversationID, id, nil
+				}
+				off = i + 6
 			}
 		}
 		if rerr != nil || len(buf) > 1<<20 {
