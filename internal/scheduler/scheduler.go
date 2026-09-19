@@ -30,6 +30,9 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	// DailyChatHours 默认 [8]：每日对话保底（国际版 30 分硬条件——当天须至少
+	// 1 次有效对话；模型按 realm 选 x0.00 免费档，零积分消耗）。
+	DailyChatHours []int
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -52,6 +55,8 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+	// DailyChatDisabled 显式关闭每日对话保底排程（schedule.daily_chat_enabled=false）。
+	DailyChatDisabled bool
 
 	// CNInviteCode CN 侧邀请码（空 = 不跑本任务）。[面板层：CN 邀请活动]
 	CNInviteCode string
@@ -119,6 +124,9 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
 	}
+	if len(cfg.DailyChatHours) == 0 {
+		cfg.DailyChatHours = []int{8}
+	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
@@ -184,6 +192,7 @@ const (
 	taskSchool
 	taskCat
 	taskCNInvite
+	taskDailyChat
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -200,6 +209,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	schoolOff, catOff := s.cfg.SchoolDisabled, s.cfg.CatDisabled
 	cnInviteCode, cnInviteHours, cnInviteUntil := s.cfg.CNInviteCode, s.cfg.CNInviteHours, s.cfg.CNInviteUntil
 	cnInviteOff := s.cfg.CNInviteDisabled
+	dailyChatHours, dailyChatOff := s.cfg.DailyChatHours, s.cfg.DailyChatDisabled
 	s.schedMu.Unlock()
 
 	type slot struct {
@@ -227,6 +237,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !cnInviteOff && cnInviteCode != "" && cnInviteInWindow(now, cnInviteUntil) {
 		slots = append(slots, slot{nextFire(now, cnInviteHours), taskCNInvite})
+	}
+	if !dailyChatOff {
+		slots = append(slots, slot{nextFire(now, dailyChatHours), taskDailyChat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -344,6 +357,8 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.RunBlackcatNow()
 	case taskCNInvite:
 		s.RunCNInviteAllNow()
+	case taskDailyChat:
+		s.RunDailyChatNow()
 	}
 }
 
@@ -764,7 +779,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 
 // RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的账号解**余额型冷却** CoolHard；
-	// 429/6004 的限流软冷却不受余额刷新影响——配额未恢复时解冻会被立刻再撞），
+// 429/6004 的限流软冷却不受余额刷新影响——配额未恢复时解冻会被立刻再撞），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 // [贴回：面板 scheduler/scheduler.go，适配上游签名（UserResourceDetailed 分桶；
@@ -807,8 +822,8 @@ func poke(ch chan struct{}) {
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config normalize 的回落语义一致）。
 // 参数名沿用面板配置词汇（blackcatHours → 内部 CatHours 域）。[面板层：热配置]
-func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, schoolHours []int,
-	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, schoolDisabled bool) {
+func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, schoolHours, dailyChatHours []int,
+	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, schoolDisabled, dailyChatDisabled bool) {
 	s.schedMu.Lock()
 	if len(checkinHours) > 0 {
 		s.cfg.CheckinHours = checkinHours
@@ -828,12 +843,16 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	if len(schoolHours) > 0 {
 		s.cfg.SchoolHours = schoolHours
 	}
+	if len(dailyChatHours) > 0 {
+		s.cfg.DailyChatHours = dailyChatHours
+	}
 	s.cfg.CheckinDisabled = checkinDisabled
 	s.cfg.TravelDisabled = travelDisabled
 	s.cfg.ActivityDisabled = activityDisabled
 	s.cfg.KeepaliveDisabled = keepaliveDisabled
 	s.cfg.CatDisabled = blackcatDisabled
 	s.cfg.SchoolDisabled = schoolDisabled
+	s.cfg.DailyChatDisabled = dailyChatDisabled
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)
 	poke(s.rearmBalance)

@@ -94,6 +94,7 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
 		CatHours:          []int{1},
 		SchoolDisabled:    true,
 		CatDisabled:       true,
+		DailyChatDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 14, 21, 0, 0, 0, time.Local); !at.Equal(want) {

@@ -543,12 +543,13 @@ func TestNextWakeTravelDisabled(t *testing.T) {
 // TestNextWakeActivityDisabled 活跃上报禁用后排程里不再有活跃时点。
 func TestNextWakeActivityDisabled(t *testing.T) {
 	s := New(Config{
-		CheckinHours:     []int{9, 21},
-		ActivityHours:    []int{10},
-		ActivityDisabled: true,
-		KeepaliveHours:   []int{22},
-		SchoolDisabled:   true,
-		CatDisabled:      true,
+		CheckinHours:      []int{9, 21},
+		ActivityHours:     []int{10},
+		ActivityDisabled:  true,
+		KeepaliveHours:    []int{22},
+		SchoolDisabled:    true,
+		CatDisabled:       true,
+		DailyChatDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -589,6 +590,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
+		DailyChatDisabled: true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},

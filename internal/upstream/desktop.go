@@ -416,10 +416,23 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // 解析**服务端返回的 requestId**（data.id，如 cmb-xxxx / 32hex）并返回。
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
-func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
+func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (string, string, error) {
+	return c.desktopChat(a, "fast-model", expertID)
+}
+
+// DesktopDailyChat 每日对话保底：与桌面指纹 chat 同形，模型由调用方指定（按 realm
+// 选免费档，见 scheduler.dailyChatModel），用于满足「当天须至少 1 次有效对话」的
+// 积分硬条件。成功判据同 DesktopChatWithExpert——SSE 里拿到服务端 requestId。
+func (c *Client) DesktopDailyChat(a *auth.Auth, model string) error {
+	_, _, err := c.desktopChat(a, model, "")
+	return err
+}
+
+// desktopChat DesktopChatWithExpert / DesktopDailyChat 的共同实现：model 参数化。
+func (c *Client) desktopChat(a *auth.Auth, model, expertID string) (conversationID, requestID string, err error) {
 	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
 	body := map[string]any{
-		"model": "fast-model",
+		"model": model,
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
 			map[string]any{"role": "user", "content": "1+1等于几？直接回答。"},

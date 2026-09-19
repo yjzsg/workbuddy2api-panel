@@ -182,10 +182,12 @@ func main() {
 		CatHours: cfg.Schedule.BlackcatHours,
 		// 开学季任务（Go API 闭环：四任务 + 抽奖；活动期外静默跳过）。
 		SchoolHours: cfg.Schedule.SchoolHours,
+		// 每日对话保底（国际版 30 分硬条件：当天须至少 1 次有效对话）。
+		DailyChatHours: cfg.Schedule.DailyChatHours,
 		// CN 邀请活动（面板层）：绑码 + 每天一次桌面事件链。
-		CNInviteCode:    cfg.Schedule.CNInviteCode,
-		CNInviteHours:   cfg.Schedule.CNInviteHours,
-		CNInviteUntil:   cfg.Schedule.CNInviteUntil,
+		CNInviteCode:     cfg.Schedule.CNInviteCode,
+		CNInviteHours:    cfg.Schedule.CNInviteHours,
+		CNInviteUntil:    cfg.Schedule.CNInviteUntil,
 		CNInviteDisabled: !cfg.Schedule.CNInviteEnabled,
 		// 活跃上报条数（上游语义：领猫前置需 5 次对话）。
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
@@ -197,6 +199,7 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		CatDisabled:        !cfg.Schedule.BlackcatEnabled,
 		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
+		DailyChatDisabled:  !cfg.Schedule.DailyChatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -232,6 +235,12 @@ func main() {
 		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
 	default:
 		log.Printf("开学季任务已启用：%v 点（Go API 闭环：四任务 + 抽奖）", cfg.Schedule.SchoolHours)
+	}
+	switch {
+	case !cfg.Schedule.DailyChatEnabled:
+		log.Printf("每日对话保底已禁用（schedule.daily_chat_enabled=false）")
+	default:
+		log.Printf("每日对话保底已启用：%v 点（国际版 30 分硬条件：当天须至少 1 次有效对话；x0.00 免费档）", cfg.Schedule.DailyChatHours)
 	}
 	switch {
 	case !cfg.Schedule.CNInviteEnabled:
@@ -281,7 +290,7 @@ func main() {
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath:  *cfgPath,
+		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -423,10 +432,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		newCfg.Schedule.SchoolHours,
+		newCfg.Schedule.SchoolHours, newCfg.Schedule.DailyChatHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
-		!newCfg.Schedule.SchoolEnabled)
+		!newCfg.Schedule.SchoolEnabled, !newCfg.Schedule.DailyChatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetCNInvite(newCfg.Schedule.CNInviteCode, newCfg.Schedule.CNInviteHours,
 		newCfg.Schedule.CNInviteUntil, !newCfg.Schedule.CNInviteEnabled)
