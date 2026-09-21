@@ -30,6 +30,9 @@
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5
   },
+  "admin": {
+    "enabled": false
+  },
   "global": {
     "enabled": true,
     "chat_base": "",

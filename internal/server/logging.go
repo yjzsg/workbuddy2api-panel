@@ -170,7 +170,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
-			// 缓存三段（上游实测字段名，供 /v1/stats 的 cache_* 口径）。
+			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
 			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
 			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
 			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
@@ -192,6 +192,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
 	}
+	s.cacheHit = chunk.Usage.PromptCacheHitTokens
+	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
+	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit

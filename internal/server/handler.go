@@ -62,6 +62,10 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
+	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+	AdminEnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -140,6 +144,17 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
+	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
+	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
+	// 探测回 mux 默认纯文本 404、对 GET 探测无 405+Allow 头，与真 404 完全不可
+	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
+	// 暴露管理面存在。
+	if cfg.AdminEnabled {
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -367,9 +382,9 @@ func (h *Handler) modelList() []map[string]any {
 	}
 	for _, mi := range infos {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
@@ -605,10 +620,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
-	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（对齐官方桌面 CLI
-	// 的 X-Conversation-Request-ID 轮级语义——TraceStartHook 每次 USER_PROMPT_SUBMIT
-	// 清空重生成），故不再限 sessKey=="" 才计算；sessKey 由下方派生处以复合键方式
-	// 入键（防不同会话同轮文本互撞）。
+	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（与官方桌面 CLI 的
+	// X-Conversation-Request-ID 轮级语义对齐），故不再限 sessKey=="" 才计算；
+	// sessKey 由调用侧以复合键方式入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
 	turnKey := session.TurnKey(body)
 
@@ -713,32 +727,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
-	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
-	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
-	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
-	// RequestID）。
+	// 会话头族（issue #35 / #170）：后台按 X-Conversation-Request-ID 聚合请求，官方
+	// 客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。**统一轮级**
+	// （对齐官方桌面 CLI：TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成
+	// conversationRequestId，同轮内复用、跨轮必换；官方云链路 lfConvReqId 的会话级
+	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
+	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
+	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
 	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
-	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先；否则按轮级
-	//     键生成（#170 起带会话键客户端也走轮级：sessKey+":"+turnKey 复合键，对齐官方
-	//     桌面 CLI 的 USER_PROMPT_SUBMIT 轮级语义）；无 user 消息时退化成本请求级随机
-	//     ——轮转内捕获一次即共享；
+	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
+	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
+	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
+	//       sessKey+":"+turnKey) 复合键（会话段入键保证不同会话同轮文本不互撞，
+	//       轮级粒度对齐官方 CLI）；无会话键客户端走既有 TurnRequestID(turnKey)
+	//       纯轮级键（存量会话键值零漂移）。
+	//     * turnKey 为空（残留空态：无 user 消息/无可签名内容）→ sessKey 非空时
+	//       回落 RequestIDForKey(sessKey)（会话级兜底，好于请求级随机）；sessKey
+	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
-		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞（#170 统一轮级）。
+		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞。
 		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
 	} else if turnKey != "" {
 		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
 		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	} else if sessKey != "" {
-		// 残留空态兜底（无 user 消息/无可签名内容）：会话级聚合，好于请求级随机。
+		// 残留空态兜底：无轮可聚合时维持会话级聚合（同会话恒同值）。
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
-		// 无会话键也无轮级键：请求级随机（TurnRequestID("") → NewMessageID）。
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
@@ -893,6 +915,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
+			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
+			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
+			if kind == upstream.ErrImageInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "image request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
+					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -1071,7 +1107,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 九条路径，各司其职：
+// 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
@@ -1092,6 +1128,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
 //     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
 //     该分支只为文档完备，不指望走到换号路径。
+//   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
+//     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
+//     不喂连败），chatCompletions 已直接透传原文返回不轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
@@ -1182,6 +1221,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
 		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
 		// 不指望走到换号路径。
+	case upstream.ErrImageInvalid:
+		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
+		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

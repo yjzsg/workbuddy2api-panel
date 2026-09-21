@@ -108,6 +108,10 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 和 AI 对话 3 次 | +50c +1抽奖 | viewed 后 3 条 `chat_request_send` 埋点（无需真实会话） |
 | 召唤开学季专家 | +50c +1抽奖 | viewed 后 mp 事件链（召唤×3 + 对话） |
 | 学生认证 | +100c | 需微信学生真实认证，不做 |
+- **分级熔断与冷却** — 429 软冷却（600s 起指数退避、封顶 `soft_rate_max`）、404 固定浅冷却、402 / 余额耗尽硬冷却至次日 04:00、连续失败熔断（`breaker_threshold` 触发后指数退避封顶 6h）
+- **模型级限流独立冷却** — 6004（该模型使用量超限）只冷却触发调用的模型，切其他模型立即可用；`/status` 透出 `rate_limited_models` 台账
+- **账号临时停用 / 恢复** — 运维可把某个号临时摘出选号池、观察后再放回，不必删凭证（issue #138/#118）。语义是「对话流量摘除」而非「账号冻结」：停用期间签到、token 保活、排程任务照常执行，账号仍在池里、状态照常透出。与系统自动禁用是**两个独立状态位**（`manual_disabled` / `disabled`），各自清除、都清空才回到选号池——避免运维意图被签到解冻等自动复活路径意外解除；停用状态随池状态落盘，重启保留。入口：`/admin/accounts/{uid}/{disable,enable,revive}` 端点 + `cmd/acct` CLI（默认关闭，`admin.enabled` 显式开启）
+- **状态持久化** — 池状态（积分 / 冷却 / 熔断 / 计数）本地原子落盘 `state.json`，可选镜像至 Upstash Redis，重启后择优恢复
 
 抽奖次数自动全部抽完。期间逆向成果（cf-connect 加密通道、mp 云对话全链路）记录在 `data/desktop-task-protocol.md` §8。
 
@@ -121,6 +125,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 任务中心扫描自动合并 mp 口径待办；accept 带**登记回读验证**（上游存在 200+OK 但未落账的形态，未生效自动重试一次）。
 
 ### 连登兑换与抽奖（自动）
+- **成本分层** — 账本把每个 `(账号, 模型)` 归入三档：**tier 0**（实测免费，单价 ≤ 0）、**tier 1**（无观测）、**tier 2**（实测收费）。同一次选号在**存活的最便宜档内**选：有 tier 0 就只在 tier 0 里挑，全池无免费观测才落到 tier 1，再不行才是 tier 2——即「贵号永远只作兜底」。tier 1 的号**不会被跳过**：新账号 / 新模型没跑过就没有观测，直接淘汰会把新号饿死。观测随 `usage.credit` 实时更新且 6 小时过期，所以限免窗口（如夜间免费）一结束，账号回到 tier 1 / tier 2，选号自动跟随——无需重启，日志会打 `free tier ended` 提示价格切换
+- **会话粘性** — 同一对话固定走同一账号（多轮上下文不跳号、上游 prompt cache 不碎）。粘性键按此优先级取：**conversation 维度四键**（`metadata.conversation_id` / `metadata.conversationId` / `conversation_id` / `conversationId` 任一）→ **`prompt_cache_key`**（pi-ai 系客户端把会话 ID 放在这个 OpenAI 前缀缓存字段里）→ **首条 user 消息文本的 sha256 兜底**（OpenAI 兼容协议无会话 ID 字段，dsh / Codex 等客户端四键全缺，此前粘性恒不命中、逐请求换号；现由首条 user 消息派生会话级稳定键——会话内历史追加不影响该键，开新会话自然换键）。`user_id` **不是**粘性键——它会把一个用户的所有并行对话钉到同一个号上（粒度远粗于上游对话级缓存边界），发 `user_id` 的客户端回落加权轮换（**该回落同样适用于首条 user 消息兜底**：请求体带 `metadata.user_id` 或顶层 `user_id` 时不派生兜底键）。绑定 30 分钟滚动续期，空闲即过期释放
+- **负载分布** — 粘性与分层都未限定时，三因子加权随机（`credits ×10 + 快过期积分 ×8 + 闲置补偿`）把流量摊开：高余额号多扛、快过期积分的号先用、闲置号补位；防惊群跳过 100ms 内刚选中的号。权重是**概率倾斜**而非硬排序（Top-5 短名单 + 名单内抽签），不会让单一账号垄断流量
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
 
@@ -169,6 +176,11 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | ⚠️ 不支持 | **剩余 1 个任务** | `Expert_Philanthropy`（需真实捐款：服务端领奖时校验捐赠回执，已实测无法绕过）；面板展示指引 |
 | ❌ 未做 | **面板侧 Upstash / 凭证目录配置** | 涉及启动期装配，需手工编辑 `config.json`（面板会提示为重启项） |
 | ❌ 未做 | **HTTPS / 内置限流** | 设计上交给反向代理（Nginx / Caddy）。服务本身只提供明文 HTTP，公网部署**必须**置于 HTTPS 反代之后 |
+- 积分日报：`./credit.sh`（美化 / `-json`，realm 感知双域）
+- 手动签到：`./signin.sh`（批量、幂等不重复计）
+- 账号停用 / 恢复：`./acct.sh list | disable <uid> [原因] | enable <uid> | revive <uid>`（需 `admin.enabled`，走网关管理端点）
+- 领养联动 / 任务查询：`scripts/task_runner.py`（成长任务一体机，默认 dry-run）
+- 个性化提示词：`prompt.file` 指向自定义提示词文件即整体替换内置默认（`custom`/`append` 模式生效）
 
 ## 架构总览
 
@@ -191,7 +203,7 @@ flowchart LR
     U -->|"billing / auth / growth"| CB
 ```
 
-上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
+上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
 ## 快速开始
 
@@ -230,6 +242,9 @@ docker compose logs -f          # 跟踪日志
 docker compose restart          # 重启
 docker compose down             # 停止并移除容器（数据在 ./auths 与 ./data，不受影响）
 ```
+# 登录添加账号（重复执行可加多号；注意：执行过下方说明中的 chown 后，
+# host 侧 login.sh 会被可写性预检拦截——此时请在容器内登录，见下方说明）
+./login.sh
 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
@@ -245,6 +260,17 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 ```
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
+> **非 root 宿主用户注意**：`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
+>
+> ```bash
+> chown -R 10001:10001 ./auths
+> ```
+>
+> 之后新增账号**必须**进**容器内**登录（`app` 自身落盘，属主即 10001，无需反复 chown；chown 后 host 侧 `./login.sh` 无写权限，脚本会在启动浏览器授权前直接退出并提示，不会白走一遍 OAuth。容器内无 docker CLI，完成后回宿主机重启）：
+>
+> ```bash
+> docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
+> ```
 
 ### 方式三：源码运行（开发调试）
 
@@ -280,6 +306,34 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 `login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
+#### Windows 原生运行（无需 Docker）
+
+Windows 10/11 自带的 PowerShell 与 `curl.exe` 即可管理后台进程。先准备配置并构建：
+
+```powershell
+Copy-Item config.example.json config.json
+# 编辑 config.json；建议把 listen 设为 127.0.0.1:7863，且务必设置 api_key
+
+go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
+go build -trimpath -ldflags="-s -w" -o login.exe ./cmd/login
+go build -trimpath -ldflags="-s -w" -o signin_bin.exe ./cmd/signin
+go build -trimpath -ldflags="-s -w" -o credit.exe ./cmd/credit
+```
+
+使用仓库自带脚本在后台启停并查看状态：
+
+```powershell
+.\start-workbuddy2api.cmd
+.\status-workbuddy2api.cmd
+.\stop-workbuddy2api.cmd
+```
+
+PID 写入 `wb2api.pid`，标准输出与错误日志分别写入 `data/server.out.log`、
+`data/server.err.log`。停止脚本会先验证 PID 对应的可执行文件确为当前目录下的
+`wb2api.exe`，不会因陈旧 PID 误杀其他进程。
+
+添加账号可使用配套管理面板，或在 Git Bash 中运行现有 `login.sh`（它还负责 CN
+首次签到以及 Global 注册地区/trial 流程；不建议只手工调用 `login.exe` 后跳过这些步骤）。
 
 ### 验证
 
@@ -287,8 +341,15 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 # 模型列表
 curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
-# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
+# 账号状态（汇总 + 每账号详情，含 disabled / manual_disabled 双位）
 curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+
+# 临时停用一个账号（需 config 里 admin.enabled = true）
+curl -s -X POST http://localhost:7863/admin/accounts/<uid>/disable \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"reason":"观察几天"}'
+# 或用 CLI（自动从 config.json 读网关地址与 key）
+./acct.sh list && ./acct.sh disable <uid> 观察几天 && ./acct.sh enable <uid>
 
 # 流式聊天
 curl -sN http://localhost:7863/v1/chat/completions \

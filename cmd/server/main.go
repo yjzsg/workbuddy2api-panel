@@ -316,6 +316,8 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 运维管理端点开关（config admin.enabled，默认 false）。
+		AdminEnabled: cfg.Admin.Enabled,
 	})
 	chatHandler = h
 

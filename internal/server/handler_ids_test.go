@@ -301,15 +301,11 @@ func TestChatTurnKeyStableAcrossAgentSteps(t *testing.T) {
 	}
 }
 
-// TestChatSessionKeyTurnLevel issue #170：带会话键的客户端也统一走轮级聚合
-// （对齐官方桌面 CLI 的 X-Conversation-Request-ID 轮级语义——TraceStartHook 每次
-// USER_PROMPT_SUBMIT 清空重生成）。会话键以复合键 sessKey+":"+turnKey 入键：
-// 同轮内稳定（含 agent 多步与换号重试），跨轮换键；不同会话的同轮文本不互撞。
-//
-// ⚠️ 本测试替换了原 TestChatSessionKeyBeatsTurnKey —— 原断言「带会话键则跨轮同键」
-// 是 #170 之前的行为，已被有意改掉（不是回归）。
-func TestChatSessionKeyTurnLevel(t *testing.T) {
-	// 同一会话、不同轮 → 必换键（轮级）。
+// TestChatSessionKeyBeatsTurnKey 带 conversationId 时聚合键随末条 user 消息变化
+// （#170 统一轮级，取代旧「会话键跨轮稳定」契约——对齐官方 CLI）。同轮同会话
+// 仍同键（与 TestChatSessionKeyTurnStableWithinTurn 互补：这里覆盖顶层
+// conversationId 形态 + 重复文本轮不并轮）。
+func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
 	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
 	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第二问"}]}`)
 	if a == "" {

@@ -227,6 +227,8 @@ python3 restore_panel_tests.py <panel_repo> 3f55d50 <tree> <file:TestName> [...]
 - `internal/upstream/school.go` — 开学季纯 API 客户端
 - `internal/upstream/tasks.go` — 成长任务
 - `internal/upstream/blackcat.go` — 夜猫子对话链
+- `internal/upstream/streak.go` — 连登兑换 + 抽奖 API（`GrowthStreakFull`/`GrowthRedeemTier`/`LotteryChances`/`LotteryDraw`；2026-09-21 面板同步带入）
+- `internal/scheduler/streak.go` — 连登奖励排程（`RunStreakBonusNow`/`streakBonusAccount`；`makeupYesterday` 用 `scheduler.go` 的 bool 版，本文件不重复定义）
 - `internal/scheduler/blackcat.go` / `school_api.go` — 上述功能的排程闭环
 - `internal/upstream/cninvite.go` + `internal/scheduler/cn_invite.go` + `internal/panel/cninvite.go` — **CN 邀请活动**（绑码 + 每日桌面事件链；面板 `/panel/api/cninvite/{status,run}` + 任务中心卡片）
 - `scripts/` — 面板自有脚本（`probe_active.py`/`probe_max_tokens.py`/`task_*.py`）+ 上游带过来的 `global_region.py`
@@ -309,6 +311,90 @@ git -C /vol4/_rebase_try_B apply -v /vol4/_pr161_x.patch      # _rebase_try_B �
 **验收**：`go build` / `go vet` / `go test`（**19 包**）全绿。`gofmt` 报的 `session.go`/`client.go`/`handler.go` 差异均为**上游/既有**（注释缩进风格、`handler.go` map 对齐老问题），非本次引入。
 
 > ⚠️ 上游做过 **rebase**（先前记录的 `d2cd004` 等 SHA 已不在 `origin/master` 历史里）→ 引用上游提交 SHA 时**要重新核对**。
+
+## 5.3 2026-09-21 增量同步（根上游 `a9ccace → origin/master` 30 提交 + 面板 `6d0bcab → origin/main` 14 条）
+
+### A. 根上游（`Sliverkiss/workbuddy2api`，30 提交）
+| 阶段 | 结果 |
+|---|---|
+| 分诊 | 干净 **38** / 冲突 **27** |
+| 干净组 | `git apply -p1`（6479 行 / 38 文件）+ sed import 前缀（残留 0） |
+| 三方合并 | 13 个 rc=0 自动落地 |
+| 冲突块 | 14 文件 / **29 块**全部手工判定（`/tmp/resolve.py <file> <out> <n:ours\|theirs\|both>`） |
+| 编译迭代 | **6 轮**（分层遮蔽逐层暴露）→ build/vet/test 全绿 |
+
+关键决策：`handler.go`(7 块：1 both / 2 theirs / **3 ours** / 4-7 theirs)、`session.go`→ours（`"sort"` import 是 `ProbeMissingKey` 所需）、`pool/watch.go`→ours（module 前缀）、`thinking.go`→**theirs**（PORTING 禁止事项）、`payload_test.go`→both、`config.example.json`→**ours**（§12：内联是面板既定形态）、`logging.go`(1 ours / 2 theirs / 3 both)、`cmd/server/config.go`→both、`metrics.go`→theirs（`Credits` 字段）、`README.md`(6 块)→both。
+
+**采纳要点**：`/v1/stats` 倍率列（`metrics.Credits` + `enrichCredits`）、admin 路由（`AdminEnabled`）、`ErrImageInvalid` 族、global 模型目录 catalog 体系（`model_catalog.go`/`modelsdev.go`）、tool_pairing / transport / truncation 新文件、默认提示词换小码酱。
+
+**⚠️ 教训（本轮新增，务必记住）**：**`both` 不能用在含「块级结构边界」的冲突块上** —— 本轮 6 次编译报错里 **5 次**都是这个原因：
+| 文件 | 症状 | 修法 |
+|---|---|---|
+| `handler.go` | ours 块含 struct 闭合 `}` → 上游 `AdminEnabled` 字段落到方法体后 | 抽出字段块插回 struct 内 |
+| `logging.go` | 上游方法重复声明 + `s.tokens`/`s.prompt` 不存在 | 删重复方法 + 删错位赋值 |
+| `cmd/server/config.go` | `if err := c.validateScheduleHours(); err != nil {` 的 body 被挤掉 | 补回 `return err` + 闭合 |
+| `scheduler_test.go` / `payload_test.go` | ours 测试函数尾缺 2 个 `}` | 补闭合 |
+
+→ **正确做法**：这类块**先取 ours，再手工把上游新增内容插到正确位置**（字段进 struct、语句进 if 体）。
+
+**另**：`cmd/server/config.go` 取 both 后引用了上游 `c.Schedule.Normalize()`（上游把排程归一移到 `internal/config` 包）→ **移除该调用**，保留本仓上方的内联补齐逻辑（§12 已预警）。
+
+### B. 面板上游（`linguo2625469/workbuddy2api-panel`，14 条）
+**关键策略**：面板仓库对**上游派生文件**的版本**落后根上游** → 对这些文件做三方合并会把刚同步的新代码**倒退**。
+→ **只合面板层文件**，上游派生文件一律跳过。
+
+| 提交 | 性质 | 处理 |
+|---|---|---|
+| `bb1dfe6` 校园日活动与小程序首对话 | 面板层（`internal/panel/*` + `upstream/{school,tasks}.go`） | **合** |
+| `08752df` run_queue 建队合并 mp 口径待办 | 面板层（`taskcenter.go`+14） | **合** |
+| `c3cc888` 模型目录双域分流 + 前缀输出 | 面板层 `panel.go`+129 | **合**（upstream 部分跳过） |
+| `d3488be` usage 真实时间轴 | 面板层 `app.js`+123 | **合** |
+| `c192fd1` 券码提示文字 | 面板层 `index.html`(1) | **合** |
+| `03ce06d`/`860ec53`/`b59655c` 手工吸收上游 | 上游派生 | **跳过**（已由根上游同步覆盖） |
+| `73fe1f8` 移除 max_body_mb | = 根上游 PR #159 | **跳过** |
+
+落地 11 个文件：自动合 `internal/panel/{autotask,taskcenter,tasks}.go`；冲突块 `app.js`(`1:theirs,2:theirs,3:ours,4:ours`)、`index.html`(theirs)、`panel.go`(2 块全 theirs)；面板新增 `internal/scheduler/streak.go`(116)、`internal/upstream/streak.go`(106)。
+
+**去重（面板版与我们既有实现重复的符号）**：
+- `upstream/streak.go` 删 `clientToken()`（我们 09-19 已抽成 `client_token.go`）
+- `scheduler/streak.go` 删 `makeupYesterday()`（`scheduler.go:686` 有更完善的 **bool 版**，用 `GrowthHeatmap`+`HeatmapDayScore`）
+- `upstream/streak.go` 常量去重：`streakRedeemPath`→`redeemPath`、删重复 `lotteryDrawPath`（`growth_reward.go` 已有）
+- 清 `time`/`crypto/rand`/`encoding/hex`/`fmt` 未用 import
+
+### C. ⭐ F 步符号级遗漏审计（基线 `3f55d50`）
+脚本在 `/vol4/`（**下划线前缀**）：`_audit2.py`、`_restore_panel_tests.py`。
+```
+python3 /vol4/_audit2.py <panel_repo> 3f55d50 <tree>
+→ A) 生产缺失 45 个   B) 仅测试缺失 21 个
+```
+**逐条定性结果：① 上游等价替代 / ② 有意退役 / ③ 真丢失 = 0**
+
+| 分类 | 实例 |
+|---|---|
+| ① 等价替代 | `hardMarkers`→`hardRule`、`softRateMarkers`→`softRateRule`（§3.1-F 已举过的例子）、`modelEntry`→`applyModelInfoFields`、`fetchGlobalModelInfos`→`globalInfos`、`PickExcludingForModel`→`PickExcludingForRealm`、`PickByUID`→`PickByUIDForModel`、`deriveKey`→`StickyFallbackKey`、`trunc`→`short()`、`adoptReportGap`→`travelAccountDelay`/`activityReportGap`、`TestTransitionReviveClearsCoolingKeepsBreaker`→**拆 3 个**、`TestRequestIDForKeyStability`→`TestRequestIDForKeyDerivation` |
+| ② 有意退役（§4 登记） | `cmd/credit\|signin`（**§4-8 明示"保持上游版，面板版是旧快照"**）、`SetMaxBodyBytes`/`max_body`（§4-10）、内容拦截那批（§4-15）、`derivedKeyPrefix`/`messageText`（§4-17）、`TestMaxBody*`/`TestChatOversized*`/`TestModelCooldownsNotPersisted`（§4-16） |
+| ③ 真丢失 | **0 项** |
+
+**唯一补回**：`internal/auth/auth.go` 的 `func GlobalEnabled() bool`（面板新增观测函数，3 行）。
+
+**⚠️ 方法论（本轮新增）**：
+1. 判断"缺失符号是否真丢"，**要对照面板 `origin/main`**（我们的直接来源），不是根上游；再叠加 §4 差异表定性
+2. 审计脚本按 `audit_panel*` 搜不到（实际名 `_audit2.py`）
+
+### D. 验收（2026-09-21 14:34 部署）
+```
+docker compose build → 镜像 b0d54af05dcf（旧镜像已 tag wb2api-rollback-20260921）
+docker compose up -d → workbuddy2api  Up (healthy)
+① /healthz            → 200
+② /status             → total=32 healthy=32 cooling=0 | realm {global:27, cn:5}
+③ /v1/models          → 66 个（cn: 42 + global: 24），ctx 真值（1000000/300000/176000…）
+④ /panel/             → 200；/panel/api/config → 200
+⑤ 非流式 cn:fast-model → "收到。"（usage 带缓存三段）
+   流式 global:fast-model → heartbeat + delta 逐帧 + 末帧 usage（prompt_cache_hit_tokens=128, credit=0.11）+ [DONE]
+```
+备份：`/vol4/_panel_backup_2026-09-21_1433.tgz`（849KB）
+
+---
 
 ## 6. 禁止事项
 
