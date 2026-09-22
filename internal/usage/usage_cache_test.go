@@ -62,7 +62,10 @@ func TestCacheSurvivesRollup(t *testing.T) {
 		CacheHitTokens: 500, CacheMissTokens: 500, CacheWriteTokens: 20}, true)
 
 	r.Rollup(time.Now())
-	s := r.Snapshot(24, nil)
+	// ⚠️ 用 hours=0（全部历史）：面板上游 c206468「时间窗口全口径生效」后，**折叠出的日桶
+	// 也受时间窗过滤**，100 天前的日桶不再进 24 小时窗口。本用例的靶子是「折叠有没有漏
+	// 字段」，不是窗口口径，所以取全部历史来观察折叠结果（窗口口径另有用例覆盖）。
+	s := r.Snapshot(0, nil)
 	if s.Totals.CacheHitTokens != 1400 || s.Totals.CacheMissTokens != 600 || s.Totals.CacheWriteTokens != 50 {
 		t.Fatalf("折叠后 cache = %d/%d/%d, want 1400/600/50（漏字段会让折叠丢数据）",
 			s.Totals.CacheHitTokens, s.Totals.CacheMissTokens, s.Totals.CacheWriteTokens)

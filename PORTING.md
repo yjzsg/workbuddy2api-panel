@@ -396,6 +396,61 @@ docker compose up -d → workbuddy2api  Up (healthy)
 
 ---
 
+## 5.4 2026-09-22 增量同步（面板 `b69d06e → origin/main` 6 条；根上游**无实质更新**）
+
+### A. 根上游 `Sliverkiss/workbuddy2api`：12 提交，**无实质更新**
+`2e2f08e`（09-21 14:01，上次同步点）→ `origin/master`：12 条里 11 条是 `.github` 治理/CI
+（PR 评审流水线、OIDC 换票、workflow_dispatch…），**唯一的代码改动是 `README.md +6`**
+→ **本次不动根上游**。
+
+### B. 面板上游 `linguo2625469/workbuddy2api-panel`：6 提交 / 7 文件 +371-68
+| 提交 | 内容 | 文件 |
+|---|---|---|
+| `9371f7d`+`c294926`（**PR #35**） | **Add Account 对话框内支持 cockpit tools JSON 导入** | 新增 `internal/panel/import.go`(+181)、`app.js`(+52)、`index.html`(+46) |
+| `5e1422c`+`1fba6b4`+`ab9a162`（**PR #36**） | **Docker bind mount 下保存配置失败**修复（保留 tmp 新内容） | `cmd/server/main.go`(+27) |
+| `c206468` | **用量页时间窗口全口径生效**（折叠出的日桶也受窗口过滤） | `internal/usage/usage.go`(+77)、`usage_test.go` |
+
+**处理方式（按 §3.1 判据，全部是面板层 → 逐个三方合并，不整包覆盖）**：
+`git merge-file -p <file> <b69d06e> <origin/main>`：
+- 干净自动合 5 个：`cmd/server/main.go`、`internal/panel/index.html`、`internal/panel/panel.go`、
+  `internal/usage/usage.go`、`internal/usage/usage_test.go`
+- `internal/panel/app.js` **1 处冲突 → 取 both**：
+  - theirs（上游新增）：`数据自 <since>` + `文件 ` 前缀
+  - ours（本仓面板层增强）：`命中率分母 = 命中 + 未命中（不含 write）`
+  - → 两段都保留（实测该文案**只在本仓存在**，base 与上游都没有）
+- `internal/panel/import.go`：上游新增文件，直接取
+
+### C. ⭐ 适配：`import.go` 调的是**旧版上游接口**（不覆盖、改调用方）
+面板上游对上游派生文件的版本**落后根上游**（§3.1），`import.go` 按旧签名写：
+
+| 接口 | 面板上游（`import.go` 期望） | 本仓（根上游最新） |
+|---|---|---|
+| `Upstream.UserResource(a)` | `(rm, tt, err)` 3 值 | **`(remain, err)`** 2 值（total 由 `UserResourceDetailed` 拆分） |
+| `Pool.ReenableIfCredits` | `(uid, remain, total)` | **`(uid, remain)`** |
+
+→ 按 §3.1「上游派生文件永远以我们的树为准」**改调用方**：
+```go
+if rm, err := p.cfg.Upstream.UserResource(a); err == nil {
+    p.cfg.Pool.ReenableIfCredits(uid, rm)
+}
+```
+
+### D. ⭐ 一处**用例假设过期**（不是代码回归）
+`internal/usage/usage_cache_test.go::TestCacheSurvivesRollup` 用 `Snapshot(24, nil)` 却期望
+100 天前折叠出的日桶被计入 → `c206468` **有意**改成"日桶也受时间窗过滤"（`hours<=0` 才是全部历史）
+→ 该用例必然 0/0/0。
+**核验**：折叠逻辑里 `dst.CH += src.CH` / `dst.CM += src.CM` / `dst.CW += src.CW` **三行都在**
+（本仓自己的注释「缓存三段必须一起搬」也保留）→ **不是折叠漏字段**。
+**修**：用例改用 `Snapshot(0, nil)`（靶子是折叠，不是窗口口径），并加注释说明。
+
+### E. 验证
+```
+go build ./...  → 通过
+go vet   ./...  → 通过
+go test -count=1 -timeout 480s ./...  → 全绿（修 D 之后）
+```
+备份：`/vol4/_panel_bak_2026-09-22_2056.tgz`
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
