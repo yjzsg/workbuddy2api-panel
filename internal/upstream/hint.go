@@ -51,6 +51,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。
 		return "upstream WAF blocked the gateway; retry after the block window"
+	case ErrEdgeAuth:
+		// 与 ErrWafBlock 同语义（同为边缘层按出口 IP 拒绝，只是状态码 401）：
+		// 换号不换 IP，立刻重试无意义，等窗口过去。账号未被惩罚（健康号不受影响）。
+		return "upstream gateway rejected the request at its auth edge; retry after the block window"
 	case ErrSoftRate:
 		return "rate limited by upstream; retry after reset"
 	case ErrAccountFault:

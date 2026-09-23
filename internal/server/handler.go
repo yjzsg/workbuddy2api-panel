@@ -119,9 +119,10 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
-	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
-	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP wafIPGate
+	// edgeGate 上游边缘层拒绝的 IP 级拦截状态机（fail-fast，edgegate.go）：
+	// 短窗多号命中 WAF 403 / 鉴权层 401 → 激活期轮转再遇同类直接终止
+	// （不放大请求量）。进程内状态、重启清零。
+	edgeGate edgeGate
 }
 
 // NewHandler 构建 handler。
@@ -937,12 +938,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
-			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
-			// 任务书设计纪律）：该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，
+			// 边缘层 IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
+			// 任务书设计纪律）：该次边缘层拒绝喂入 IP 级状态机，若激活（短窗多号命中，
 			// IP 被拦而非账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍
-			// 打同一出口 IP，加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账
-			// （单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
-			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+			// 打同一出口 IP，加重风控。
+			// 两种形态共用同一状态机：WAF 403（账号级软冷却照常记账）与鉴权层 401
+			// （零账号惩罚，见 applyErrorPolicy 的 ErrEdgeAuth 分支）。IP 级状态只改变
+			// 「是否继续轮转」——协同不叠加。
+			if kind == upstream.ErrWafBlock && h.edgeGate.noteWaf(acct.UID) {
+				break
+			}
+			if kind == upstream.ErrEdgeAuth && h.edgeGate.noteEdgeAuth(acct.UID) {
 				break
 			}
 			if !rotateBackoff(i, r.Context()) {
@@ -1059,12 +1065,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
 		case upstream.ErrWafBlock:
-			if h.wafIP.active() {
+			if h.edgeGate.active() {
 				// IP 级拦截措辞（fail-fast 终止路径）：空 body 时给出明确可读文案——
 				// 网关出口 IP 被 WAF 拦截、轮转已止损、窗口 X 秒后自动解除。客户端
 				// 提前重试无意义（换号不换 IP）；有上游原文时原文优先（下方统一）。
 				code = "waf_ip_blocked"
 				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
+			}
+		case upstream.ErrEdgeAuth:
+			// 鉴权层 401 与 WAF 403 同族（都是边缘层按出口 IP 拒绝），只是状态码不同：
+			// 机器可读 code 分开（客户端可据此区分是风控还是鉴权），文案口径一致。
+			// 空 body 时给明确可读文案；有上游原文（openresty 401 页）时原文优先（下方统一）。
+			code = "edge_auth_rejected"
+			msg = "upstream gateway rejected the request at its auth edge (401); accounts are healthy, this is an egress-IP-level rejection"
+			if h.edgeGate.active() {
+				code = "edge_auth_blocked"
+				msg = "edge auth ip-level block: upstream gateway is rejecting the gateway IP at its auth edge, rotation stopped; retry after the block window expires"
 			}
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
@@ -1107,7 +1123,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 十条路径，各司其职：
+// 十一条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
@@ -1119,6 +1135,13 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避（比 429 的 soft_rate 严：
 //     基数小但响应快；WAF 信号带 IP 级粘性故指数升级保底存在）。基数经 jitterDur
 //     抖动（复用 backoff.go 单一抖动来源，防多账号同相位冷却到期再聚团）。
+//   - ErrEdgeAuth → **零账号惩罚**（不冷却/不熔断/不 NoteError/不喂连败）：401 + 无业务
+//     信封是**出口 IP 级**事实（APISIX 鉴权层拒绝页），账号完全无辜——2026-09-22 事故
+//     正是此处缺失：该形态此前落 ErrClient → 喂 NoteFailures → 一次 5 分钟边缘层抖动把
+//     33 个健康号各记满 5 次连败、一起降权 10 分钟 → 池子打空 → 连环 503。铁证：同批号
+//     风暴中 401、风暴后同 token 立刻 200（16 个可复现）。「停止继续打上游」的职责交给
+//     IP 级状态机（handler 轮转循环的 edgeGate.noteEdgeAuth，短窗多号即 fail-fast），
+//     不靠惩罚账号实现。同 ErrContentBlocked/ErrPromptTooLong 一类的「非账号问题」。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
@@ -1189,6 +1212,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			return
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+	case upstream.ErrEdgeAuth:
+		// 边缘层鉴权拒绝（401 + 无业务信封，APISIX「401 Authorization Required」页）：
+		// **零账号惩罚** —— 不冷却、不熔断、不 NoteError、**不喂连败计数**。
+		// 理由：这是出口 IP 级事实，账号完全无辜。2026-09-22 事故正是此处缺失造成的
+		// ——该形态此前落 ErrClient 兜底 → 喂 NoteFailures → 一次 5 分钟边缘层抖动
+		// 让 33 个健康号各记满 5 次连败、一起降权 10 分钟 → 池子被打空 → 连环 503。
+		// 铁证：同一批号在风暴中 401、风暴后同 token 立刻 200（16 个号可复现）。
+		// 「停止继续打上游」的职责交给 IP 级状态机（h.edgeGate.noteEdgeAuth，
+		// 短窗多号命中即 fail-fast 终止轮转），不靠惩罚账号来实现——惩罚账号既治不了
+		// IP 级问题，又白白废掉健康号。
+		// 本分支与 ErrContentBlocked/ErrPromptTooLong 同属「请求/环境问题非账号问题」
+		// 一类：零动作，仅由轮转循环换号（且 IP 级激活时连轮转都会终止）。
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:

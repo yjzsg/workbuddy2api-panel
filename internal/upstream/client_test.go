@@ -124,6 +124,21 @@ func TestClassify(t *testing.T) {
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
+		// 边缘层鉴权拒绝（2026-09-22 全池降权事故）：401 + 无业务信封 → ErrEdgeAuth。
+		// 与 WAF 403 同族（同为 APISIX 边缘层按出口 IP 拒绝），必须判在通用 4xx
+		// 兜底**之前**——此前落 ErrClient 会喂连败计数（NoteFailures），一次 5 分钟
+		// 边缘层抖动就把 33 个健康号各记满 5 次连败、一起降权 10 分钟、全池 503。
+		{401, ``, ErrEdgeAuth},
+		{401, `Authorization Required`, ErrEdgeAuth},
+		{401, `<head><title>401 Authorization Required</title></head>`, ErrEdgeAuth},
+		{401, `<head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center></body>`, ErrEdgeAuth},
+		{401, `{"message":"unauthorized"}`, ErrEdgeAuth}, // 非信封 JSON（无 "code":/"msg": 字段名）
+		// 401 带业务信封的仍走既有权威分类（不劫持账号级 401）。
+		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 非 401 的无信封错误体不进边缘鉴权分类（判定绑定 401 形态）。
+		{403, ``, ErrWafBlock},
+		{400, ``, ErrClient},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -151,6 +166,32 @@ func TestIsWafBlocked(t *testing.T) {
 	for _, c := range cases {
 		if got := IsWafBlocked(c.status, c.body); got != c.want {
 			t.Errorf("IsWafBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsEdgeAuth 边缘层鉴权拒绝形态判定的直接回归（Classify 的第 11 层）：
+// 只认 401 + 无业务信封；带信封/其他状态码一律 false。与 IsWafBlocked 逐字同构
+// 只差状态码——两形态必须互不串味（403 归 WAF、401 归 edge auth）。
+func TestIsEdgeAuth(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{401, "", true},
+		{401, "<html>401 Authorization Required</html>", true},
+		{401, "<hr><center>openresty</center>", true},
+		{401, `{"code":12153,"msg":"Offline user session not found"}`, false}, // 有 "code": 字段 → 权威账号级分类
+		{401, `{"msg":"unauthorized"}`, false},                                // 有 "msg": 字段
+		{403, "", false},                                                      // 非 401（归 IsWafBlocked）
+		{402, "", false},
+		{429, "", false},
+		{500, "<html>gateway</html>", false},
+	}
+	for _, c := range cases {
+		if got := IsEdgeAuth(c.status, c.body); got != c.want {
+			t.Errorf("IsEdgeAuth(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
 	}
 }

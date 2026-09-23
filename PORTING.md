@@ -451,6 +451,76 @@ go test -count=1 -timeout 480s ./...  → 全绿（修 D 之后）
 ```
 备份：`/vol4/_panel_bak_2026-09-22_2056.tgz`
 
+## 5.5 2026-09-23 **本仓自研修复**：边缘层 401 → 全池降权（上游两仓库均未修）
+
+### A. 事故现象（2026-09-22 22:41:10–22:45:50）
+- 2h 窗口 442 请求 / **68 个 503**；用量页 `2026-09-22T22` = 467 请求 / **204 errors（43.7%）**，历史最大。
+- 崩溃前 22:21–22:38 稳定 10–22 req/min **全 200**；风暴期 22:41–22:45 是 12/6/22/17/11，**水位没变**
+  → **不是并发压垮**（网关自身已限 `max_in_flight_global=2` / `max_in_flight=3`）。
+
+### B. 根因（证据链）
+1. 401 的 body 全文是 openresty/APISIX 的 `401 Authorization Required` 错误页 → **上游 API 网关鉴权层拒绝**，请求没到业务 app。
+2. 22:41:10 **所有号同一秒一起 401**（35 个），含 22:40:43 刚成功过的 `tangerinewren259`。
+3. **16 个号「风暴中 401 → 风暴后同 token 立刻 200」**（可复现）→ 账号无辜。
+4. 代码链：
+   ```
+   Classify: 401 且无业务信封 → IsWafBlocked 只认 403，漏过 → 兜底 return ErrClient
+   applyErrorPolicy default: if kind == ErrClient { Pool.NoteFailures(uid) }
+   NoteFailures: consecutiveFails++ → 满 degrade_threshold=5 → degradeUntil = now + 10m
+   ```
+   → 5 分钟风暴里每个号被打 5+ 次 → **33/40 号一起降权 10 分钟**（`degrade_cooldown: 10m`）。
+5. 池子被打空（可用只剩 cn 5 / **global 2**），请求全是 `global:deepseek-v4.1-flash`
+   → 只剩 `fallback_earliest_expiry` 挑**降权号**硬打 → 还是 401 → **503**。
+
+**代码里的不对称（bug 本体）**：`IsWafBlocked` 只认 `status == 403`。同一个「边缘层 HTML 拒绝页」，
+403 归 `ErrWafBlock`（软冷却 60s、**不喂连败**），401 却落 `ErrClient`（**喂连败** → 降权 10m）。
+
+### C. 上游核查结论（**两仓库都没有此修复**）
+| 上游 | 位置 | 结论 |
+|---|---|---|
+| 根上游 `Sliverkiss/workbuddy2api` | `origin/master` `9a26ae7`（`a9ccace` 之后 **59 提交**） | `IsWafBlocked` **一字未改**（仍只认 403）；`internal/pool/{degrade,entry,pool}.go` **零改动**；全树无 `StatusUnauthorized` 分类分支、无 `ErrEdgeAuth`/风暴概念 |
+| 面板上游 `linguo2625469/workbuddy2api-panel` | `origin/main` `5a6b167`（`ab9a162` 之后 8 条） | `internal/pool/` **未改**；`internal/upstream/client.go` +141/−15 全是 14018/image_url/11135 三连修，**未碰分类链** |
+
+→ 上游注释里已明写 `IsWafBlocked —— 403 且无业务信封（HTML 拦截页）：APISIX WAF`，
+说明他们知道是 APISIX，但**只覆盖了 403 形态**。故本修复为**本仓自研**，非上游移植。
+
+### D. 改动（5 改 + 3 新增 + 3 删）
+
+| 文件 | 变更 |
+|---|---|
+| `internal/upstream/client.go` | 新增 `ErrKind` 枚举 `ErrEdgeAuth`（插在 `ErrWafBlock` 后）+ `String()` 分支 + `IsEdgeAuth(status, body)`（与 `IsWafBlocked` 逐字同构，只差状态码）+ `Classify` 第 11 层（判在通用 4xx 兜底**之前**）+ 判定顺序文档 |
+| `internal/upstream/hint.go` | `case ErrEdgeAuth` → gateway_hint（与 WAF 同语义：换号不换 IP，等窗口） |
+| `internal/server/edgegate.go` | **由 `wafip.go` 泛化**：`wafIPGate`→`edgeGate`，`wafIPWindow`→`edgeWindow`，`noteWaf`/`noteEdgeAuth` 共用 `note(uid, shape)`。**401 与 403 共用同一判定窗**（都是「出口 IP 被边缘层拒」的证据，只是状态码不同；混排抖动更快识别）。阈值/窗/不续期语义**逐字保留**（`edgeThreshold=2` 不同 UID / `edgeWindow=60s`） |
+| `internal/server/handler.go` | ① 字段 `wafIP`→`edgeGate`；② 轮转循环加 `if kind == ErrEdgeAuth && h.edgeGate.noteEdgeAuth(uid) { break }`；③ `applyErrorPolicy` 新增 `ErrEdgeAuth` → **零账号惩罚**（不冷却/不熔断/不 NoteError/**不喂连败**）；④ 末端错误映射 `edge_auth_rejected` / `edge_auth_blocked`；⑤ 策略表文档补第 11 条 |
+| `internal/upstream/{client,hint}_test.go` | 新增 401 形态用例（含「带信封 401 仍是 SessionDead/Client」的不劫持守卫） |
+| `internal/server/edgegate{,_conc}_test.go` | 由 `wafip{,_conc}_test.go` 改名 + 新增 401 用例 |
+| ~~`internal/server/wafip{,_conc}_test.go`~~ | **已删**（改名进 `edgegate*`） |
+
+**设计要点**：账号惩罚与「停止打上游」**解耦**——账号零惩罚（账号无辜），
+止打职责交给 IP 级状态机（短窗 2 个不同 UID 即 fail-fast 终止轮转）。
+效果：风暴中每次客户端请求只打 1–2 次上游（原先 5–10 次），且**不再有任何号被降权**。
+
+### E. 验证
+```
+gofmt -l（仅本仓既有的 client.go/hint_test.go 为脏，非本次引入；本次碰过的文件全 clean）
+go build ./...  → 通过
+go vet   ./...  → 通过
+go test -count=1 -timeout 480s ./...  → 全绿（21 包）
+```
+新增用例（均 PASS）：
+- `TestIsEdgeAuth` / `TestClassify`（含 401 无信封→EdgeAuth、401 带信封→SessionDead/Client 守卫）
+- `TestEdgeGateMultiAccountTriggers` / `TestEdgeAuthGateMultiAccountTriggers` / `TestEdgeGateWindowExpiry`
+- `TestEdgeGateSharedWindowAcrossShapes`（401+403 混排共用窗）
+- `TestEdgeGateConcurrentMixed` / `TestEdgeGateConcurrentSingleUIDPerAccount`（并发）
+- ⭐ `TestChatEdgeAuthFailFastStopsRotation`（2 次上游调用即 break + **账号零惩罚**断言）
+- ⭐ `TestChatEdgeAuthNeverDegradesPool`（**事故精确回归**：单号池连撞 8 次 401，`consecutive_fails` 恒 0、`degrade_until` 恒零、号仍可选）
+- `TestChatEdgeAuthSingleAccountRotatesToHealthy`（单号 401 仍轮转到健康号）
+
+⚠️ **`-race` 本机跑不了**：`-race` 需要 cgo，而 NAS 无 gcc、`golang:1.23`（Debian 版）拉不动
+（registry-1.docker.io TLS 超时）、alpine 容器内 `apk add gcc` 也超时（网络受限）。
+项目历史验证标准本就是 `build+vet+test`（见 §3.1 E 步），**本仓从未跑过 `-race`**，非本次降级。
+并发用例仍会执行（只是不带竞态检测）；`edgeGate` 的锁结构与既有 `wafIPGate` 一致（单 mutex 全覆盖）。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
@@ -464,6 +534,17 @@ go test -count=1 -timeout 480s ./...  → 全绿（修 D 之后）
 - ⛔ 别在同步时整批覆盖**面板自有测试用例**（`internal/pool/*_test.go`、`internal/server/handler_test.go`、`cmd/server/config_test.go`、`internal/upstream/client_test.go` 等）——文件在≠用例在，丢了不报错
 - ⛔ 别把 `internal/pool/watch.go` / `watch_test.go` 的 import 退回上游写法 `workbuddy2api/internal/auth`——本仓模块名是 `github.com/linguo2625469/workbuddy2api-panel`，退回即编译不过（见 §5.1）
 - ⚠️ **别用 `git checkout .` / `git stash` / `git reset --hard` 回退**。2026-09-18 曾发现工作树领先 HEAD 63 个文件（含生产文件），已提交让 **HEAD == 工作树**（`f204e68`）；但容器是 `build: .`，**部署真相始终是工作树** → 改前先 `git status --short`，回退用 `git revert`/逐文件恢复
+- ⛔ **别把 `ErrEdgeAuth`（401 + 无业务信封）退回 `ErrClient`**，也别给它加任何账号级惩罚
+  （冷却/熔断/NoteFailures）——2026-09-22 全池降权事故的根因就是它落 `ErrClient` 后喂了连败计数
+  （5 分钟边缘层抖动 → 33 个健康号一起降权 10 分钟 → 池子打空 → 连环 503）。
+  止打职责归 `edgeGate`（IP 级状态机），不归账号惩罚。详见 §5.5。
+- ⛔ **别把 `internal/server/edgegate.go` 退回 `wafip.go` 的 403 专用形态**（也别把 `noteEdgeAuth` 拆成独立状态机）
+  —— 401 与 403 共用同一判定窗是刻意的：两者都是「出口 IP 被边缘层拒绝」，混排要能更快触发。
+- ⛔ **别在同步上游 `internal/upstream/client.go` 时整文件覆盖**——本仓在该文件有 `ErrEdgeAuth` /
+  `IsEdgeAuth` / `Classify` 第 11 层三处自研改动（上游没有，见 §5.5 C 节核查结论）。
+  同步姿势仍是 §3.1 的逐文件三方合并。
+- ⚠️ **`-race` 在本机跑不了**（无 gcc + 网络受限），验证标准是 `build+vet+test`（§3.1 E 步）。
+  别因为「没跑 -race」就认为验证不完整——本仓历史从未跑过。
 - ⛔ **别为了本机某个客户端的现象去改 `internal/upstream/thinking.go`**（`injectThinking` / `backfillReasoningContent`）—— 那是上游面向**全部客户端**的契约：**issue #43** 的验收项就是「无 effort 裸请求也开思考」（非它则只发 `thinking` 的客户端拿不到思维链）；**issue #157** 维护者结论是「**客户端配置问题，非网关缺陷**」；**issue #91** 明确 `reasoning_content` 是**要被传递出去**的字段。
   2026-09-18 曾偏离两处（① 不注入 thinking ② 不回放历史 reasoning），**A/B/C 同参数多组对照证明收益不成立**（不注入 vs 注入都退化），**已于 `94b2aee` 全部回滚**，5 个文件与两个上游逐字节一致。
   → 若再遇到「卡循环 / 反复 `finish_reason=length` 空正文」，先走**客户端侧**（`maxInputTokens` 压缩点、`reasoning_effort` 档位、`max_tokens` 预算），别动网关。详见技能 `workbuddy-compact-threshold` §九。

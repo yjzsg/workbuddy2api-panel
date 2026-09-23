@@ -36,6 +36,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrEdgeAuth                      // 401 + 非业务信封体（APISIX 鉴权层拒绝页/空体）→ **不罚账号**，仅轮转 + IP 级 fail-fast（2026-09-22 全池降权事故）
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
@@ -63,6 +64,8 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrEdgeAuth:
+		return "edge_auth"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
 	case ErrImageInvalid:
@@ -391,6 +394,27 @@ func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
 }
 
+// IsEdgeAuth 报告 401 响应是否为**边缘层鉴权拒绝**形态（APISIX / OpenResty 的
+// 「401 Authorization Required」HTML 页、空体、纯文本）。判定口径与 IsWafBlocked
+// 逐字同构，只差状态码；同样要求**无业务信封**——带信封的 401 是权威账号级分类
+// （12153 offline session），由 sessionDeadRule 在 Classify 上层先捕获，走不到本函数。
+//
+// 为什么必须与 ErrClient 分开（2026-09-22 实测事故）：
+//
+//	该形态此前落通用 4xx 兜底 ErrClient，而 applyErrorPolicy 对 ErrClient 喂连败
+//	计数（issue #114 NoteFailures）→ 上游边缘层抖 5 分钟（APISIX 鉴权层统一 401，
+//	全池 35 个号在同一秒内全中，含 10 秒前刚成功过的号）就把 33 个**健康**号各记满
+//	5 次连败、一起降权 10 分钟（pool.degrade_cooldown）→ 池子被打空（可用只剩
+//	cn 5 / global 2）→ 只剩 fallback_earliest_expiry 挑**降权号**硬打 → 连环 503。
+//
+// 铁证：同一批号在风暴中 401、风暴结束后同一 token 立刻 200（16 个号可复现）；
+// 且 401 body 是 openresty/apisix 的错误页，请求根本没到业务 app。
+// 边缘层拒绝是**出口 IP 级**事实（我们的 IP 被边缘层拒了），不是账号级事实，
+// 绝不能计到账号头上——所以本形态零账号惩罚，只喂 IP 级状态机（server.edgeGate）。
+func IsEdgeAuth(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
+}
+
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列（P1-2，对齐
 // intl CLI parseRetryAfterMs / parseRateLimitResetMs 的头族）：
 // retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
@@ -534,7 +558,12 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
 //     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. IsEdgeAuth —— 401 且无业务信封：APISIX **鉴权层**拒绝形态（openresty
+//     「401 Authorization Required」页）。与第 10 层同族同位置、同样必须在
+//     通用 4xx 兜底**之前**分流——此前落 ErrClient → 喂连败计数 → 一次 5 分钟
+//     边缘层抖动把 33 个健康号一起降权 10 分钟、全池 503（2026-09-22 事故，
+//     详见 IsEdgeAuth 注释）。带信封的 401（12153）在第 2 层已是权威分类。
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -597,6 +626,14 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 边缘层鉴权拒绝（401 + 无业务信封，APISIX「401 Authorization Required」页）：
+	// 与上方 WAF 403 同族、同位置——都是「边缘层按出口 IP 拒绝我们」的形态判定，
+	// 必须判在通用 4xx 兜底之前（落 ErrClient 会喂连败计数 → 全池降权，见
+	// IsEdgeAuth 注释）。12153 session dead 是 401 的**带信封**形态，已在第 2 层
+	// 被 sessionDeadRule 捕获，不受本层影响。
+	if IsEdgeAuth(status, body) {
+		return ErrEdgeAuth
 	}
 	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
 	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。

@@ -26,6 +26,7 @@ func TestGatewayHintKindMap(t *testing.T) {
 	}{
 		{"11115 prompt too long", ErrPromptTooLong, `{"code":11115,"msg":"prompt is too long"}`, "request context exceeds the model's limit; reduce history/message size"},
 		{"WAF 403", ErrWafBlock, `<html><head><title>403 Forbidden</title></head></html>`, "upstream WAF blocked the gateway; retry after the block window"},
+		{"edge auth 401", ErrEdgeAuth, `<head><title>401 Authorization Required</title></head><hr><center>openresty</center>`, "upstream gateway rejected the request at its auth edge; retry after the block window"},
 		{"429 soft rate", ErrSoftRate, `{"code":6004,"msg":"rate limited"}`, "rate limited by upstream; retry after reset"},
 		{"11140 account fault", ErrAccountFault, `{"code":11140,"msg":"request illegal"}`, "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"},
 		{"12153 session dead", ErrSessionDead, `{"code":12153,"msg":"Offline user session not found"}`, "account session expired at upstream; the account is disabled until re-login"},
