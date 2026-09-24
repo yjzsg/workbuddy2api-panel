@@ -1,7 +1,14 @@
 # PORTING.md — 本仓库与根上游的同步手册
 
 > 生成：2026-09-17（P4 换基落地后）。**下次同步上游前先读这份。**
-> 根上游：`Sliverkiss/workbuddy2api` ｜ 本仓库：`linguo2625469/workbuddy2api-panel`（= 上游主干 + 面板层）
+> 上游：`linguo2625469/workbuddy2api-panel`（= 面板主干；本仓库是它的 fork）
+>
+> ⚠️⚠️ **2026-09-25 起：只跟面板上游，不再跟根上游。**
+> 原根上游 `Sliverkiss/workbuddy2api` **已删库**（404 / API Not Found）。
+> 延续仓库为 `HanawaBanana/workbuddy2api`（描述明写「原 Sliverkiss/workbuddy2api 已删库」），
+> 但**已按用户决定不再单独跟踪**——面板上游会自己手工吸收根上游的改动。
+> NAS 上 `/vol4/_upstream_wb2api` 这个浅克隆自此**仅作历史留档，不再 fetch**。
+> 详细核查过程见 §5.6。
 
 ---
 
@@ -122,9 +129,15 @@ docker compose build && docker compose up -d
 
 ### 3.1 增量同步（日常小步更新走这条，别重走全量换基）
 
-> ⚠️ **每次同步必须同时看两个上游**：根上游 `Sliverkiss/workbuddy2api`（服务端主干）
-> **和** 面板仓库 `linguo2625469/workbuddy2api-panel`（`internal/panel/*` 等面板层文件）。
-> 2026-09-17 就漏了后者一次（app.js 用量图表真实时间轴），容器重建完才发现。
+> ⚠️ **2026-09-25 起只有一个上游**：面板仓库 `linguo2625469/workbuddy2api-panel`。
+> 原根上游 `Sliverkiss/workbuddy2api` 已删库（见文首与 §5.6），不再跟踪。
+> 下面 `git -C /vol4/_upstream_wb2api ...` 的命令**只适用于 2026-09-25 之前**，留作历史；
+> 现在同步直接对本仓库的 `origin`（= 面板上游）操作。
+>
+> ⚠️ **但「一个上游」不等于「可以整文件覆盖」**——本仓与面板上游在 `internal/upstream/client.go`
+> 等文件上**结构性分叉**（本仓走根上游的 `errorRule/matchMode` 重构，面板仍是 `xxxMarkers`）。
+> 逐文件三方合并只在**结构相同**的文件上有效；结构不同的必须**手工移植**（见 §5.6 D 节）。
+> 判据：`comm -23 <(ours 顶层符号) <(theirs 顶层符号)` —— 两边互不包含就是结构分叉。
 
 ```bash
 git -C /vol4/_upstream_wb2api fetch origin
@@ -521,6 +534,106 @@ go test -count=1 -timeout 480s ./...  → 全绿（21 包）
 项目历史验证标准本就是 `build+vet+test`（见 §3.1 E 步），**本仓从未跑过 `-race`**，非本次降级。
 并发用例仍会执行（只是不带竞态检测）；`edgeGate` 的锁结构与既有 `wafIPGate` 一致（单 mutex 全覆盖）。
 
+## 5.6 2026-09-25 上游变动 + 面板同步（`5a6b167 → dbd7c68`，8 提交）
+
+### A. ⚠️ 根上游 `Sliverkiss/workbuddy2api` 已删库
+
+| 核查 | 结果 |
+|---|---|
+| `https://github.com/Sliverkiss/workbuddy2api` | **HTTP 404** |
+| `api.github.com/repos/Sliverkiss/workbuddy2api` | `{"message":"Not Found"}` |
+| 用户 `Sliverkiss` 的 77 个公开仓库 | **无 workbuddy2api**（只有个不相干的 `CodeBuddy2api`） |
+| 症状 | NAS 上 `git fetch` 报 `could not read Username for 'https://github.com'` |
+
+**判据**：public 仓库的 `git fetch` 突然要凭据 = **仓库没了**（GitHub 对不存在/私有仓库回 404，
+git 转去问账号密码），**不是 token 过期**，别往那个方向查。
+
+**延续仓库 = `HanawaBanana/workbuddy2api`**（描述：「WorkBuddy2API 延续仓库 —— 账号池转 OpenAI 兼容 API
+（原 Sliverkiss/workbuddy2api 已删库）」，提交 `a65565d0 docs: 标注延续来源`）。
+我们的基线 `9a26ae7` 是它的祖先（`compare` → `ahead_by=3`）。
+
+**怎么找到延续仓库（可复用）**：
+```bash
+api.github.com/search/repositories?q=workbuddy2api        # 72 个同名仓库
+api.github.com/repos/<候选>/commits/<我们的基线sha>        # 200=同一棵树，422=不是
+api.github.com/repos/<候选>/compare/<基线sha>...HEAD      # status=ahead 才算接得上
+```
+⚠️ **父仓库被删后，GitHub 会把 fork 的 `fork` 字段置 false、`parent` 置 null**
+→ 不能用 `fork` 字段判断，**只认「含基线提交」这一条判据**。
+同名的那堆（`Zhengyuuuui`/`hawklithm`/`xiaofan6ya`/`ckldy`）都不含我们的基线提交，**不是同一棵树**。
+
+**用户决定（2026-09-25）**：**不再单独跟踪根上游**，只跟面板上游
+（面板会自己手工吸收根上游改动，如 `d47219b 吸收上游三连修`）。
+→ `/vol4/_upstream_wb2api` 自此仅作历史留档，不再 fetch。
+
+> 备注（未执行）：新根上游 `9a26ae7..5e2c2b4d` 有 3 提交，实质只有 `internal/server/handler.go +7`
+> （成功响应透出 `X-Wb-Account` 头）；`Dockerfile`/`docker-compose.yml` 是 L0 本地补丁版不可同步，
+> `README.md` 是文档。面板上游**不含**这 3 提交（`X-Wb-Account` 在面板树里不存在）。
+
+### B. 面板上游 8 提交（`5a6b167..dbd7c68`）
+
+| 提交 | 内容 | 文件 |
+|---|---|---|
+| `09fd96e` | 待办扫描过滤上游锁定任务（Sequential 每日解锁环不再误入队列） | `taskcenter.go +7` |
+| `1d7c97b` | 扫描待办结果不再被上一轮队列残留轮询冲掉 | `app.js ±18` |
+| `c564e90` | 修复 v1.11.3 任务中心 JS 崩溃（`pollQueueOnce` 残留调用点） | `app.js +13/-2` |
+| `410309c` | 修复 `reattachQueueView` 顶层 TDZ 崩溃 + **JS 冒烟测试入册** | `app.js +5/-1`、**`frontend_test.go +67`（新文件）** |
+| `2b0eedd` | **模型倍率列显示优惠生效价**（牌价+折扣+标签+时段说明） | `app.js +20`、`panel.go +12`、`client.go +161` |
+| ×3 | 版本号 1.11.3 / 1.11.5 / 1.11.6 | `main.go` |
+
+### C. ⭐ 关键判据：两条线在 `client.go` 已**结构性分叉**，不能用三方合并
+
+| | 本仓（= 根上游架构） | 面板上游 |
+|---|---|---|
+| 分类规则实现 | `errorRule` + `matchMode`/`matchPattern`（17 处） | 纯 `xxxMarkers` 字符串切片（0 处 `errorRule`） |
+| 顶层符号 | 87 个，含 `hardRule`/`sessionDeadRule`/`IsEdgeAuth` | 87 个，含 `hardMarkers`/`sessionDeadMarkers`/`applyModelPromotions` |
+| 互包含性 | `comm -23` 双向都非空 → **互不包含** | 同左 |
+| `billingMeterJSON` 定义处 | `client.go`（根上游搬来的） | `report.go` |
+
+**行级三方合并对该文件是错的工具**：实测产出 5 处冲突，且冲突边界把函数**从中间切开**
+（`billingMeterJSON` 的头在 ours 侧、尾在公共区，`storeEfforts` 的头在 theirs 侧）。
+强行按「两个都要」拼会得到语义错误的交错代码。
+
+**正确做法 = 手工移植**（同 §5.1「手工吸收」）：
+1. 先判断该提交的改动**是否自包含**。`2b0eedd` 的 `client.go` 部分恰好自包含
+   （4 个 `ModelInfo` 字段 + `v3ModelPromotion` 类型 + `promoZone`/`promoClock`/`promoActive`/`applyModelPromotions`
+   + 一个调用点），只依赖 `time`/`strings`/`strconv`，与分类链结构无关。
+2. 整块搬进本仓结构，**适配调用点**：上游 `out` 是 `map[string]ModelInfo`，本仓 `fetchV3Models`
+   产出**切片** → 经 map 中转再回填。
+3. 上游把 `modelPromotions` 放在 `fetchV3ConfigModelMap` 的 env 结构里；本仓的
+   `parseGlobalModelNames(raw)` **不透出该字段且签名已被多处调用** → 另写
+   `parseV3ModelPromotions(raw)` 单独解析（失败返回 nil，优惠是展示性增强，绝不拖垮模型目录）。
+
+### D. 分诊与落点
+
+| 文件 | 方式 | 结果 |
+|---|---|---|
+| `internal/panel/taskcenter.go` | 三方合并 | 干净 |
+| `internal/panel/panel.go` | 三方合并 | 干净（`panelModelEntry` 的 `credits` + `promo_*` 并存） |
+| `internal/panel/frontend_test.go` | 新增文件 | 直接取上游 |
+| `internal/panel/app.js` | 三方合并 **1 冲突 → 取 both** | 我们的 `loadCNInvite(true)` ‖ 上游的 `reattachQueueView()` |
+| `cmd/server/main.go` | 三方合并 **1 冲突 → 取 theirs** | 版本号 `1.10.1-panel` → **`1.11.6-panel`**（跟上游） |
+| `internal/upstream/client.go` | ⚠️ **手工移植**（见 C） | +187（比上游 +161 多出适配代码） |
+
+**`app.js` 冲突的教训**：上游把 `pollQueueOnce` 换成了 `reattachQueueView`（那 4 个连环修复就是围绕它），
+而我们那一行有自己的 `loadCNInvite(true)` → **必须取 both**，只取一边会丢功能或留悬空调用点。
+合并后 `pollQueueOnce` 只剩上游自己的注释引用，**调用点已清零**。
+
+### E. 验证（全绿）
+
+```
+gofmt  → 本次碰过的文件均 clean（client.go 的脏是仓库既有，已确认我的新增行合规）
+go build ./...  → 通过
+go vet   ./...  → 通过
+go test -count=1 -timeout 480s ./...  → 全绿（21 包，含新增的 panel/frontend_test.go）
+```
+
+**符号级遗漏审计（§3.1 F 步）**：11 项逐条 grep 确认存活 ——
+`ErrEdgeAuth` / `IsEdgeAuth` / `Classify` 第 11 层 / `edgeGate.noteEdgeAuth` / `edge_auth_blocked`
+（§5.5 的 401 修复）、`loadCNInvite` / `rate_limited_models` / 命中率分母文案（面板本地特性）、
+`reattachQueueView` / `promo_factor` / `applyModelPromotions`（本次合入）。
+全树无冲突标记残留。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
@@ -542,7 +655,17 @@ go test -count=1 -timeout 480s ./...  → 全绿（21 包）
   —— 401 与 403 共用同一判定窗是刻意的：两者都是「出口 IP 被边缘层拒绝」，混排要能更快触发。
 - ⛔ **别在同步上游 `internal/upstream/client.go` 时整文件覆盖**——本仓在该文件有 `ErrEdgeAuth` /
   `IsEdgeAuth` / `Classify` 第 11 层三处自研改动（上游没有，见 §5.5 C 节核查结论）。
-  同步姿势仍是 §3.1 的逐文件三方合并。
+  ⚠️ 且该文件与面板上游**结构性分叉**（本仓 `errorRule/matchMode` vs 面板 `xxxMarkers`）
+  → **逐文件三方合并也不适用**，必须**手工移植**（见 §5.6 C 节）。先判断改动是否自包含，再整块搬。
+- ⛔ **别在结构分叉的文件上迷信「三方合并成功」**——`git merge-file` 返回 0（无冲突）
+  只说明文本能拼上，不说明语义正确。分诊前先跑一次顶层符号互包含性检查：
+  `comm -23 <(ours 符号) <(theirs 符号)` 双向非空 ⇒ 结构分叉 ⇒ 走手工移植。
+- ⛔ **别再 fetch `/vol4/_upstream_wb2api`**（2026-09-25 用户决定：只跟面板上游）。
+  原根上游 `Sliverkiss/workbuddy2api` 已删库；延续仓库是 `HanawaBanana/workbuddy2api`，
+  **仅作历史留档**，不纳入日常同步。见 §5.6 A。
+- ⛔ **别把 `internal/panel/app.js` 的 `reattachQueueView` 换回 `pollQueueOnce`**——
+  上游已废弃后者（`c564e90`/`410309c` 就是在修它的残留调用点导致的 JS 崩溃）。
+  本仓那一行是 `loadSchoolStatus(true); loadCNInvite(true); reattachQueueView();`（两个改动并存）。
 - ⚠️ **`-race` 在本机跑不了**（无 gcc + 网络受限），验证标准是 `build+vet+test`（§3.1 E 步）。
   别因为「没跑 -race」就认为验证不完整——本仓历史从未跑过。
 - ⛔ **别为了本机某个客户端的现象去改 `internal/upstream/thinking.go`**（`injectThinking` / `backfillReasoningContent`）—— 那是上游面向**全部客户端**的契约：**issue #43** 的验收项就是「无 effort 裸请求也开思考」（非它则只发 `thinking` 的客户端拿不到思维链）；**issue #157** 维护者结论是「**客户端配置问题，非网关缺陷**」；**issue #91** 明确 `reasoning_content` 是**要被传递出去**的字段。

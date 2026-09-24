@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -872,6 +873,153 @@ func realmKey(realm string) string {
 	return realm
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 模型限时优惠（modelPromotions）[2026-09-25 手工移植面板上游 2b0eedd]
+//
+// 为什么是「移植」而不是三方合并：本仓 client.go 的错误分类链取自**根上游**的
+// errorRule/matchMode 重构版，而面板上游仍是 xxxMarkers 旧形态——两条线在该文件
+// 已**结构性分叉**（顶层符号 ours 87 / theirs 87 但互不包含）。行级三方合并会产出
+// 语义错误的交错代码，故按 PORTING §5.1「手工吸收」的方式把该特性整体搬过来。
+// 该块自包含（只依赖 time/strings/strconv），与分类链结构无关。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
+// 7 条：deepseek 系错峰五折、glm-5.2 夜间五折、hy3 与 hy4-preview-f 限时免费）。
+// discount 只在部分条目上存在：有 factor 的可算生效价；「错峰使用」类只有时段
+// 文案（factor 藏在 hover 文本里，无机器可读值），仅透出标签与说明。
+type v3ModelPromotion struct {
+	Enabled  bool     `json:"enabled"`
+	Priority int      `json:"priority"`
+	ModelIDs []string `json:"modelIds"`
+	Badge    *struct {
+		Label string `json:"label"`
+	} `json:"badge"`
+	Discount *struct {
+		DiscountedCredits string  `json:"discountedCredits"`
+		Factor            float64 `json:"factor"`
+	} `json:"discount"`
+	Hover *struct {
+		TextZh string `json:"textZh"`
+	} `json:"hover"`
+	Schedule *struct {
+		Daily []struct {
+			Start string `json:"start"` // "23:00"
+			End   string `json:"end"`   // "7:50"（可跨午夜）
+		} `json:"daily"`
+		Timezone   string `json:"timezone"`  // 实测恒 Asia/Shanghai
+		ValidFrom  string `json:"validFrom"` // RFC3339，可缺省
+		ValidUntil string `json:"validUntil"`
+	} `json:"schedule"`
+}
+
+// promoZone 优惠时区：上游恒 Asia/Shanghai（UTC+8 无夏令时），用 FixedZone 免依赖
+// 系统 tzdata（Windows 无 IANA 库时 LoadLocation 会失败）。
+var promoZone = time.FixedZone("CST", 8*3600)
+
+// promoClock 解析 "HH:MM" 为当日分钟数；坏值返回 (-1, false)。
+func promoClock(hhmm string) (int, bool) {
+	parts := strings.Split(hhmm, ":")
+	if len(parts) != 2 {
+		return -1, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 24 || m < 0 || m > 59 {
+		return -1, false
+	}
+	return h*60 + m, true
+}
+
+// promoActive 评估优惠在 now 是否生效：enabled + validFrom/validUntil 内 + 落在
+// 任一 daily 窗口（支持跨午夜，如 23:00→7:50）。schedule 为 nil 视为全天生效。
+func promoActive(p *v3ModelPromotion, now time.Time) bool {
+	if !p.Enabled {
+		return false
+	}
+	if sc := p.Schedule; sc != nil {
+		if sc.ValidFrom != "" {
+			from, err := time.Parse(time.RFC3339, sc.ValidFrom)
+			if err == nil && now.Before(from) {
+				return false
+			}
+		}
+		if sc.ValidUntil != "" {
+			until, err := time.Parse(time.RFC3339, sc.ValidUntil)
+			if err == nil && !now.Before(until) {
+				return false
+			}
+		}
+		if len(sc.Daily) > 0 {
+			cur := now.Hour()*60 + now.Minute()
+			inWindow := false
+			for _, w := range sc.Daily {
+				st, ok1 := promoClock(w.Start)
+				ed, ok2 := promoClock(w.End)
+				if !ok1 || !ok2 {
+					continue
+				}
+				if st <= ed {
+					if cur >= st && cur < ed {
+						inWindow = true
+						break
+					}
+				} else if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
+					inWindow = true
+					break
+				}
+			}
+			if !inWindow {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
+// 最高（实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨
+// 切换）。无 discount 对象的条目也挂标签/说明（错峰类），PromoFactor 留 nil。
+func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
+	if len(promos) == 0 || len(out) == 0 {
+		return
+	}
+	now := time.Now().In(promoZone)
+	type cand struct {
+		prio int
+		p    *v3ModelPromotion
+	}
+	best := map[string]cand{}
+	for i := range promos {
+		p := &promos[i]
+		if !promoActive(p, now) {
+			continue
+		}
+		for _, id := range p.ModelIDs {
+			if _, ok := out[id]; !ok {
+				continue // 目录外模型（如同名 global 变体）不挂
+			}
+			if b, seen := best[id]; !seen || p.Priority > b.prio {
+				best[id] = cand{prio: p.Priority, p: p}
+			}
+		}
+	}
+	for id, c := range best {
+		mi := out[id]
+		if c.p.Badge != nil {
+			mi.PromoLabel = c.p.Badge.Label
+		}
+		if c.p.Hover != nil {
+			mi.PromoNote = c.p.Hover.TextZh
+		}
+		if c.p.Discount != nil {
+			f := c.p.Discount.Factor
+			mi.PromoFactor = &f
+			mi.PromoCredits = c.p.Discount.DiscountedCredits
+		}
+		out[id] = mi
+	}
+}
+
 // storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
 // 供 CN FetchModels 与 global 探测共用：拉取到的模型档位落桶后，出站请求体 normalizeReasoningEffort
 // 才能按域降级。efforts 与 defs 均空时删除该 realm 桶（等价「该域无可降级档位」）。
@@ -1198,6 +1346,15 @@ type ModelInfo struct {
 	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
 	ReasoningEffort   string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
 	ReasoningSummary  string   // reasoning.summary 推理摘要模式（如 "auto"）
+
+	// 优惠（modelPromotions，/v3/config data.modelPromotions）[2026-09-25 移植面板上游
+	// 2b0eedd]：Credits 是**牌价**（转正后基准倍率），Promo* 是当前生效的限时优惠——
+	// 面板据此显示「生效价 + 标签 + 牌价」。PromoFactor 为 nil 表示无 machine-readable
+	// 折扣（如「错峰使用」只有时段文案无 factor），仅挂标签/提示。
+	PromoFactor  *float64 // 折扣系数（0=限时免费，0.5=五折）；nil=无
+	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
+	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
+	PromoNote    string   // hover 说明原文（含时段/日期描述）
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1510,7 +1667,37 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 		}
 		out = append(out, mi)
 	}
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 是牌价，Promo* 是生效价，
+	// 面板据此显示「生效价 + 标签 + 划线牌价」。[2026-09-25 手工移植面板上游 2b0eedd]
+	// 本函数产出**切片**（上游产出 map），故经 map 中转再回填；promotions 单独解析
+	// （parseGlobalModelNames 不透出该字段，且其签名已被多处调用，不为此扩返回值）。
+	if promos := parseV3ModelPromotions(raw); len(promos) > 0 {
+		byID := make(map[string]ModelInfo, len(out))
+		for _, mi := range out {
+			byID[mi.ID] = mi
+		}
+		applyModelPromotions(byID, promos)
+		for i := range out {
+			if mi, ok := byID[out[i].ID]; ok {
+				out[i] = mi
+			}
+		}
+	}
 	return out, nil
+}
+
+// parseV3ModelPromotions 从 /v3/config 原始响应里取出 data.modelPromotions。
+// 解析失败/字段缺失返回 nil —— 优惠是**展示性增强**，绝不因它让模型目录整体失败。
+func parseV3ModelPromotions(raw []byte) []v3ModelPromotion {
+	var env struct {
+		Data struct {
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil
+	}
+	return env.Data.ModelPromotions
 }
 
 // billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
