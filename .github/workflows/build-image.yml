@@ -1,0 +1,77 @@
+name: build-image
+
+# 在 GitHub runner 上构建镜像并推送到 GHCR。
+# 动机（2026-09-28）：NAS 上 `docker compose build` 卡在 `apk add`
+# （dl-cdn.alpinelinux.org 从 NAS 不可达），且源码只存在于 NAS 单盘。
+# runner 有外网，能拉 alpine 源；产物推到 GHCR，NAS 只负责 pull。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'PORTING.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+# 同一分支只保留最新一次构建，旧的在跑就取消
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Building $IMAGE:latest and $IMAGE:sha-$SHA"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # runner 在境外，用官方代理更稳（Dockerfile 里 ARG 默认是 goproxy.cn）
+          build-args: |
+            GOPROXY=https://proxy.golang.org,direct
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ steps.meta.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| image | \`$IMAGE\` |"
+            echo "| tag | \`sha-${{ steps.meta.outputs.sha }}\` / \`latest\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
