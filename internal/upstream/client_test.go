@@ -72,6 +72,18 @@ func TestClassify(t *testing.T) {
 		// （上方 {200, "code":11140 rate-limiting} 必须仍是 ErrSoftRate），只能靠 msg 区分。
 		{403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
 		{403, `request illegal`, ErrAccountFault},
+		// ⭐ 11140 的**内容审核**形态（2026-09-28 事故）：与上面的账号授权封禁同为
+		// code 11140 + msg "request illegal"，**只有 displayMsg 能分野**。
+		// 必须归 ErrContentBlocked（零账号惩罚 + 首遇降级重试），绝不能落 accountFaultRule
+		// ——那会让 applyErrorPolicy 走 Pool.Disable **永久禁用健康号**（实测已误禁 2 个）。
+		// 两个 pattern 互为冗余：上游只发 zh / 只发 en 都要命中。
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`, ErrContentBlocked},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review."}}`, ErrContentBlocked},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"内容未通过安全审核"}}`, ErrContentBlocked},
+		// 真·账号授权封禁（displayMsg 不含安全审核文案）必须**保持** ErrAccountFault →
+		// Disable 语义不变：判据只用文案，不用「displayMsg 存在性」。
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been suspended."}}`, ErrAccountFault},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"账号已被封禁"}}`, ErrAccountFault},
 		{429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated. Please log out of your current account and log in again to activate it immediately and start your free trial."}}}`, ErrAccountFault},
 		{400, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。

@@ -531,6 +531,78 @@ func TestChatAccountFault11140Disables(t *testing.T) {
 	}
 }
 
+// TestChatContentSafety11140DoesNotDisable ⭐ 事故回归（2026-09-28）：
+// 上游对**内容审核拒绝**也回 code 11140 + msg "request illegal"，
+// 与真·账号授权封禁**同码同 msg**，只有 displayMsg 能分野：
+//
+//	{"code":11140,"msg":"request illegal","displayMsg":{
+//	   "en":"The content did not pass the safety review. Please adjust and retry.",
+//	   "zh":"内容未通过安全审核…"}}
+//
+// 修复前按 msg 归 ErrAccountFault → applyErrorPolicy 走 Pool.Disable →
+// **永久禁用健康号**（生产已误禁 2 个：onyxibis257 / yejzsg@gmail.com，需人工 revive）。
+// 修复后归 ErrContentBlocked：零账号惩罚，回 400 content_blocked 透传上游原文。
+//
+// 两个子用例覆盖两种 PromptMode（决定是否先做一次降级重试）：
+//   - custom       = **生产配置**（prompt.mode=custom）→ 不降级重试，1 次上游调用
+//   - passthrough  = NewHandler 缺省 → 首遇降级重试一次，2 次上游调用
+func TestChatContentSafety11140DoesNotDisable(t *testing.T) {
+	const body = `{"code":11140,"msg":"request illegal","requestId":"req-x","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`
+
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		wantCalls int
+	}{
+		{"custom(生产配置，不降级重试)", "custom", 1},
+		{"passthrough(缺省，首遇降级重试一次)", "passthrough", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var called []string
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				called = append(called, authz)
+				return 403, body, false
+			})
+			p := testPoolWith(
+				&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+			)
+			h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: tc.mode})
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+			// 内容拦截最终回 400（不是 503），且透传上游原文。
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d want 400 (content_blocked), body=%s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), "content_blocked") {
+				t.Errorf("应回 content_blocked code：%s", rec.Body)
+			}
+			// 分类确为 ErrContentBlocked（而非 account_fault）：hint 是内容策略口径。
+			// 这条是「修复是否生效」的直接证据——修复前 hint 会是账号级口径。
+			if !strings.Contains(rec.Body.String(), "content policy") {
+				t.Errorf("hint 应为内容策略口径（证明分类是 ErrContentBlocked 而非 ErrAccountFault）：%s", rec.Body)
+			}
+			if len(called) != tc.wantCalls {
+				t.Errorf("upstream calls=%d want %d（mode=%s）", len(called), tc.wantCalls, tc.mode)
+			}
+			// ⭐ 事故修复点：内容审核绝不能罚账号。
+			for _, uid := range []string{"u1", "u2"} {
+				st, _ := p.Status(uid)
+				if st.Disabled {
+					t.Errorf("uid=%s 被禁用——内容审核被误判成账号封禁（事故根因）: reason=%q", uid, st.DisabledReason)
+				}
+				if st.Cooling {
+					t.Errorf("uid=%s 被冷却——内容问题应零账号惩罚: %+v", uid, st)
+				}
+				if st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+					t.Errorf("uid=%s 被喂了连败/降权——内容问题应零账号惩罚: %+v", uid, st)
+				}
+			}
+		})
+	}
+}
+
 // TestChatAccountFault14017Rotates 配额未激活（14017 trial not activated，实测 global
 // 新账号 register 未完成）同样纳入轮换：坏号冷却、轮换到下一号、不再被重复选中。
 // 与 11140（硬禁用）区分的关键：14017 属于 register 未完成，完善 register 后可能

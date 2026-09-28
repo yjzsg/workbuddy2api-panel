@@ -634,6 +634,83 @@ go test -count=1 -timeout 480s ./...  → 全绿（21 包，含新增的 panel/f
 `reattachQueueView` / `promo_factor` / `applyModelPromotions`（本次合入）。
 全树无冲突标记残留。
 
+## 5.7 2026-09-28 **本仓自研修复**：内容审核被误判成账号封禁（上游未修）
+
+### A. 事故现象
+生产 40 个号里 **2 个被 `Pool.Disable` 永久禁用**（需人工 revive）：
+
+```
+onyxibis257        disabled=True  reason=account banned by upstream (11140 request illegal), re-login required
+yejzsg@gmail.com   disabled=True  reason=account banned by upstream (11140 request illegal), re-login required
+```
+
+### B. 根因（证据链）
+完整 body（日志在 200 字符处截断，但 `en` 字段完整）：
+```json
+{"code":11140,"msg":"request illegal","requestId":"...",
+ "displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.",
+               "zh":"内容未通过安全审核…"}}
+```
+**`displayMsg` 明说是内容审核拒绝——用户请求内容触发的，与账号无关。**
+
+代码链（`internal/upstream/client.go` + `internal/server/handler.go`）：
+```
+Classify: accountFaultRule（matchFold，pattern "request illegal"）先命中 → ErrAccountFault
+   ↑ contentBlockedRule 只认 "blocked by security policy" / "unapproved channel" /
+     "illegal api invocation"，接不住这个形态
+applyErrorPolicy(ErrAccountFault):
+   if strings.Contains(lower(body), "request illegal") { Pool.Disable(uid, "...") }
+```
+→ **把「用户内容触发审核」记成「账号授权封禁」→ 永久禁用健康号。**
+
+**影响**：40 号损失 2 个（5%）；**只要再发一次触发审核的内容就再损失一个**（持续性失血），
+且惩罚的是无辜健康号。
+
+**与 §5.5 的 401 事故同类**：把「非账号问题」记到账号头上
+（401 = 出口 IP 级 → 全池降权；本例 = 内容级 → 单号永久禁用）。
+
+### C. 上游核查：**未修**
+面板上游 `dbd7c68..1e23c2b`（26 提交）无一条碰 `11140` / `displayMsg` / `安全审核`；
+根上游留档克隆同样无。→ 本仓自研。
+
+### D. 改动
+| 文件 | 变更 |
+|---|---|
+| `internal/upstream/client.go` | 新增 `contentSafetyRule`（`ErrContentBlocked`，pattern `"safety review"` + `"内容未通过"`）；`Classify` 在 `accountFaultRule` **之前**加一层分流；判定顺序文档补第 3 层 |
+| `internal/upstream/client_test.go` | `TestClassify` 加 5 例（zh 形态 / en 形态 / 仅 en / 仅 zh / **真封禁仍 ErrAccountFault** ×2） |
+| `internal/server/handler_test.go` | 新增 `TestChatContentSafety11140DoesNotDisable`（事故回归，双子用例） |
+
+**判据设计**：
+- 只用 displayMsg 的**文案**，不用「displayMsg 存在性」→ 真·账号封禁若也带 displayMsg 不受影响
+- 两个 pattern 互为冗余 → 上游只发 zh 或只发 en 都能命中
+- `"内容未通过"` 取**已观测前缀**（日志截断在 `内容未通过安`，不臆造完整文案）
+
+**验证过分类用的是完整 body**：`Classify(resp.StatusCode, string(raw))` —— 未截断；
+`truncate(...,200)` 只用于日志与 `Error.Msg`。
+
+### E. ⭐ 测试时发现的行为差异（值得记住）
+`NewHandler` 缺省 `PromptMode = "passthrough"` → 首遇 `ErrContentBlocked` 会先做**一次降级重试**
+（`prompt.Rewrite(body, prompt.Degraded)` 后 `continue`），再撞才回 400。
+而**生产配置是 `prompt.mode = "custom"`** → **不降级重试**，直接 400。
+→ 测试用两个子用例分别覆盖（custom=1 次上游调用 / passthrough=2 次）。
+
+### F. 验证（全绿）
+```
+gofmt（本次碰过的文件 clean；client.go 的脏是仓库既有，已确认新增行合规）
+go build ./... / go vet ./...  → 通过
+go test -count=1 -timeout 480s ./...  → 全绿（21 包）
+```
+关键回归：`TestChatAccountFault11140Disables`（**真封禁仍禁用，语义未被破坏**）与
+`TestChatAccountFault14017Rotates` 均通过。
+
+### G. 人工补救
+那 2 个被误禁的号已 revive：
+```bash
+curl -X POST -H "Authorization: Bearer <key>" \
+  http://127.0.0.1:7863/panel/api/accounts/<uid>/revive      # 路由不需要 body
+```
+→ 40/40 healthy。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
@@ -653,6 +730,15 @@ go test -count=1 -timeout 480s ./...  → 全绿（21 包，含新增的 panel/f
   止打职责归 `edgeGate`（IP 级状态机），不归账号惩罚。详见 §5.5。
 - ⛔ **别把 `internal/server/edgegate.go` 退回 `wafip.go` 的 403 专用形态**（也别把 `noteEdgeAuth` 拆成独立状态机）
   —— 401 与 403 共用同一判定窗是刻意的：两者都是「出口 IP 被边缘层拒绝」，混排要能更快触发。
+- ⛔ **别把 `contentSafetyRule`（11140 + displayMsg 安全审核文案）的判定挪到 `accountFaultRule` 之后**，
+  也别删掉它——两者同为 code 11140 + msg "request illegal"，**只有 displayMsg 能分野**；
+  落 `accountFaultRule` 会让 `applyErrorPolicy` 走 `Pool.Disable` **永久禁用健康号**
+  （2026-09-28 已误禁 2 个，见 §5.7）。**内容问题不是账号问题。**
+- ⛔ **别为了「displayMsg 存在」就归内容审核**——判据必须是**文案**（`safety review` / `内容未通过`），
+  否则真·账号授权封禁若带上 displayMsg 就会被漏放成健康号，反而更糟。
+- ⚠️ **`NewHandler` 缺省 `PromptMode="passthrough"`，生产配置是 `prompt.mode="custom"`** ——
+  两者对 `ErrContentBlocked` 的行为不同（前者先降级重试一次，后者直接 400）。
+  写相关测试时**显式指定 PromptMode**，别依赖缺省值（见 §5.7 E）。
 - ⛔ **别在同步上游 `internal/upstream/client.go` 时整文件覆盖**——本仓在该文件有 `ErrEdgeAuth` /
   `IsEdgeAuth` / `Classify` 第 11 层三处自研改动（上游没有，见 §5.5 C 节核查结论）。
   ⚠️ 且该文件与面板上游**结构性分叉**（本仓 `errorRule/matchMode` vs 面板 `xxxMarkers`）

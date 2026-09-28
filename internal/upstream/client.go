@@ -207,6 +207,33 @@ var invalidImageRule = errorRule{kind: ErrImageInvalid, mode: matchFold, pattern
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already"}}
 
+// contentSafetyRule 上游「内容未通过安全审核」文案（code 11140 的**内容审核**形态）。
+//
+// 定位（2026-09-28 实测事故）：上游对**内容审核拒绝**也回 code 11140 + msg
+// "request illegal"，只在 displayMsg 里点明是内容问题：
+//
+//	{"code":11140,"msg":"request illegal","requestId":"...",
+//	 "displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.",
+//	               "zh":"内容未通过安全审核…"}}
+//
+// 若按 msg 的 "request illegal" 归 ErrAccountFault，applyErrorPolicy 会走
+// **Pool.Disable** —— 把「用户请求内容触发审核」记成「账号授权封禁」，**永久禁用健康号**
+// （生产已误禁 2 个号：onyxibis257 / yejzsg@gmail.com，需人工 revive 才恢复）。
+// 内容问题不是账号问题，必须归 ErrContentBlocked：零账号惩罚 + 首遇降级重试
+// + 最终 400 content_blocked 透传原文（见 handler.applyErrorPolicy 的 ErrContentBlocked 分支）。
+//
+// 判据只用 displayMsg 的**文案**，不用「displayMsg 存在性」：真·账号授权封禁若也带
+// displayMsg，不会被误判成内容问题（两个 pattern 都不命中）。
+// 两个 pattern 互为冗余：上游只发 zh 或只发 en 时都能命中。
+//   - "safety review"：en 完整观测（"The content did not pass the safety review. …"）
+//   - "内容未通过"：zh 已观测前缀（日志在 200 字符处截断，只能确认到这里）
+//
+// 分类顺序：必须判在 accountFaultRule **之前**（见 Classify 第 3.5 层）。
+var contentSafetyRule = errorRule{kind: ErrContentBlocked, mode: matchFold, patterns: []string{
+	"safety review",
+	"内容未通过",
+}}
+
 // accountFaultRule 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
@@ -221,6 +248,9 @@ var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签�
 // is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateRule
 // 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
 // 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
+//
+// ⚠️ 11140 还有第三种形态：**内容审核拒绝**（displayMsg 点明安全审核）——那种必须先被
+// 上方 contentSafetyRule 截走，绝不能落到这里（落到这里 = 永久禁用健康号）。
 var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
 	"request illegal",
 	"trial not activated",
@@ -529,7 +559,13 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
-//  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
+//  3. contentSafetyRule —— 11140 的**内容审核**形态（displayMsg 点明「内容未通过安全
+//     审核」）。**必须判在 accountFaultRule 之前**：两者同为 code 11140 + msg
+//     "request illegal"，只有 displayMsg 能分野；先落 accountFaultRule 会被
+//     applyErrorPolicy 判成账号授权封禁 → **Pool.Disable 永久禁用健康号**
+//     （2026-09-28 实测误禁 2 个号）。内容问题不是账号问题，归 ErrContentBlocked
+//     （零账号惩罚 + 首遇降级重试）。
+//  3.5 accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
 //     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
@@ -584,6 +620,14 @@ func Classify(status int, body string) ErrKind {
 	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
+	}
+	// 11140 的内容审核形态先于 accountFaultRule 分流（2026-09-28 事故）：
+	// 两者同为 code 11140 + "request illegal"，只有 displayMsg 能分野。若让
+	// accountFaultRule 先命中，applyErrorPolicy 会 Pool.Disable —— 把「用户请求内容
+	// 触发审核」记成「账号授权封禁」，**永久禁用健康号**（实测已误禁 2 个）。
+	// 详见 contentSafetyRule 注释。
+	if contentSafetyRule.hit(body, lower) {
+		return ErrContentBlocked
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
