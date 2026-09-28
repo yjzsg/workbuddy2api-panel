@@ -1,6 +1,13 @@
 services:
   wb2api:
-    build: .
+    # 镜像由 GitHub Actions 构建并推到 GHCR（.github/workflows/build-image.yml）。
+    #   部署：docker compose pull && docker compose up -d --force-recreate
+    #   回滚：把下面的 tag 换成不可变的 sha-<短sha>（历史 tag 见 PORTING.md §7）
+    image: ghcr.io/yjzsg/workbuddy2api-panel:latest
+    # [应急后备] 本地构建（需先把 Dockerfile 里的 alpine 源换成 NAS 可达的镜像站）。
+    # ⚠️ 直接启用会卡在 `apk add`：dl-cdn.alpinelinux.org 从 NAS 不可达
+    #（2026-09-28 实测；此前能过是因为该层还在构建缓存里）。这正是改用 CI 的动机。
+    # build: .
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
