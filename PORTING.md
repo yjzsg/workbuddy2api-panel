@@ -646,6 +646,12 @@ go test -count=1 -timeout 480s ./...  → 全绿（21 包，含新增的 panel/f
 
 ## 5.7 2026-09-28 **本仓自研修复**：内容审核被误判成账号封禁（上游未修）
 
+> ⚠️⚠️ **2026-09-29：本节 B 节的判据（`displayMsg` 文案能分野内容/账号）已被实测证伪。**
+> 隔离实例 A/B：`onyxibis257` / `yejzsg@gmail.com` 对内容 `"hi"` **也**返回同一句
+> 「内容未通过安全审核」，而同一请求换健康号即 200 ⇒ **那 2 个号是账号级被拒，不是内容问题**。
+> `displayMsg` 是面向终端用户的装饰性文案，**不能当分类判据**。
+> 本节保留作历史记录；**当前实现见 §5.8**（把判定从「文案」改为「行为」）。
+
 ### A. 事故现象
 生产 40 个号里 **2 个被 `Pool.Disable` 永久禁用**（需人工 revive）：
 
@@ -721,6 +727,137 @@ curl -X POST -H "Authorization: Bearer <key>" \
 ```
 → 40/40 healthy。
 
+## 5.8 2026-09-29 **本仓自研修复**：内容拦截改为「行为判别」（推翻 §5.7 的文案判据）
+
+### A. 现象
+
+`global:` 模型「经常被拦截」，`cn:` 从不被拦：
+
+```
+近 12h：  global 1011 请求 → 200×565 / 400×445（44.0%）
+          cn      190 请求 → 200×180 /  400×0
+```
+
+400 全部是 `403 content_blocked`（上游 code 11140 + displayMsg「内容未通过安全审核」）。
+
+### B. 根因（两个独立伤害，同一个假设错误）
+
+**错误假设**：`handler.go` 旧分支注释写着「内容命中网关内容防火墙：立即回客户端，
+**不轮转**——换任何账号都会撞同一审核」。**该假设被实测证伪。**
+
+隔离实例单账号 A/B（内容 = `"hi"`，同镜像 / 同配置 / 同出口 IP）：
+
+| 账号 | 结果 |
+|---|---|
+| `gentlenewt309`（对照） | **200** |
+| `onyxibis257` | **400 content_blocked** |
+| `yejzsg@gmail.com` | **400 content_blocked** |
+
+⇒ 上游对**账号级拒绝**也回同一句 displayMsg。文案不可信，唯一可靠判据是**行为**。
+
+**伤害 ①（客户端可见 400）**：本来换个健康号就能成功，却直接回 400。
+**伤害 ②（死号泄漏）**：`ErrContentBlocked` 零惩罚 ⇒ 被拦号 `fails=0 / cooling=False /
+disabled=False`，状态永远"最干净" ⇒ 在选号打分里永远最优 ⇒ 被越选越多：
+
+```
+onyxibis257        pick=224   ok=0    0%     ← 446/1011 = 44% 的 global 流量落在 2 个死号上
+yejzsg@gmail.com   pick=222   ok=0    0%
+其余 38 个号        pick=2~156 ok≈pick   ~100%
+```
+
+客户端重试 → 又落回这 2 个号 → 再 400 → **重试风暴**（02:30 一分钟 247 个 400）。
+
+### C. 修法：把判定从「文案」改成「行为」
+
+`ErrContentBlocked` 不再立即返回，改为**先轮转**，用「换号后能否成功」判定：
+
+| 结果 | 判定 | 动作 |
+|---|---|---|
+| 后续某个号**成功** | 内容可过审 ⇒ 被拦的是**账号侧** | 对 `blockedUIDs` 喂 `NoteContentBlockEvidence` |
+| 整轮**都被拦** | 换任何号都一样 ⇒ **内容问题** | 末端回 400 `content_blocked`，**零惩罚** |
+
+`NoteContentBlockEvidence`（`internal/pool/state.go`，与 `NoteSessionDead` 同构）：
+- 未达 `contentBlockThreshold=3`：软冷却 `contentBlockCooldown=1m` 让位，返回 false；
+- 达阈值：`Disable(uid, contentBlockReason)`，返回 true。
+- 清零点：`NoteSuccess`（成功是「该号没被上游拒」的直接证据）、`ReviveDisabled`。
+
+⇒ 死号约 2 分钟内被自动摘出池（每次证据后软冷却 1 分钟，冷却结束再被选中才累积下一次），
+且**客户端始终拿到 200**（轮转到健康号）。
+
+### D. 代码位置
+
+```
+internal/pool/entry.go     + contentBlockFails 字段 / contentBlockThreshold / contentBlockCooldown
+                           + contentBlockReason / ContentBlockThreshold()
+internal/pool/state.go     + NoteContentBlockEvidence / ClearContentBlock
+                           ~ NoteSuccess、ReviveDisabled 各加一行清零
+internal/server/handler.go ~ 轮转循环：blockedUIDs 记账 + ErrContentBlocked 改为换号
+                           ~ 成功分支：对 blockedUIDs 喂证据
+                           ~ 末端 switch：新增 case ErrContentBlocked → 400（零惩罚）
+```
+
+### E. 代价（有意接受）
+
+真内容拦截时多打 1~2 次上游（罕见）——换来「账号级误判不再变成客户端可见 400 + 死号泄漏」。
+单账号池无法证明是账号问题（没有「另一个号成功」的证据）⇒ **不惩罚**，偏向不误伤。
+
+### F. 验证
+
+新增 8 个用例，核心三条：
+- `TestChatContentBlockRotatesToHealthy` —— 被拦号 + 健康号 → 客户端 **200**，被拦号软冷却，健康号零惩罚；
+- `TestChatAllContentBlockedReturns400NoPenalty` —— 整轮都被拦 → 400 `content_blocked`，**零惩罚**（保住 §5.7 要保护的性质）；
+- `TestChatContentBlockRepeatedEvidenceDisablesDeadAccount` —— 单号池不惩罚（无法证明是账号问题）。
+- pool 侧 5 条覆盖阈值/清零/复活/未知 uid。
+
+同时**改写了 3 个编码旧行为的既有用例**（`TestContentBlockedSecondHitReturns400` /
+`TestContentBlockedReturnsFirewallMessage` / `TestChatContentSafety11140DoesNotDisable`）——
+它们的调用次数断言从「拦截即停」改为「轮转两个账号」，语义变更是有意的。
+
+## 5.9 2026-09-29 查明：网关会「替换客户端 system prompt」（上游设计，本仓改了提示词内容）
+
+### A. 机制（上游本就有，非本仓补丁）
+
+`internal/prompt/defaultprompt.md` 被 `//go:embed` 嵌进二进制；`prompt.mode="custom"` + `file=""`
+→ `Load()` 返回内嵌提示词 → `handler.go` 调 `prompt.Rewrite()`：**删除 messages 中所有
+role∈{system,developer} 的消息，头部插入一条 `{"role":"system","content":<网关提示词>}`**。
+
+**与域无关**（`global:` / `cn:` 都一样，实测两者都回人格口吻）。
+
+设计动机（`internal/prompt/prompt.go` 包注释）：客户端 CLI 在 system prompt 注入固定模板句，
+上游内容审核按**逐字精确匹配**误杀合法流量（issue #36 / PR39 的 11-128），所以网关替换掉它。
+
+### B. ⚠️ 本仓的偏离：`defaultprompt.md` 被换成了人格提示词
+
+```
+上游  internal/prompt/defaultprompt.md  = 38 行「你是一名工程助手…」（干净）
+本仓  internal/prompt/defaultprompt.md  = 300 行「Little Code Sauce / YG」人格提示词
+      （b4d4997 一次根上游同步时替换）
+```
+
+⇒ 每个经过网关的请求，模型读到的 system 都是这份人格提示词。2026-09-29 在 DSH 会话里
+实测到后果：模型用第三人称谈「YG」、只输出散文、不认客户端 schema
+（探针发 `"hi"` 回 `"hey. what's going on"` —— 该提示词 Casual examples 的原句；
+换 `passthrough` 则回干净的 `"Hi! How can I help you today?"`）。
+
+### C. 三个模式（`handler.go`）
+
+| mode | 行为 |
+|---|---|
+| `passthrough`（**代码缺省**，`config.example.json` 也写这个） | 透传客户端原始 system |
+| `append` | **保留**客户端 system，在开头连续 system/developer 块之后**再插**一条网关 system |
+| `custom`（**生产配置是手工设的**） | **删除**客户端所有 system/developer，换成网关提示词 |
+
+### D. 未决
+
+- 要不要给「自带 schema / 工具定义」的客户端（DSH 等）走 `append`？
+  代价：客户端 system prompt 会重新出现在发往上游的请求里，11-128 指纹误杀风险回归
+  （**注**：2026-09-29 全窗口日志里 `11-128` 出现 **0 次**，该风险当前未观测到）。
+- `defaultprompt.md` 要不要恢复上游那份 38 行版本？人格注入对 WorkBuddy 客户端是想要的，
+  对其他客户端是污染——目前**未改**，等用户决定。
+- ⚠️ 该提示词含大量会被内容审核盯上的词汇（CSAM / incest / non-con / RAT / stealer /
+  phishing / 露骨词表），**每次请求都发给上游**。是否是那 2 个号被上游内容信誉标记的诱因——
+  **假设，未证实**（反证：健康号带该提示词仍 200）。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
@@ -742,12 +879,25 @@ curl -X POST -H "Authorization: Bearer <key>" \
   止打职责归 `edgeGate`（IP 级状态机），不归账号惩罚。详见 §5.5。
 - ⛔ **别把 `internal/server/edgegate.go` 退回 `wafip.go` 的 403 专用形态**（也别把 `noteEdgeAuth` 拆成独立状态机）
   —— 401 与 403 共用同一判定窗是刻意的：两者都是「出口 IP 被边缘层拒绝」，混排要能更快触发。
-- ⛔ **别把 `contentSafetyRule`（11140 + displayMsg 安全审核文案）的判定挪到 `accountFaultRule` 之后**，
-  也别删掉它——两者同为 code 11140 + msg "request illegal"，**只有 displayMsg 能分野**；
-  落 `accountFaultRule` 会让 `applyErrorPolicy` 走 `Pool.Disable` **永久禁用健康号**
-  （2026-09-28 已误禁 2 个，见 §5.7）。**内容问题不是账号问题。**
-- ⛔ **别为了「displayMsg 存在」就归内容审核**——判据必须是**文案**（`safety review` / `内容未通过`），
-  否则真·账号授权封禁若带上 displayMsg 就会被漏放成健康号，反而更糟。
+- ⚠️ **`contentSafetyRule` 的判据（`safety review` / `内容未通过`）不是可靠分野**（2026-09-29 实测证伪，
+  见 §5.8 B）：上游对**账号级拒绝**也回同一句文案。规则本身保留（用于给出 `content_blocked` 这个
+  机器可读 code），但**它只决定"叫什么名字"，不决定"罚不罚"**——罚与不罚由行为证据决定。
+  ⛔ 别再基于该文案做「不轮转 / 不罚号」的判断。
+- ⛔ **别把 `ErrContentBlocked` 改回「立即 400、不轮转」**（2026-09-29 之前的行为）——
+  那会让「账号级被拒」变成客户端可见的 400，并让被拦号零惩罚地留在池里被越选越多
+  （实测 44% 的 global 流量落在 2 个死号上 + 客户端重试风暴）。判定必须靠**换号结果**，见 §5.8 C。
+- ⛔ **别在「整轮都被拦」时罚账号**——那才是内容问题（换任何号都一样）。
+  `NoteContentBlockEvidence` **只能在「后续有号成功」之后调用**（`handler.go` 成功分支），
+  否则就退回 §5.7 的误禁老路。
+- ⛔ **别删 `NoteSuccess` / `ReviveDisabled` 里对 `contentBlockFails` 的清零**——
+  不清会让历史证据跨成功累积，最终误禁健康号。
+- ⚠️ **`prompt.mode` 决定客户端 system prompt 的命运**（`handler.go`）：`custom` = **删除**客户端
+  system 换成网关提示词；`append` = 保留客户端 system 再插一条；`passthrough` = 原样透传。
+  **生产用 `custom`**（防客户端指纹被上游逐字误杀，见 `internal/prompt/prompt.go` 包注释），
+  代价是**任何依赖自己 system prompt 的客户端（schema / 工具定义）都会失效**——
+  2026-09-29 在 DSH 会话里实测到「模型改说散文、第三人称谈 YG、不认输出格式」。
+  另注：`internal/prompt/defaultprompt.md` 在本仓被换成了**本工作区那份 300 行人格提示词**
+  （上游是 38 行的工程助手提示词，见 §5.9）。
 - ⚠️ **`NewHandler` 缺省 `PromptMode="passthrough"`，生产配置是 `prompt.mode="custom"`** ——
   两者对 `ErrContentBlocked` 的行为不同（前者先降级重试一次，后者直接 400）。
   写相关测试时**显式指定 PromptMode**，别依赖缺省值（见 §5.7 E）。

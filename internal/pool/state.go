@@ -59,6 +59,53 @@ func (p *Pool) ClearSessionDead(uid string) {
 	}
 }
 
+// NoteContentBlockEvidence 记录一次「证据确凿的账号级内容拦截」——即同一请求
+// 换号后**成功**（证明内容本身可过审，被拦的是账号侧，2026-09-29 事故）。
+//
+// 与 ErrContentBlocked 的零惩罚互补，不是替代：零惩罚只适用于「整轮轮转都被拦」
+// （内容问题，换任何号都一样）。上游对账号级拒绝也回同一句 displayMsg，**文案不可信**，
+// 唯一可靠判据是行为（换号能否成功）——所以惩罚必须由调用方在「确认换号成功」之后施加。
+//
+// 演进（与 NoteSessionDead 同构）：
+//   - 未达 contentBlockThreshold：软冷却 contentBlockCooldown 让位（不叠加，取更长者），
+//     返回 false。一次证据不足以判死——上游审核灰度/瞬时风控都会造成单次假阳性。
+//   - 达到阈值：Disable（reason=contentBlockReason）并清计数，返回 true。该账号在上游
+//     已被拒（实测 11.5h / 446 次尝试 0 成功），留在池里只会被反复选中、白打上游、
+//     并让客户端多轮转几次；摘出后运维在面板能看到 disabled_reason 并重新登录。
+//
+// 清零点：NoteSuccess（账号被证明可用的任何时刻）。
+func (p *Pool) NoteContentBlockEvidence(uid string) bool {
+	p.mu.Lock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		p.mu.Unlock()
+		return false
+	}
+	e.contentBlockFails++
+	if e.contentBlockFails >= contentBlockThreshold {
+		e.contentBlockFails = 0
+		p.disableLocked(e, contentBlockReason)
+		p.mu.Unlock()
+		return true
+	}
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	// 未达阈值：软冷却让位（Cooldown 自持锁，必须在释放 p.mu 之后调用）。
+	p.Cooldown(uid, CoolSoft, contentBlockCooldown, "content blocked while another account served the same request")
+	return false
+}
+
+// ClearContentBlock 清连续「账号级内容拦截」计数——账号被证明可用的任何时刻调用
+// （chat 成功 → NoteSuccess，手工复活 → ReviveDisabled）。
+func (p *Pool) ClearContentBlock(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.contentBlockFails != 0 {
+		e.contentBlockFails = 0
+		p.dirty.Store(true)
+	}
+}
+
 // ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
@@ -76,6 +123,7 @@ func (p *Pool) ReviveDisabled(uid string) bool {
 	e.disabled = false
 	e.reason = ""
 	e.sessionDeadFails = 0
+	e.contentBlockFails = 0
 	p.dirty.Store(true)
 	return true
 }
@@ -259,6 +307,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		// 成功同样清「账号级内容拦截」计数：成功是「该号没被上游拒」的直接证据
+		// （2026-09-29）。不清会让历史证据跨成功累积，最终误禁健康号。
+		e.contentBlockFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)

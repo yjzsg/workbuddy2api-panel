@@ -554,8 +554,10 @@ func TestChatContentSafety11140DoesNotDisable(t *testing.T) {
 		mode      string
 		wantCalls int
 	}{
-		{"custom(生产配置，不降级重试)", "custom", 1},
-		{"passthrough(缺省，首遇降级重试一次)", "passthrough", 2},
+		// 2026-09-29 起 content_blocked **会轮转**（用「换号能否成功」判别账号/内容问题），
+		// 所以 2 个账号都会被试到：custom 各一次 = 2；passthrough 首遇多一次降级重试 = 3。
+		{"custom(生产配置，不降级重试)", "custom", 2},
+		{"passthrough(缺省，首遇降级重试一次)", "passthrough", 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var called []string
@@ -2130,12 +2132,13 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`)))
 
-	// passthrough 首遇（body 含原始 system）→ 降级重试一次；第二次仍拦 → 立即 400，不轮转。
+	// passthrough 首遇（body 含原始 system）→ 降级重试一次；此后每次仍拦都**换号**
+	// （2026-09-29：用行为证据判别账号/内容问题），两个账号各试一次 → 整轮都被拦 ⇒ 400。
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
 	}
-	if calls != 2 {
-		t.Errorf("want exactly 2 upstream calls (first 400 + one degraded retry, then stop), got %d", calls)
+	if calls != 3 {
+		t.Errorf("want 3 upstream calls (u1 first + one degraded retry on u1, then rotate to u2), got %d", calls)
 	}
 	body := rec.Body.String()
 	if !assertJSONErrorCode(t, body, "content_blocked") {
@@ -2181,9 +2184,10 @@ func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
 	}
-	// custom 模式不走降级，因此只应打一次上游（不轮转第二个账号）。
-	if calls != 1 {
-		t.Errorf("content_blocked must not rotate accounts, calls=%d", calls)
+	// custom 模式不走降级重试；但 content_blocked 会**换号**（2026-09-29 行为判别），
+	// 两个账号各被拦一次 → 整轮都被拦 ⇒ 400（内容问题，零惩罚）。
+	if calls != 2 {
+		t.Errorf("content_blocked must rotate through both accounts, calls=%d want 2", calls)
 	}
 
 	var envelope struct {

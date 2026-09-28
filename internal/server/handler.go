@@ -766,6 +766,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// blockedUIDs 本次请求内被上游内容策略拦过的账号（2026-09-29 行为判别）。
+	//
+	// 为什么不能「被拦就立即回 400」（旧行为）：上游对**账号级拒绝**也回同一句
+	// displayMsg（"content did not pass the safety review"），文案不可信——实测两个
+	// 账号对内容 "hi" 也返回该文案，而同一请求换号即 200。旧行为有两个后果：
+	//   ① 客户端拿到本可避免的 400（换号就能成功）；
+	//   ② 被拦账号零惩罚 ⇒ 状态永远"最干净" ⇒ 在选号打分里永远最优 ⇒ 被越选越多
+	//      （实测 446/1011 = 44% 的 global 流量落在那 2 个死号上，客户端重试风暴）。
+	// 新行为：先换号，用「换号后是否成功」这一**行为证据**判定：
+	//   - 有号成功 ⇒ 前面被拦的是账号级坏号 ⇒ 在成功分支统一喂证据（升级惩罚）；
+	//   - 整轮都被拦 ⇒ 才是内容问题 ⇒ 末端回 400 content_blocked，**零惩罚**。
+	blockedUIDs := make([]string, 0, h.cfg.MaxRotate)
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -876,8 +889,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
-			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
-			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
+			// 第二次仍被拦 → 落下方 ErrContentBlocked 分支：**换号**，用行为证据
+			// 判定是账号问题还是内容问题（2026-09-29；该分支不再立即回 400）。
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
@@ -888,21 +901,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
-				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一
-				// 审核，轮转纯属浪费时间。不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
-				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样，
-				// 任务书授权上游错误码/账号语义对客户端可见），不再改写成网关固定文案。
+				// 内容策略拦截：**先换号，不立即回客户端**（2026-09-29 行为判别修复）。
+				//
+				// 旧行为是「立即回 400、不轮转」，理由是「换任何账号都会撞同一审核」——
+				// 该假设已被实测证伪：上游对**账号级拒绝**也回同一句 displayMsg
+				// （两个账号对内容 "hi" 也返回「内容未通过安全审核」，而同一请求换号即 200）。
+				// 文案不可信，唯一可靠判据是行为：换号后能否成功。
+				//
+				// 因此这里只记账 + 换号，把判定推迟到「结果已知」之后：
+				//   - 后续有号成功 → 成功分支对 blockedUIDs 统一喂 NoteContentBlockEvidence
+				//     （前 2 次软冷却让位，第 3 次 Disable——账号侧被上游拒）；
+				//   - 整轮都被拦 → 末端 ErrContentBlocked 分支回 400，**零惩罚**（内容问题）。
+				// applyErrorPolicy 的 ErrContentBlocked 分支仍为零动作（不冷却/熔断/NoteError），
+				// 惩罚只由「证据」路径施加，两条路径职责不重叠。
+				//
+				// 轮转代价：真内容拦截时多打 1~2 次上游（罕见），换来「账号级误判不再变成
+				// 客户端可见 400 + 死号泄漏」。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				msg := string(respBody)
-				if strings.TrimSpace(msg) == "" {
-					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
-					msg = "content blocked by upstream content firewall"
-				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
-					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
+				blockedUIDs = append(blockedUIDs, acct.UID)
 				st.status = http.StatusBadRequest
-				return
+				lastErr = uerr
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（客户端已走，换号无意义）
+				}
+				continue
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
 			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
@@ -957,6 +980,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// ⭐ 行为证据落地（2026-09-29）：本次请求成功 ⇒ 内容本身可过审 ⇒ 之前那些
+		// 回 content_blocked 的账号是**账号侧被上游拒**，不是内容问题。此时才喂证据：
+		// 未达阈值软冷却让位，达阈值 Disable（账号需重新登录）。
+		// 位置刻意放在 NoteSuccess 之后：先承认本次成功号可用，再清算被拦号。
+		for _, buid := range blockedUIDs {
+			if buid == acct.UID {
+				continue // 理论上不会（同号不会既被拦又成功），防御性跳过
+			}
+			if h.cfg.Pool.NoteContentBlockEvidence(buid) {
+				log.Printf("WARN: [server] content-block evidence: disabled acct=%s after %d account-side content rejections while other accounts served the same request",
+					logfmt.Label(buid, ""), pool.ContentBlockThreshold())
+			}
+		}
 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
@@ -1082,6 +1118,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				code = "edge_auth_blocked"
 				msg = "edge auth ip-level block: upstream gateway is rejecting the gateway IP at its auth edge, rotation stopped; retry after the block window expires"
 			}
+		case upstream.ErrContentBlocked:
+			// 整轮轮转都被内容策略拦（2026-09-29）：这才是**内容问题**——换任何号都拦，
+			// 所以零账号惩罚（没有任何账号被喂证据；blockedUIDs 里那些号在循环内已
+			// 被 applyErrorPolicy 零动作处理过）。回 400 与旧行为一致，客户端据此调整内容。
+			// 空 body 时给可读文案；有上游原文（code 11140 + displayMsg）时原文优先（下方统一）。
+			status = http.StatusBadRequest
+			code = "content_blocked"
+			msg = "content blocked by upstream content firewall"
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
@@ -1144,8 +1188,10 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     不靠惩罚账号实现。同 ErrContentBlocked/ErrPromptTooLong 一类的「非账号问题」。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
-//   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
-//     降级重试，最终仍拦则回 400 content_blocked（防火墙文案，不含账号/错误码）。
+//   - ErrContentBlocked → **本函数零动作**；惩罚由 chatCompletions 的「行为判别」
+//     路径施加（2026-09-29）：先换号，后续有号成功才喂 NoteContentBlockEvidence
+//     （账号级拦截），整轮都被拦则回 400 且零惩罚（内容问题）。
+//     passthrough/append 模式首遇仍触发降级重试（system 指纹误报专用）。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrPromptTooLong → 11115「prompt is too long」：请求的问题不是账号的问题
 //     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
@@ -1248,9 +1294,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
 	case upstream.ErrContentBlocked:
-		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
-		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
-		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+		// 内容策略拦截：**本分支恒为零动作**（不冷却/不熔断/不 NoteError）。
+		// chatCompletions 收到本 kind 后先换号（2026-09-29 行为判别修复）：
+		//   - 后续有号成功 → 由成功分支调 NoteContentBlockEvidence 施加惩罚
+		//     （证据确凿的账号级拦截：软冷却让位 → 达阈值 Disable）；
+		//   - 整轮都被拦 → 末端回 400 content_blocked，零惩罚（内容问题）。
+		// 惩罚与判定分离在**两个不同位置**是刻意的：这里无法知道「是账号问题还是
+		// 内容问题」（上游对两者回同一句 displayMsg），只有拿到换号结果才能判定。
 	case upstream.ErrPromptTooLong:
 		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked

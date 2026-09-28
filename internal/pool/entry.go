@@ -202,6 +202,16 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// contentBlockFails 连续「证据确凿的账号级内容拦截」计数（2026-09-29）。
+	//
+	// 与 ErrContentBlocked 的零惩罚互补：零惩罚只适用于**整轮轮转都被拦**（内容问题，
+	// 换任何号都一样）。若同一请求换号后**成功**，则证明内容可过审——被拦的是账号侧，
+	// 此时才喂本计数。上游对账号级拒绝也回同一句 displayMsg（"content did not pass
+	// the safety review"），**文案不可信**，行为证据（换号能否成功）是唯一可靠判据。
+	//
+	// 不持久化：达阈只需 3 次证据，重启归零的代价是「多打 3 次上游」；且本计数只用于
+	// 升级惩罚（前 N-1 次已给软冷却让位），不承载跨重启语义。
+	contentBlockFails int
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -529,6 +539,21 @@ const (
 // 又不会让真正的死 session 留在池里反复被选中。
 const sessionDeadThreshold = 3
 
+// contentBlockThreshold 连续「证据确凿的账号级内容拦截」（换号后成功 → 证明是账号问题）
+// 达到该次数才永久禁用（2026-09-29）。
+//
+// 与 sessionDeadThreshold 同值同理由：单次证据可能来自偶发（上游审核灰度、账号侧瞬时
+// 风控），3 次连续足以区分「偶发」与「该账号已被上游拒」——2026-09-29 实测两个账号
+// 11.5 小时内 446 次尝试 0 成功，3 次阈值对真死号是秒级命中，对健康号几乎不可能连撞。
+const contentBlockThreshold = 3
+
+// contentBlockReason 证据确凿的账号级内容拦截达到阈值时的持久化 reason。
+const contentBlockReason = "content blocked by upstream while another account served the same request (account-side rejection; re-login or check account status)"
+
+// contentBlockCooldown 证据确凿的账号级内容拦截在**未达禁用阈值**时给的软冷却时长。
+// 取 60s（与软冷却基数同量级）：让位给健康号，又不把一次偶发证据放大成长时间出池。
+const contentBlockCooldown = time.Minute
+
 // 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）
 // 的默认参数，与熔断器参数族同风格（SetDegrade 注入，默认值在此）。
 //   - defaultDegradeThreshold=5：比熔断阈值 3 宽——熔断管 5xx（ErrServer，确定性
@@ -558,6 +583,9 @@ const sessionDeadReason = "12153 session dead"
 
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }
+
+// ContentBlockThreshold 暴露「账号级内容拦截」证据的禁用阈值（供 server 日志引用）。
+func ContentBlockThreshold() int { return contentBlockThreshold }
 
 // softStreakShiftMax 软冷却退避的最大左移位数（防 1<<streak 溢出成负数/零）。
 // 无论 streak 累积多少，封顶逻辑总会先生效，此值只是溢出兜底。
