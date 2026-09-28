@@ -9,6 +9,11 @@
 > 但**已按用户决定不再单独跟踪**——面板上游会自己手工吸收根上游的改动。
 > NAS 上 `/vol4/_upstream_wb2api` 这个浅克隆自此**仅作历史留档，不再 fetch**。
 > 详细核查过程见 §5.6。
+>
+> 🚀 **2026-09-28 起：构建与部署已改走 GitHub。** 源码推到 `yjzsg/workbuddy2api-panel`
+> （remote 名 `fork`），由 GitHub Actions 构建镜像推到 GHCR，NAS 只负责 `pull`。
+> **NAS 上不再 `docker compose build`**（会卡在 `apk add`，见 §7 A）。
+> 部署 = `docker compose pull && docker compose up -d --force-recreate`；回滚 = 切 `sha-<短sha>` tag。
 
 ---
 
@@ -114,18 +119,22 @@ docker run --rm -v <tree>:/src -v /vol4/_gocache:/go/pkg/mod -w /src \
   golang:1.23-alpine \
   sh -c 'go build ./... && go vet ./... && go test -count=1 -timeout 480s ./...'
 
-# ④ 落地（备份 → 替换 → 重建 → 验收）
+# ④ 落地（备份 → 替换 → 提交推送 → CI 构建 → NAS 拉取 → 验收）
 cd <家目录>/docker/workbuddy2api-panel
 tar -czf /vol4/_panel_backup_$(date +%F_%H%M).tgz internal cmd scripts go.mod go.sum login.sh signin.sh credit.sh Dockerfile docker-compose.yml config.example.json
 rsync -a --delete <tree>/internal/ internal/
 rsync -a --delete <tree>/cmd/ cmd/
 cp <tree>/go.mod <tree>/go.sum . && cp <tree>/login.sh .
 cp <tree>/scripts/global_region.py scripts/            # login.sh 的 global 注册流程依赖
-docker compose build && docker compose up -d
+git add -A internal cmd && git commit -m "..." && git push fork HEAD:main
+#   ↑ push 触发 .github/workflows/build-image.yml：runner 上构建 + 推 GHCR（约 1–2 分钟）
+#   查进度：api.github.com/repos/yjzsg/workbuddy2api-panel/actions/runs
+docker compose pull && docker compose up -d --force-recreate
 # 验收：healthz / status（账号数+realm）/ v1/models（cn:+global:，ctx 真值）/ 面板 UI / 1 次流式+非流式请求
 ```
 
-**踩过的坑**：`docker compose build` 若在 `alpine:3.20` 报 401（NAS 镜像站 docker.fnnas.com 间歇性）→ 先 `docker pull alpine:3.20` 把它落进本地镜像库再 build。
+**踩过的坑**：~~`docker compose build` 若在 `alpine:3.20` 报 401（NAS 镜像站 docker.fnnas.com 间歇性）→ 先 `docker pull alpine:3.20`~~
+——**2026-09-28 起 NAS 不再 build**，改走 CI（§7）。这条留作历史：当时能过只是因为 `apk add` 那层还在构建缓存里。
 
 ### 3.1 增量同步（日常小步更新走这条，别重走全量换基）
 
@@ -173,7 +182,8 @@ git merge-file -p <tree>/<f> /tmp/base /tmp/theirs > /tmp/merged   # rc = 冲突
 # D) 增量落地只需 internal/ + cmd/（+ 有变动时的 config.example.json）
 rsync -a --delete <tree>/internal/ internal/ && rsync -a --delete <tree>/cmd/ cmd/
 # ⚠️ Dockerfile 是 L0 本地补丁版（NAS 镜像站绕行 + 国内 proxy + 只构建面板需要的二进制），永不同步
-docker compose build && docker compose up -d
+git add -A internal cmd && git commit -m "..." && git push fork HEAD:main   # 触发 CI 构镜像
+docker compose pull && docker compose up -d --force-recreate
 
 # E) 验证（无需 TZ：上游 #130 已把日期敏感测试改成 CST 自然日口径）
 docker run --rm -v <tree>:/src -v /vol4/_gocache:/go/pkg/mod -w /src \
@@ -723,7 +733,9 @@ curl -X POST -H "Authorization: Bearer <key>" \
 - ✅ **`deriveKey` 已于 2026-09-19 退役**（上游 `8058019`/`10eefa8` 官方化为 `StickyFallbackKey`，比我们原实现更完善）→ **别再补回 `deriveKey`**；同步 session 包时只需保留纯诊断的 `session.ProbeMissingKey`（见 §4 第 17 条）
 - ⛔ 别在同步时整批覆盖**面板自有测试用例**（`internal/pool/*_test.go`、`internal/server/handler_test.go`、`cmd/server/config_test.go`、`internal/upstream/client_test.go` 等）——文件在≠用例在，丢了不报错
 - ⛔ 别把 `internal/pool/watch.go` / `watch_test.go` 的 import 退回上游写法 `workbuddy2api/internal/auth`——本仓模块名是 `github.com/linguo2625469/workbuddy2api-panel`，退回即编译不过（见 §5.1）
-- ⚠️ **别用 `git checkout .` / `git stash` / `git reset --hard` 回退**。2026-09-18 曾发现工作树领先 HEAD 63 个文件（含生产文件），已提交让 **HEAD == 工作树**（`f204e68`）；但容器是 `build: .`，**部署真相始终是工作树** → 改前先 `git status --short`，回退用 `git revert`/逐文件恢复
+- ⚠️ **别用 `git checkout .` / `git stash` / `git reset --hard` 回退**。2026-09-18 曾发现工作树领先 HEAD 63 个文件（含生产文件），已提交让 **HEAD == 工作树**（`f204e68`）。改前先 `git status --short`，回退用 `git revert`/逐文件恢复。
+  ℹ️ **2026-09-28 起「部署真相」已不是工作树**（容器改跑 GHCR 镜像，见 §7）；但**源码真相仍是本仓 HEAD**，
+  而 HEAD 只有 `push` 出去才有异地备份 —— **提交后务必 `git push fork HEAD:main`**（2026-09-28 之前曾有 16 条提交只在 NAS 单盘上）。
 - ⛔ **别把 `ErrEdgeAuth`（401 + 无业务信封）退回 `ErrClient`**，也别给它加任何账号级惩罚
   （冷却/熔断/NoteFailures）——2026-09-22 全池降权事故的根因就是它落 `ErrClient` 后喂了连败计数
   （5 分钟边缘层抖动 → 33 个健康号一起降权 10 分钟 → 池子打空 → 连环 503）。
@@ -757,3 +769,114 @@ curl -X POST -H "Authorization: Bearer <key>" \
 - ⛔ **别为了本机某个客户端的现象去改 `internal/upstream/thinking.go`**（`injectThinking` / `backfillReasoningContent`）—— 那是上游面向**全部客户端**的契约：**issue #43** 的验收项就是「无 effort 裸请求也开思考」（非它则只发 `thinking` 的客户端拿不到思维链）；**issue #157** 维护者结论是「**客户端配置问题，非网关缺陷**」；**issue #91** 明确 `reasoning_content` 是**要被传递出去**的字段。
   2026-09-18 曾偏离两处（① 不注入 thinking ② 不回放历史 reasoning），**A/B/C 同参数多组对照证明收益不成立**（不注入 vs 注入都退化），**已于 `94b2aee` 全部回滚**，5 个文件与两个上游逐字节一致。
   → 若再遇到「卡循环 / 反复 `finish_reason=length` 空正文」，先走**客户端侧**（`maxInputTokens` 压缩点、`reasoning_effort` 档位、`max_tokens` 预算），别动网关。详见技能 `workbuddy-compact-threshold` §九。
+- ⛔ **别在 NAS 上跑 `docker compose build`**（会卡 `apk add`，见 §7 A）。构建在 GitHub Actions 上，
+  NAS 只 `pull`。**也别让 NAS `git pull` 源码**——它是源头，pull 会冲掉本地提交；「从 Git 部署」= 拉镜像。
+- ⛔ **别把 `docker-compose.yml` 的 `image:` 退回 `build: .`** —— 那会同时失去「构建可复现」和「源码异地备份」两件事。
+- ⛔ **别删 `.github/workflows/build-image.yml`**，也别把它的 `permissions.packages` 从 `write` 降下来
+  （降了 CI 推不进 GHCR，而 `gho_` token 没有 `write:packages` 可兜底）。
+- ⚠️ **提交后一定 `git push fork HEAD:main`**。NAS 是单盘，`fork/main` 才是异地备份。
+  2026-09-28 之前曾积累 **16 条提交只在 NAS 上**（含两个自研修复）。
+
+---
+
+## 7. 构建与部署（2026-09-28 起：GitHub 构建 + GHCR 拉取）
+
+### A. 为什么改
+
+```
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash   → exit 5
+dl-cdn.alpinelinux.org 从 NAS 不可达（APKINDEX 拉取挂死）
+```
+
+此前几次 `docker compose build` 能过，只是因为该层还在**构建缓存**里；2026-09-28 缓存失效后暴露。
+（试过换 `mirrors.tuna.tsinghua.edu.cn`、拉 `golang:1.23` Debian 版——都被 NAS 的网络策略挡住。）
+
+同时暴露第二个问题：**源码只存在于 NAS 单盘**。`fork/main` 停在 2026-09-18，
+本地 HEAD 领先 **16 条提交**（含两次自研修复 `e0e1a35` / `816e308`）——盘挂了就全没了。
+
+两件事一个方案解决：**runner 有外网，NAS 只拉产物。**
+
+### B. 拓扑
+
+```
+NAS 工作树 ──git push fork HEAD:main──▶ yjzsg/workbuddy2api-panel (GitHub)
+                                              │ 触发
+                                              ▼
+                              .github/workflows/build-image.yml
+                              （ubuntu-latest；GITHUB_TOKEN；gha 缓存）
+                                              │ push
+                                              ▼
+                          ghcr.io/yjzsg/workbuddy2api-panel:latest
+                                     + :sha-<短sha>（不可变）
+                                              │ docker compose pull
+                                              ▼
+                                          NAS 容器
+```
+
+⚠️ **NAS 是「源头」，不要让它 pull 源码。** 「从 Git 拉取部署」指的是**拉镜像**，不是 `git pull`。
+NAS 上 `git pull` 有冲掉本地提交的风险（§6 那条 `checkout .` 事故同源）。
+
+### C. 凭据
+
+| 用途 | 凭据 | 位置 |
+|---|---|---|
+| NAS → GitHub 推送 | `gho_…`（`yjzsg`，scopes `gist, repo, workflow`） | NAS `~/.git-credentials`（perm 600）+ `git config --global credential.helper store` |
+| CI → GHCR 推送 | **内置 `GITHUB_TOKEN`**（workflow 里 `permissions: packages: write`） | 不需要任何 PAT |
+| NAS → GHCR 拉取 | **无需凭据** | 包是 public（仓库 public，GHCR 继承可见性） |
+
+- 该 `gho_` token **没有** `read:packages`/`write:packages` → **改不了 GHCR 包可见性**（API 报 403）。
+  但匿名拉取实测可用，所以不需要。**别为了这个去换 token。**
+- 本地机器上同名 token 可从 Git Credential Manager 取：`printf 'protocol=https\nhost=github.com\n\n' | git credential fill`。
+
+### D. 日常操作
+
+```bash
+# 提交并部署（在 NAS 上）
+cd ~/docker/workbuddy2api-panel
+git add -A internal cmd && git commit -m "..."
+git push fork HEAD:main                    # 触发 CI
+# 等 run 变绿（约 1–2 分钟）：
+#   curl -s -H "Authorization: token $TOK" \
+#     https://api.github.com/repos/yjzsg/workbuddy2api-panel/actions/runs?per_page=1
+docker compose pull && docker compose up -d --force-recreate
+curl -s --noproxy '*' http://127.0.0.1:7863/healthz
+```
+
+`push` 会**无条件**触发构建（`paths-ignore` 只排除 `**.md`/`docs/**`）。改 `docker-compose.yml` 也会触发，
+但 compose 文件不进镜像，重建出来的镜像内容一致——无害。
+
+### E. 回滚
+
+**首选：切不可变 sha tag**（每个提交一个，永不覆盖）
+
+```bash
+cd ~/docker/workbuddy2api-panel
+sed -i 's#\(ghcr.io/yjzsg/workbuddy2api-panel:\).*#\1sha-<短sha>#' docker-compose.yml
+docker compose up -d --force-recreate
+```
+
+**次选：切本地留档镜像**（部署前一定先 tag）
+
+```bash
+docker tag wb2api-rollback-20260928b ghcr.io/yjzsg/workbuddy2api-panel:latest
+docker compose up -d --force-recreate        # ⚠️ 别加 pull，会覆盖回去
+```
+
+本地留档镜像：`wb2api-rollback-20260928b`（= `0b4c44b7fed3`，注入式构建）、
+`wb2api-rollback-20260928` / `-20260925` / `-20260923` / `-20260922` / `-20260921`。
+
+### F. 坑
+
+- ⛔ **别在 NAS 上恢复 `build: .` 后直接 build** —— 会卡 `apk add`。要用本地构建，先把
+  `Dockerfile` 的 `FROM alpine:3.20` 换成 NAS 可达的基础镜像，或把 alpine 源换掉。
+- ⚠️ **`docker compose up -d` 不加 `--force-recreate` 时**，若镜像 ID 变了 compose 会重建；
+  但若只是 tag 指向变了而 ID 相同，不会重建 —— 回滚时统一加 `--force-recreate` 省心。
+- ⚠️ **CI 构建用 `GOPROXY=https://proxy.golang.org,direct`**（workflow 里 `build-args` 覆盖 Dockerfile 默认的 `goproxy.cn`）。
+  runner 在境外，官方代理更稳。**改回 `goproxy.cn` 不会立刻出问题，但没必要。**
+- ⚠️ **镜像 digest 可用于核对**：`docker inspect -f '{{index .RepoDigests 0}}' ghcr.io/yjzsg/workbuddy2api-panel:latest`。
+  workflow 的 Summary 里也打印 digest。
+- ✅ **验证新镜像内容**（中文 pattern 用 `grep -a`，`strings` 会滤掉非 ASCII 导致假阴性）：
+  ```bash
+  docker run --rm --entrypoint /bin/sh ghcr.io/yjzsg/workbuddy2api-panel:latest \
+    -c 'for p in "safety review" "内容未通过" "edge_auth_rejected"; do printf "%-22s %s\n" "$p" "$(grep -ac "$p" /app/wb2api)"; done'
+  ```
