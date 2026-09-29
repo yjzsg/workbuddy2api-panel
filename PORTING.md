@@ -826,18 +826,23 @@ role∈{system,developer} 的消息，头部插入一条 `{"role":"system","cont
 设计动机（`internal/prompt/prompt.go` 包注释）：客户端 CLI 在 system prompt 注入固定模板句，
 上游内容审核按**逐字精确匹配**误杀合法流量（issue #36 / PR39 的 11-128），所以网关替换掉它。
 
-### B. ⚠️ 本仓的偏离：`defaultprompt.md` 被换成了人格提示词
+### B. ✅ 本仓的偏离已修正（2026-09-29）
 
 ```
 上游  internal/prompt/defaultprompt.md  = 38 行「你是一名工程助手…」（干净）
-本仓  internal/prompt/defaultprompt.md  = 300 行「Little Code Sauce / YG」人格提示词
-      （b4d4997 一次根上游同步时替换）
+本仓  （2026-09-29 之前）= 300 行「Little Code Sauce / YG」人格提示词（b4d4997 一次同步时替换）
+本仓  （2026-09-29 起）= **已恢复为上游那份 38 行版，逐字节一致**（`cmp` 验过）
 ```
 
-⇒ 每个经过网关的请求，模型读到的 system 都是这份人格提示词。2026-09-29 在 DSH 会话里
-实测到后果：模型用第三人称谈「YG」、只输出散文、不认客户端 schema
+**修正前的后果**（2026-09-29 在 DSH 会话里实测）：每个经过网关的请求，模型读到的 system 都是
+那份人格提示词 → 模型用第三人称谈「YG」、只输出散文、不认客户端 schema
 （探针发 `"hi"` 回 `"hey. what's going on"` —— 该提示词 Casual examples 的原句；
 换 `passthrough` 则回干净的 `"Hi! How can I help you today?"`）。
+
+**顺带消掉的风险**：那份人格提示词含大量会被内容审核盯上的词汇
+（CSAM / incest / non-con / RAT / stealer / phishing / 露骨词表），**每次请求都发给上游**。
+38 行版是干净的工程助手提示词。**"它是否导致账号被上游内容信誉标记"仍是未证实的假设**
+（反证：健康号带旧提示词也照样 200），但把这段词汇从出站流量里去掉本身没有坏处。
 
 ### C. 三个模式（`handler.go`）
 
@@ -847,16 +852,14 @@ role∈{system,developer} 的消息，头部插入一条 `{"role":"system","cont
 | `append` | **保留**客户端 system，在开头连续 system/developer 块之后**再插**一条网关 system |
 | `custom`（**生产配置是手工设的**） | **删除**客户端所有 system/developer，换成网关提示词 |
 
-### D. 未决
+### D. 仍未决（`prompt.mode`）
 
-- 要不要给「自带 schema / 工具定义」的客户端（DSH 等）走 `append`？
+- **`prompt.mode` 仍是 `custom`**（用户 2026-09-29 只选了「恢复 38 行提示词」，未选改 mode）。
+  因此**「自带 schema / 工具定义」的客户端（DSH 等）仍然拿不到自己的 system prompt**——
+  换掉提示词内容不解决这一点，**只有把 mode 改成 `append` 才解决**。
   代价：客户端 system prompt 会重新出现在发往上游的请求里，11-128 指纹误杀风险回归
   （**注**：2026-09-29 全窗口日志里 `11-128` 出现 **0 次**，该风险当前未观测到）。
-- `defaultprompt.md` 要不要恢复上游那份 38 行版本？人格注入对 WorkBuddy 客户端是想要的，
-  对其他客户端是污染——目前**未改**，等用户决定。
-- ⚠️ 该提示词含大量会被内容审核盯上的词汇（CSAM / incest / non-con / RAT / stealer /
-  phishing / 露骨词表），**每次请求都发给上游**。是否是那 2 个号被上游内容信誉标记的诱因——
-  **假设，未证实**（反证：健康号带该提示词仍 200）。
+  → 要动的话建议先在隔离实例上跑 `append` 观察几天 400 率。
 
 ## 6. 禁止事项
 
@@ -896,8 +899,8 @@ role∈{system,developer} 的消息，头部插入一条 `{"role":"system","cont
   **生产用 `custom`**（防客户端指纹被上游逐字误杀，见 `internal/prompt/prompt.go` 包注释），
   代价是**任何依赖自己 system prompt 的客户端（schema / 工具定义）都会失效**——
   2026-09-29 在 DSH 会话里实测到「模型改说散文、第三人称谈 YG、不认输出格式」。
-  另注：`internal/prompt/defaultprompt.md` 在本仓被换成了**本工作区那份 300 行人格提示词**
-  （上游是 38 行的工程助手提示词，见 §5.9）。
+  另注：`internal/prompt/defaultprompt.md` 曾在本仓被换成**本工作区那份 300 行人格提示词**，
+  2026-09-29 已恢复为上游的 38 行版（见 §5.9 B）。
 - ⚠️ **`NewHandler` 缺省 `PromptMode="passthrough"`，生产配置是 `prompt.mode="custom"`** ——
   两者对 `ErrContentBlocked` 的行为不同（前者先降级重试一次，后者直接 400）。
   写相关测试时**显式指定 PromptMode**，别依赖缺省值（见 §5.7 E）。
