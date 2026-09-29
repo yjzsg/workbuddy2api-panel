@@ -7,10 +7,21 @@ name: build-image
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'PORTING.md'
-      - 'docs/**'
+    # ⛔ 这里刻意**没有** paths-ignore。
+    #
+    # 2026-09-29 踩过：曾写 `paths-ignore: ['**.md', ...]`，结果改了
+    # `internal/prompt/defaultprompt.md`（**是 go:embed 的构建输入**）时构建被静默跳过。
+    # 失败模式很危险：CI 没跑 → `docker compose pull` 拿到的是**旧镜像** →
+    # 以为部署了新代码，其实跑的还是旧的（镜像 tag 是 `latest`，无从察觉）。
+    #
+    # 本仓的构建输入不止 `.go`——`go:embed` 还吃这些非源码文件：
+    #   internal/panel/index.html、internal/panel/app.js、
+    #   internal/prompt/defaultprompt.md、internal/upstream/model.json
+    # 所以按扩展名做忽略天然不可靠。文档提交多跑一次构建约 1 分钟，换「绝不静默漏构建」值得。
+    #
+    # 部署侧自查（避免再被静默跳过）：
+    #   docker inspect -f '{{index .RepoDigests 0}}' ghcr.io/<owner>/<repo>:latest
+    #   并确认 ghcr.io/<owner>/<repo>:sha-<短sha> 这个 tag 存在。
   workflow_dispatch:
 
 # 同一分支只保留最新一次构建，旧的在跑就取消

@@ -1020,6 +1020,22 @@ docker compose up -d --force-recreate        # ⚠️ 别加 pull，会覆盖回
 
 ### F. 坑
 
+- ⛔⛔ **别给 workflow 加 `paths-ignore` 按扩展名忽略**（2026-09-29 踩过）。
+  曾写 `paths-ignore: ['**.md', 'docs/**']`，结果改 `internal/prompt/defaultprompt.md`
+  （**`go:embed` 的构建输入**）时**构建被静默跳过** —— CI 没跑 → `docker compose pull`
+  拿到的是**旧镜像** → **以为部署了新代码，其实跑的还是旧的**（tag 是 `latest`，无从察觉）。
+  **本仓构建输入不止 `.go`**，`go:embed` 还吃：
+  `internal/panel/index.html`、`internal/panel/app.js`、`internal/prompt/defaultprompt.md`、
+  `internal/upstream/model.json`。按扩展名忽略天然不可靠 → **已移除 `paths-ignore`**，
+  文档提交多跑一次构建（约 1 分钟）换「绝不静默漏构建」。
+- ⛔ **部署前先确认 CI 真的跑了**（防上面那种静默跳过）：
+  ```bash
+  # 最新 run 的 head_sha 必须 == 本仓 HEAD，且 conclusion=success
+  curl -s -H "Authorization: token $TOK" \
+    "https://api.github.com/repos/yjzsg/workbuddy2api-panel/actions/runs?per_page=1"
+  # 并确认不可变 tag 存在（每个提交一个）：
+  docker pull ghcr.io/yjzsg/workbuddy2api-panel:sha-$(git rev-parse --short HEAD)
+  ```
 - ⛔ **别在 NAS 上恢复 `build: .` 后直接 build** —— 会卡 `apk add`。要用本地构建，先把
   `Dockerfile` 的 `FROM alpine:3.20` 换成 NAS 可达的基础镜像，或把 alpine 源换掉。
 - ⚠️ **`docker compose up -d` 不加 `--force-recreate` 时**，若镜像 ID 变了 compose 会重建；
