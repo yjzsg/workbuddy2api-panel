@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"strings"
 	"log"
 	"sort"
 	"time"
@@ -169,15 +170,21 @@ func (p *Pool) ManualDisabledState(uid string) (disabled bool, reason string, ok
 // 限流类软冷却（CoolSoft：429/6004 配额窗口）**不解**：余额充足不代表配额恢复，而本函数
 // 被余额后台刷新每 5 分钟调用一次，解它会造成「冷却→刷新解冻→再撞」死循环。
 // remain==0 或禁用时只更新 credits（不动冷却/禁用）。
-func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
+			p.reviveCoolingLocked(e, remain, total)
 		} else {
 			e.credits = remain
+			e.creditsTotal = total
 		}
+		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
+		// 重新写入，不能沿用旧窗口/旧批次的缓存。
+		e.creditsExpiring = 0
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
 		p.dirty.Store(true)
 	}
 }
@@ -258,9 +265,20 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		e.credits -= d
 		if e.creditsExpiring > 0 {
 			if d > e.creditsExpiring {
-				d = e.creditsExpiring
+				e.creditsExpiring = 0
+			} else {
+				e.creditsExpiring -= d
 			}
-			e.creditsExpiring -= d
+		}
+		// 最早到期批次同步扣减（上游 dbd7c68..origin/main）：扣穿即清空该批次，
+		// 避免「批次剩余量」长期不动导致 prefer_expiring 路由基于陈旧数据。
+		if e.creditsEarliestRemaining > 0 {
+			if d >= e.creditsEarliestRemaining {
+				e.creditsEarliestRemaining = 0
+				e.creditsEarliestExpiry = time.Time{}
+			} else {
+				e.creditsEarliestRemaining -= d
+			}
 		}
 	}
 	if e.modelCost == nil {
@@ -393,6 +411,14 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 实测收费即拦。
+	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
+	// 后下次会话重新绑定。上游 dbd7c68..origin/main 新增（pool.credit_floor）。
+	if p.floorBlockedForModel(e, model, now) {
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -531,6 +557,13 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
+		CreditsTotal:      e.creditsTotal,
+		// 到期压力快照（上游 dbd7c68..origin/main）：供面板展示与 prefer_expiring 观测。
+		CreditsExpiring:          e.creditsExpiring,
+		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
+		CreditsEarliestRemaining: e.creditsEarliestRemaining,
+		// CheckinDone：本地今日已签到（签到成功或上游幂等拒绝均算），面板按钮据此显示。
+		CheckinDone: e.lastCheckinDay == time.Now().Format("2006-01-02"),
 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
 		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
@@ -605,8 +638,15 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			// Kind 区分限流与模型不可用：6004 是 rate_limit，11102 是 model_unavailable。
+			// [上游 dbd7c68..origin/main]
+			kind := "rate_limit"
+			if strings.HasPrefix(mc.Reason, "11102") {
+				kind = "model_unavailable"
+			}
 			row := RateLimitedModel{
 				Model:  m,
+				Kind:   kind,
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}

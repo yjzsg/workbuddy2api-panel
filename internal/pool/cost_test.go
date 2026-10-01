@@ -19,8 +19,8 @@ func TestNoteModelCostAndPreferFree(t *testing.T) {
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "paid"})
 	// paid 积分远高于 free：若只看积分，paid 必胜；成本分层必须压过积分。
-	p.SetCredits("free", 1)
-	p.SetCredits("paid", 1_000_000)
+	p.SetCredits("free", 1, 0)
+	p.SetCredits("paid", 1_000_000, 0)
 
 	p.NoteModelCost("free", "hy4-preview", 0, 1000)   // 免费
 	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000) // 收费
@@ -65,8 +65,8 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "unknown"})
 	p.Add(&auth.Auth{UID: "paid"})
-	p.SetCredits("unknown", 1)
-	p.SetCredits("paid", 1_000_000)
+	p.SetCredits("unknown", 1, 0)
+	p.SetCredits("paid", 1_000_000, 0)
 	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000)
 
 	for i := 0; i < 50; i++ {
@@ -87,8 +87,8 @@ func TestModelCostFreeBeatsUnknown(t *testing.T) {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "knownfree"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.SetCredits("knownfree", 1)
-	p.SetCredits("unknown", 1_000_000)
+	p.SetCredits("knownfree", 1, 0)
+	p.SetCredits("unknown", 1_000_000, 0)
 	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
 
 	for i := 0; i < 50; i++ {

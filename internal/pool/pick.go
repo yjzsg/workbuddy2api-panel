@@ -50,6 +50,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if reqModel != "" {
 		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
 	}
+	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForModel，与粘性路径共用）：
+	// 触底 + 实测收费（tier 2 有效观测）即拦；tier 0/1 不受限。
+	// 上游 dbd7c68..origin/main 新增（pool.credit_floor）。
+	floorBlocked := func(e *entry) bool { return p.floorBlockedForModel(e, reqModel, now) }
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -57,6 +61,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		if !healthyOf(e) {
 			continue
+		}
+		if floorBlocked(e) {
+			continue // 积分保底：触底号不接实测收费模型（tier 0/1 不受限）
 		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
@@ -141,7 +148,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
 		}
 	}
 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
@@ -225,6 +232,27 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return e.a
 }
 
+// floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
+// 路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型在此账号上
+// **实测收费**（tier 2 有效观测）时为真。
+//
+//   - tier 0（免费）不拦：保底的目的恰是「留余额给免费模型用」，免费请求
+//     credit=0 不再扣减余额（NoteModelCost）。
+//   - tier 1（无观测/观测过期）不拦：第一笔成功即入账毕业；若拦了，账本过期
+//     （modelCostTTL 6h）或重启清零后触底号会被永久锁死在「学不回来」的死锁里。
+//   - model 为空（无模型上下文）不拦：无成本维度，floor 无从判收费。
+//
+// 余额用本地插值口径（签到权威值 - 每笔 usage.credit 实扣，见 NoteModelCost）：
+// 只会偏低不会偏高（官方对账延迟方向安全），正是保底需要的安全方向。
+// 调用方必须已持有 p.mu（读 e.credits / e.modelCost）。
+func (p *Pool) floorBlockedForModel(e *entry, model string, now time.Time) bool {
+	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
+		return false
+	}
+	mc, ok := e.modelCostOf(model, now)
+	return ok && mc.CostPer1k > 0
+}
+
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
@@ -295,18 +323,32 @@ type weighted struct {
 	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
 }
 
-// expiringWeight 快过期积分占比的权重系数（三因子之一，issue:积分过期）。
-// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
-// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
-const expiringWeight = 8.0
+// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
+// 上游 dbd7c68..origin/main 新增（配合 prefer_expiring 的虚拟实例权重）。
+func expiringNow(e *entry, now time.Time) bool {
+	return e.creditsExpiring > 0 &&
+		e.creditsEarliestRemaining > 0 &&
+		!e.creditsEarliestExpiry.IsZero() &&
+		e.creditsEarliestExpiry.After(now)
+}
 
-// pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
+// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
+// 或账号无有效快过期批次时，实例数恒为 1，结果与 weightOf 完全一致。
+// 上游 dbd7c68..origin/main 新增（替代本仓原「第四因子 ×expiringWeight」口径）。
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	w := p.weightOf(e, maxCredits, now)
+	if p.preferExpiring && expiringNow(e, now) {
+		return w * expiringVirtualSlots
+	}
+	return w
+}
+
+// pickWeighted 加权随机（claude-api selectWeightedRandom 参考口径）：
 //
-//		weight = credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight
+//		weight = credits 比例 × 10 + idleWeight（快过期偏好见 routingWeightOf）
 //
 //	  - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
 //	    tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
-//	  - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
 //	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
 //
 // credits 全 0 时仍按 idle+expiring 加权（不退化均匀随机）。
@@ -364,13 +406,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	if maxCredits > 0 {
 		w += float64(e.credits) / float64(maxCredits) * 10
 	}
-	// 1b. 快过期积分加成（issue:积分过期）：官方活动赠送的奖励积分按批过期，
-	// 不用就作废。creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期
-	// 占比"作为一个独立的强权重项（×expiringWeight），让快过期积分多的号优先选。
-	// 与成本分层（costTier 优先免费）正交：那是按"实测扣费"分层，这是按"过期紧迫度"。
-	if e.credits > 0 && e.creditsExpiring > 0 {
-		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
-	}
+	// （原 1b「快过期积分占比 ×expiringWeight」已由上游 dbd7c68..origin/main 移除，
+	// 改为 routingWeightOf 的「快过期虚拟实例数」模型：权重 ×expiringVirtualSlots，
+	// 由 pool.prefer_expiring 开关控制。两套口径不可叠加，故此处不再计入。）
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
 		w += p.idleWeightMax // 从未使用 → 满分

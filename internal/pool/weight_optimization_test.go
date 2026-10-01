@@ -23,7 +23,7 @@ import (
 func TestNoteModelCostDeductsCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCredits("u1", 100)
+	p.SetCredits("u1", 100, 0)
 	p.NoteModelCost("u1", "m", 2.5, 1000) // 本次消耗 2.5
 	st, _ := p.Status("u1")
 	if st.Credits != 97 {
@@ -35,7 +35,7 @@ func TestNoteModelCostDeductsCredits(t *testing.T) {
 func TestNoteModelCostZeroCreditKeepsCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCredits("u1", 100)
+	p.SetCredits("u1", 100, 0)
 	p.NoteModelCost("u1", "m", 0, 1000)
 	st, _ := p.Status("u1")
 	if st.Credits != 100 {
@@ -47,7 +47,7 @@ func TestNoteModelCostZeroCreditKeepsCredits(t *testing.T) {
 func TestNoteModelCostDeductClampsAtZero(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCredits("u1", 5)
+	p.SetCredits("u1", 5, 0)
 	p.NoteModelCost("u1", "m", 100, 1000) // 消耗远超余额
 	st, _ := p.Status("u1")
 	if st.Credits != 0 {
@@ -59,7 +59,7 @@ func TestNoteModelCostDeductClampsAtZero(t *testing.T) {
 func TestNoteModelCostDeductsExpiring(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 100, 50) // 50 快过期
+	p.SetCreditsDetailed("u1", 100, 100, 50, time.Time{}, 0) // 50 快过期
 	p.NoteModelCost("u1", "m", 20, 1000)
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -77,7 +77,7 @@ func TestNoteModelCostDeductsExpiring(t *testing.T) {
 func TestNoteModelCostExpiringClampsAtZero(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 100, 5)
+	p.SetCreditsDetailed("u1", 100, 100, 5, time.Time{}, 0)
 	p.NoteModelCost("u1", "m", 50, 1000) // 消耗 50 > expiring 5
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -97,7 +97,7 @@ func TestNoteModelCostDeductPersists(t *testing.T) {
 	fp := stateFilePath(t, dir)
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCredits("u1", 100)
+	p.SetCredits("u1", 100, 0)
 	p.NoteModelCost("u1", "m", 10, 1000)
 	p.Flush()
 	p2 := New(fp)
@@ -121,8 +121,8 @@ func TestWeightOfCalledOncePerPick(t *testing.T) {
 	p.weightOfHook = func() { calls++ }
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 100)
-	p.SetCredits("u2", 50)
+	p.SetCredits("u1", 100, 0)
+	p.SetCredits("u2", 50, 0)
 	a := p.Pick("")
 	if a == nil {
 		t.Fatal("pick returned nil")
@@ -142,8 +142,8 @@ func TestPickWeightedUsesFullSetMaxCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 1000)
-	p.SetCredits("u2", 500)
+	p.SetCredits("u1", 1000, 0)
+	p.SetCredits("u2", 500, 0)
 	now := time.Now()
 	// u1 刚被用过（minPickGap=100ms 默认）→ 挤出 eligible，只剩 u2。
 	// 但注意 u1 不在 top5 内也无所谓：候选集会包含两个，eligible 只剩 u2。
@@ -178,9 +178,9 @@ func TestWeightOfMaxCreditsPassedVerbatim(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.Add(&auth.Auth{UID: "u3"})
-	p.SetCredits("u1", 1000)
-	p.SetCredits("u2", 500)
-	p.SetCredits("u3", 400)
+	p.SetCredits("u1", 1000, 0)
+	p.SetCredits("u2", 500, 0)
+	p.SetCredits("u3", 400, 0)
 	if got := p.Pick(""); got == nil {
 		t.Fatal("pick returned nil")
 	}
@@ -224,8 +224,8 @@ func TestWeightOfThreeFactorsNoSuccess(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "good"})
 	p.Add(&auth.Auth{UID: "bad"})
-	p.SetCredits("good", 100)
-	p.SetCredits("bad", 100)
+	p.SetCredits("good", 100, 0)
+	p.SetCredits("bad", 100, 0)
 	for i := 0; i < 20; i++ {
 		p.NoteSuccess("good")
 		p.NoteError("bad")
@@ -329,7 +329,7 @@ func TestShuffleEpsilonEqualWeights(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		uid := string(rune('a' + i))
 		p.Add(&auth.Auth{UID: uid})
-		p.SetCredits(uid, 100) // 完全同构 → 等权重
+		p.SetCredits(uid, 100, 0) // 完全同构 → 等权重
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 200; i++ {

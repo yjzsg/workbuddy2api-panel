@@ -116,8 +116,8 @@ func TestChatRecordsModelCost(t *testing.T) {
 		&auth.Auth{UID: "u2", AccessToken: "at-u2", ExpiresAt: 9999999999},
 	)
 	// 让 u1 积分远高于 u2：若成本分层不生效，u1 会持续被选中。
-	p.SetCredits("u1", 1_000_000)
-	p.SetCredits("u2", 1)
+	p.SetCredits("u1", 1_000_000, 0)
+	p.SetCredits("u2", 1, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 
 	// 先各打一次，让两个号的 hy3 成本被实测记录（u1=收费，u2=免费）。
@@ -181,8 +181,8 @@ func TestRotationPreservesFullContext(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 5000) // 让 bad 先被选中
-	p.SetCredits("good", 10)
+	p.SetCredits("bad", 5000, 0) // 让 bad 先被选中
+	p.SetCredits("good", 10, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 
 	body := `{"model":"hy4-preview","messages":[` +

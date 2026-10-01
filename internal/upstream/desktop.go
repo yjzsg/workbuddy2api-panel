@@ -523,6 +523,8 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string, requireID boo
 			// 原实现只看第一个出现位置：若它不是 requestId 形态（流首帧可能是心跳
 			// 或其他对象），就永远匹配不上，直到 buffer > 1MB 才报「未找到」——
 			// 实测 29 号里 1 号 cn 账号（hy3）即因此失败，同号单独复测为 200。
+			// （上游同一缺陷的另一实现：推进 searchFrom 偏移；两者等价，本仓取
+			// 全量扫描版——本仓已实测，且不依赖跨轮偏移状态。）
 			off := 0
 			for {
 				i := bytes.Index(buf[off:], []byte(`"id":"`))

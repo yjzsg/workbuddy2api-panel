@@ -292,7 +292,6 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 		BillingBaseCN:      "https://billing.example",
 		ChatBaseGlobal:     base,
 		GlobalEnabled:      true,
-		SanitizeFingerprints: true,
 	}
 	cn := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
 

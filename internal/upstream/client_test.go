@@ -1097,3 +1097,31 @@ func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
 // client.go 只把 reasoning.defaultEffort 映射到 DefaultEffort；reasoning.effort 走
 // ReasoningEffort（**单档**语义），上游自带 TestParseGlobalModelNamesSingleEffort
 // 明确断言「reasoning.effort 单档字符串 → 视作单档表，defaults 为空」。
+
+// TestModelRateCacheEffectiveAndNormalized 上游 2026-09-26 新增（dbd7c68..origin/main）。
+// 锁定模型倍率快照的两个语义：① 生效价优先（PromoFactor+PromoCredits 存在时取折扣价）；
+// ② 目录刷新是整体替换，旧条目不得残留（否则下架/取消优惠的模型继续冒充旧价）。
+func TestModelRateCacheEffectiveAndNormalized(t *testing.T) {
+	c := New()
+	factor := 0.5
+	c.storeModelRates("cn", []ModelInfo{
+		{ID: "base", Credits: "x0.50 credits"},
+		{ID: "promo", Credits: "x0.80", PromoFactor: &factor, PromoCredits: "0.50x"},
+	})
+	if got := c.ModelRate("cn", "base"); got != "0.5" {
+		t.Fatalf("base rate=%q want 0.5", got)
+	}
+	if got := c.ModelRate("cn", "promo"); got != "0.5" {
+		t.Fatalf("promo rate=%q want 0.5", got)
+	}
+	if got := normalizeModelRate("x0.05 credits"); got != "0.05" {
+		t.Fatalf("normalizeModelRate=%q want 0.05", got)
+	}
+	c.storeModelRates("cn", []ModelInfo{{ID: "base", Credits: "x0.79"}})
+	if got := c.ModelRate("cn", "base"); got != "0.79" {
+		t.Fatalf("refreshed base rate=%q want 0.79", got)
+	}
+	if got := c.ModelRate("cn", "promo"); got != "" {
+		t.Fatalf("stale promo rate=%q want empty after full refresh", got)
+	}
+}

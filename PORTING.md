@@ -861,6 +861,86 @@ role∈{system,developer} 的消息，头部插入一条 `{"role":"system","cont
   （**注**：2026-09-29 全窗口日志里 `11-128` 出现 **0 次**，该风险当前未观测到）。
   → 要动的话建议先在隔离实例上跑 `append` 观察几天 400 率。
 
+## 5.10 2026-10-01 同步：面板上游 `dbd7c68..8584e45`（53 提交）
+
+### A. ⛔ 基线修正（重要）
+上一轮（2026-09-28）把基线记成 `1e23c2b`（27 提交）——**错**。26 提交批次
+（`dbd7c68..1e23c2b`）**从未合入**（树里没有 `prefer_expiring`、`normalizeUsageCacheAliases`，
+`internal/scheduler/school.go` 还在，版本号仍 `1.11.6-panel`）。
+**正确基线 = `dbd7c68`**，本次实际范围 `dbd7c68..8584e45` = **53 提交 / 62 文件**。
+
+**基线验证姿势（每次同步前必做）**：
+```bash
+git rev-list --count <base>..origin/main          # 数量对不对
+git grep -l prefer_expiring HEAD -- '*.go'        # 抽查上一批的标志物是否真在树里
+grep -rn 'appVersion' cmd/server/main.go          # 版本号是否跟上了
+```
+别沿用上一轮的记录——上一轮可能就是错的。
+
+### B. ⛔ 分叉判据必须带签名
+上一轮用**只取符号名**的正则做互包含性检查 → `Pick(model)` 与 `Pick()`、
+`SetCredits(uid,credits)` 与 `SetCredits(uid,credits,total)` 被当成同名符号，
+**签名差异被掩盖**，误判 `internal/pool` 为「无分叉」。实际是**结构性分叉**：
+
+| 本仓（根上游系） | 面板上游 |
+|---|---|
+| `Pick(model string)` | `Pick()` / `PickExcluding(tried)` / `PickExcludingForModel` / `PickByUID` |
+| `SetCredits(uid, credits)` | `SetCredits(uid, credits, total)` |
+| `SetCreditsDetailed(uid, credits, expiring)` | `…(uid, credits, total, expiring, earliestAt, earliestRemaining)` |
+| `ReenableIfCredits(uid, remain)` | `ReenableIfCredits(uid, remain, total)` |
+| `ReviveDisabled(uid) bool` | `ReviveDisabled(uid)` |
+| `UserResource(a) (remain, err)` | `UserResource(a) (remain, total, err)` |
+| `UserResourceDetailed(a, soon) (remain, CreditBuckets, err)` | `…(remain, total, expiring, err)` |
+
+⇒ 判据：`grep "^func (p \*Pool) [A-Z]"` **取整行**（带签名）做 `comm`。
+
+### C. 本次合并方式（三档）
+1. **无冲突 / 上游新增** → 直接取上游（`internal/reqlog`、`logfmt/shortua`、CI workflow、
+   各 `*_test.go` 新增用例）。
+2. **两侧都在同一处加东西** → 取并集（`internal/usage/usage.go` 的
+   credit 分区 ∪ prompt-cache 三段；`chatStat`/`chatStatsReader` 字段；
+   `Status` 的 `CreditsTotal` ∪ `ManualDisabled`）。
+3. **结构性分叉** → **以本仓为基底，手工移植上游特性**（`internal/pool/*`、`internal/upstream/client.go`、
+   `internal/server/{handler,logging}.go`、`internal/scheduler/scheduler.go`、`cmd/server/*`、`internal/panel/*`）。
+   ⛔ 不要对这些文件用 `git merge-file` 的自动结果直接落盘。
+
+### D. 本次吸收的上游特性（全部已落地并测过）
+| 特性 | 落点 |
+|---|---|
+| `pool.credit_floor` 积分保底（触底号不接实测收费模型） | `pool/{pick,state,cooldown,pool}.go` + `cmd/server/config.go` |
+| `pool.prefer_expiring` 最早到期优先（**虚拟实例 ×3**，替代本仓原「第四因子 ×8」） | `pool/pick.go` `routingWeightOf` / `expiringNow` |
+| `NoteCheckinDone` + `Status.CheckinDone`（面板「签到/已签」） | `pool/{cooldown,entry,state}.go` + `scheduler.CheckinAll` |
+| `RecordModelRateLimitAudit` + `modelCooldown.AuditOnly` + `RateLimitedModel.Kind` | `pool/{cooldown,entry,state}.go` + `handler` |
+| `creditsTotal` / `creditsEarliestExpiry` / `creditsEarliestRemaining` / `lastCheckinDay` | `pool/{entry,persist}.go` |
+| `UserResourceDetailedWithExpiry` + `CycleEndTime` + `CreditPackage.ExpiresAt` | `internal/upstream/client.go` |
+| 计费类调用瞬时错误有界重试（签到 / 余额查询） | `upstream/{report,client}.go` |
+| `parseRetryNumber` 溢出保护、`SanitizeFingerprints` → `atomic.Bool` | `internal/upstream/client.go` |
+| 模型倍率快照（`storeModelRates`/`ModelRate`/`normalizeModelRate`） | `internal/upstream/client.go` |
+| `internal/reqlog` 请求指标 + JSONL 归档 + 客户端 IP/UA（`logging.request_client_info`） | 新包 + `server/logging.go` + `panel` 两个端点 |
+| usage 积分维度（credit/rate 分区 + `fileVersion=3`） | `internal/usage/usage.go` |
+| scheduler 墙钟分段睡眠（`waitSlot`）+ `growth` 排程 | `internal/scheduler/scheduler.go` |
+| **开学季（school）整体下线** | 删 `scheduler/{school,school_api,school_test}.go`；`taskSchool`→`taskGrowth`；panel/config 同步 |
+
+### E. 本仓自研（上游仍未吸收，同步时务必保留）
+`ErrEdgeAuth`/`IsEdgeAuth`（401）、`contentSafetyRule`（内容审核）、`edgeGate`（IP 级熔断）、
+`NoteContentBlockEvidence`/`ClearContentBlock`、`SetManualDisabled`/`ManualDisabledState`、
+`ModelCost`/`NoteModelCost` 成本账本、`Pick(model)`/`PickByUIDForModel` 选号 API、
+面板 CN 邀请 / 每日对话保底 / 缓存命中率列。
+
+### F. 验证
+```
+gofmt -l（全树 56 = 与合并前一致，无新增脏文件）
+go build ./...   通过
+go vet   ./...   通过
+go test -count=1 -timeout 900s ./...   22 包全绿
+符号级遗漏审计：12 项自研 + 14 项上游特性逐条 grep 确认 ✅
+school 残留：仅 2 处注释 ✅
+```
+
+### G. 一个后续隐患
+`internal/pool` 与 `internal/upstream/client.go` 的分叉**只增不减**：本仓带根上游特性、
+面板带自己的演进。每次同步都要手工移植。若要根治，需要决定「以哪条线为主干」并做一次换基。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）

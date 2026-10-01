@@ -133,7 +133,7 @@ func TestManualDisabledIndependentFromAutoDisable(t *testing.T) {
 	}
 
 	// 签到解冻路径同样不解除手动停用
-	p.ReenableIfCredits("u1", 100)
+	p.ReenableIfCredits("u1", 100, 0)
 	st, _ = p.Status("u1")
 	if !st.ManualDisabled {
 		t.Fatal("签到解冻不应解除手动停用")

@@ -40,7 +40,6 @@ func TestNextWakeIncludesDailyChat(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 20, 7, 30, 0, 0, time.Local))
@@ -57,9 +56,8 @@ func TestNextWakeIncludesDailyChat(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
-		DailyChatDisabled: true,
+		DailyChatDisabled: true, GrowthDisabled: true,
 	})
 	if at, kinds := s2.nextWake(time.Now()); !at.IsZero() || len(kinds) != 0 {
 		t.Errorf("at=%v kinds=%v want zero/nil（含每日对话全部禁用）", at, kinds)
@@ -73,7 +71,6 @@ func TestReconfigureDailyChat(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
 	})
 	// 时点改 3 点，其余任务保持禁用、每日对话保持启用。

@@ -188,7 +188,7 @@ func TestGlobalE2ER9CreditIsomorphic(t *testing.T) {
 
 	p := pool.New(t.TempDir() + "/state.json")
 	p.Add(a)
-	p.SetCredits(a.UID, 1000)
+	p.SetCredits(a.UID, 1000, 0)
 	h := NewHandler(Config{
 		Pool:          p,
 		Upstream:      cl,
@@ -342,7 +342,7 @@ func TestGlobalE2EDefaultAndGpt54(t *testing.T) {
 func testE2EPool(cl *upstream.Client, a *auth.Auth) *pool.Pool {
 	p := pool.New("")
 	p.Add(a)
-	p.SetCredits(a.UID, 1000)
+	p.SetCredits(a.UID, 1000, 0)
 	return p
 }
 

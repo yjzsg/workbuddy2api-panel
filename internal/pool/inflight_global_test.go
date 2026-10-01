@@ -91,8 +91,8 @@ func TestPickSkipsGlobalTierFull(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "gfull", Domain: "www.workbuddy.ai", AccessToken: "at"})
 	p.Add(&auth.Auth{UID: "gfree", Domain: "www.workbuddy.ai", AccessToken: "at"})
-	p.SetCredits("gfull", 1000)
-	p.SetCredits("gfree", 1)
+	p.SetCredits("gfull", 1000, 0)
+	p.SetCredits("gfree", 1, 0)
 	p.SetMaxInFlight(3)
 	p.SetMaxInFlightGlobal(2)
 

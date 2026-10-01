@@ -92,7 +92,7 @@ func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	p := pool.New("")
 	p.SetDegrade(2, time.Hour, 2*time.Hour) // 阈 2：两轮请求即降权
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetCredits("u1", 1000)
+	p.SetCredits("u1", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	for round := 0; round < 2; round++ {
@@ -129,8 +129,8 @@ func TestChatErrClientDegradedNotPicked(t *testing.T) {
 	p.SetDegrade(2, time.Hour, 2*time.Hour) // 阈 2
 	p.Add(&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999})
 	p.Add(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 第一轮：bad 号 ErrClient 一次（换 good 成功）。bad 连败=1。
@@ -179,8 +179,8 @@ func TestChatConsecutiveFailClearedBySuccess(t *testing.T) {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "flaky", AccessToken: "at-flaky", ExpiresAt: 9999999999})
 	p.Add(&auth.Auth{UID: "other", AccessToken: "at-other", ExpiresAt: 9999999999})
-	p.SetCredits("flaky", 2000)
-	p.SetCredits("other", 1000)
+	p.SetCredits("flaky", 2000, 0)
+	p.SetCredits("other", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 一轮真实请求：flaky 失败一次（选号顺序不定，无论先选谁，flaky 失败后换
@@ -209,7 +209,7 @@ func TestChatConsecutiveFailClearedBySuccess(t *testing.T) {
 	p2 := pool.New("")
 	p2.SetDegrade(2, time.Hour, 2*time.Hour)
 	p2.Add(&auth.Auth{UID: "solo", AccessToken: "at-solo", ExpiresAt: 9999999999})
-	p2.SetCredits("solo", 1000)
+	p2.SetCredits("solo", 1000, 0)
 	h2 := NewHandler(Config{Pool: p2, Upstream: up})
 	// 直喂两次 ErrClient 达阈降权（fake upstream 对 at-solo 恒 200）。
 	for n := 0; n < 2; n++ {

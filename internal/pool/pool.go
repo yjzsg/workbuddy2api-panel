@@ -42,9 +42,19 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
-	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
+	// creditFloor 积分保底（SetCreditFloor 注入；0 = 关闭，缺省即现状）。
+	// 账号 credits < floor 时对**实测收费**模型（tier 2，账本有效观测）不再参与
+	// 选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。tier 0/1
+	// 不受限（保底保的是「还有余额可用」，不是「什么都别调」）；签到回血
+	// （SetCreditsDetailed）越过 floor 即自动恢复。全池触底 + 全 tier 2 时选号
+	// 返回 nil（硬语义：宁 503 不打穿，放行=回到「烧到 0」现状）。
+	creditFloor int64
+	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
+	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
+	preferExpiring bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -82,6 +92,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		preferExpiring:     true,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -150,6 +161,13 @@ func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
 	return p.costExploreEvents, last
 }
 
+// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
+func (p *Pool) SetPreferExpiring(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.preferExpiring = enabled
+}
+
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
 // 非正值保留原值（用默认，见 defaultDegrade*），风格同 SetBreaker/SetSoftRateMax。
 func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
@@ -175,6 +193,24 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
+	}
+}
+
+// CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
+func (p *Pool) CreditFloor() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.creditFloor
+}
+
+// SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
+// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值（0）。
+// 语义见 Pool.creditFloor 字段注释。
+func (p *Pool) SetCreditFloor(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.creditFloor = n
 	}
 }
 

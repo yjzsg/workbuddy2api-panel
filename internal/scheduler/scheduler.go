@@ -28,7 +28,9 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
-	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
+	// GrowthHours 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，01:00
+	// 自动扫描+执行；避开零点整防解锁竞态）。[上游 dbd7c68..origin/main]
+	GrowthHours    []int
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// DailyChatHours 默认 [8]：每日对话保底（国际版 30 分硬条件——当天须至少
 	// 1 次有效对话；模型按 realm 选 x0.00 免费档，零积分消耗）。
@@ -51,8 +53,12 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
-	// SchoolDisabled 显式关闭开学季任务排程（schedule.school_enabled=false）。
-	SchoolDisabled bool
+	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
+	GrowthDisabled bool
+	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号待办
+	// 并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
+	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
+	GrowthHook func()
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
 	// DailyChatDisabled 显式关闭每日对话保底排程（schedule.daily_chat_enabled=false）。
@@ -118,8 +124,8 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
 	}
-	if len(cfg.SchoolHours) == 0 {
-		cfg.SchoolHours = []int{12}
+	if len(cfg.GrowthHours) == 0 {
+		cfg.GrowthHours = []int{1}
 	}
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
@@ -189,7 +195,7 @@ const (
 	taskTravel
 	taskActivity
 	taskKeepalive
-	taskSchool
+	taskGrowth
 	taskCat
 	taskCNInvite
 	taskDailyChat
@@ -203,10 +209,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	s.schedMu.Lock()
 	checkinHours, travelHours := s.cfg.CheckinHours, s.cfg.TravelHours
 	activityHours, keepaliveHours := s.cfg.ActivityHours, s.cfg.KeepaliveHours
-	schoolHours, catHours := s.cfg.SchoolHours, s.cfg.CatHours
+	growthHours, catHours := s.cfg.GrowthHours, s.cfg.CatHours
 	checkinOff, travelOff := s.cfg.CheckinDisabled, s.cfg.TravelDisabled
 	activityOff, keepaliveOff := s.cfg.ActivityDisabled, s.cfg.KeepaliveDisabled
-	schoolOff, catOff := s.cfg.SchoolDisabled, s.cfg.CatDisabled
+	growthOff, catOff := s.cfg.GrowthDisabled, s.cfg.CatDisabled
 	cnInviteCode, cnInviteHours, cnInviteUntil := s.cfg.CNInviteCode, s.cfg.CNInviteHours, s.cfg.CNInviteUntil
 	cnInviteOff := s.cfg.CNInviteDisabled
 	dailyChatHours, dailyChatOff := s.cfg.DailyChatHours, s.cfg.DailyChatDisabled
@@ -229,8 +235,8 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if !keepaliveOff {
 		slots = append(slots, slot{nextFire(now, keepaliveHours), taskKeepalive})
 	}
-	if !schoolOff {
-		slots = append(slots, slot{nextFire(now, schoolHours), taskSchool})
+	if !growthOff {
+		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
 	}
 	if !catOff {
 		slots = append(slots, slot{nextFire(now, catHours), taskCat})
@@ -287,6 +293,50 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
+// wallclockCheckStep 墙钟校验段长：等待槽位时单次 timer 的最大时长，每段醒来用
+// 墙钟重判是否到点。值是「时点精度」与「空闲唤醒频率」的折中。[上游 dbd7c68..origin/main]
+const wallclockCheckStep = time.Minute
+
+// slotWake waitSlot 的三态结果。
+type slotWake int
+
+const (
+	slotFired slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                 // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                // ctx 取消：上层优雅退出
+)
+
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
+// 不携带单调读数，time.Until 对它是纯墙钟差）。
+//
+// 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
+// macOS / Windows Modern Standby 睡眠会冻结它——睡眠时长不足整个等待时，fire
+// 被顺延「睡眠时长」（墙钟已过点、timer 还要继续等），时点被错过且不会立即补跑。
+// 分段睡、每段醒来用墙钟重判，把冻结的影响限制在一段之内。
+// [上游 dbd7c68..origin/main]
+func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	for {
+		wallRemain := time.Until(next)
+		if wallRemain <= 0 {
+			return slotFired
+		}
+		d := wallRemain
+		if d > step {
+			d = step
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return slotCancel
+		case <-s.rearmSchedule:
+			timer.Stop()
+			return slotRearm
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
@@ -299,14 +349,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		switch s.waitSlot(ctx, next, wallclockCheckStep) {
+		case slotCancel:
 			return
-		case <-s.rearmSchedule:
-			timer.Stop() // 排程已变：重算下一次唤醒（面板热配置）
-		case <-timer.C:
+		case slotRearm:
+			continue // 排程已变：重算下一次唤醒（面板热配置）
+		case slotFired:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
 			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
@@ -339,8 +387,9 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 
 // dispatch 按任务类型分发到对应执行函数。单账号失败不阻断遍历（与既有各任务同口径）。
 // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号）。
-// 面板层：school/cat 走 Go API 路线（RunSchoolAllNow/RunBlackcatNow；上游脚本版
-// RunSchoolNow/RunCatNow 保留定义但未接线——面板镜像未携带脚本）。
+// 面板层：cat 走 Go API 路线（RunBlackcatNow；上游脚本版 RunCatNow 已随开学季下线一并移除
+// ——面板镜像未携带脚本，本仓也不再保留未接线的脚本入口）。
+// [2026-10-01 同步：上游 dbd7c68..origin/main 下线开学季（school），taskSchool → taskGrowth]
 func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
@@ -351,8 +400,14 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.runActivity(ctx)
 	case taskKeepalive:
 		s.RunKeepaliveNow()
-	case taskSchool:
-		s.RunSchoolAllNow()
+	case taskGrowth:
+		// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+		s.schedMu.Lock()
+		hook := s.cfg.GrowthHook
+		s.schedMu.Unlock()
+		if hook != nil {
+			hook()
+		}
 	case taskCat:
 		s.RunBlackcatNow()
 	case taskCNInvite:
@@ -440,6 +495,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
 				// 出现一整段 400 报文、被误读成签到失败。
 				oc.Status = CheckinAlready
+				s.cfg.Pool.NoteCheckinDone(st.UID)
 			} else {
 				oc.Status = CheckinFail
 				oc.Detail = err.Error()
@@ -447,10 +503,14 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			}
 		} else {
 			oc.Status = CheckinOK
+			// 首次签到成功此前静默——成功也落一行并记当日已签（面板按钮据此显示）。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
+		// [上游 dbd7c68..origin/main]
+		expiringSoon := s.ExpiringSoonWindow()
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			oc.Status = CheckinFail
@@ -459,8 +519,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 		oc.Credits = &remain
 		switch oc.Status {
 		case CheckinOK:
@@ -786,6 +846,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 // ReenableIfCredits/SetCreditsDetailed 去 total）]
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
+	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -797,13 +858,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, buckets.Expiring)
+			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 		}(a, st.UID)
 	}
 	wg.Wait()
@@ -819,11 +880,42 @@ func poke(ch chan struct{}) {
 	}
 }
 
+// ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
+// [上游 dbd7c68..origin/main]
+func (s *Scheduler) ExpiringSoonWindow() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.ExpiringSoonWindow
+}
+
+// SetExpiringSoonWindow 热更新快过期路由窗口。窗口变化时清空池内旧快照，避免在下一轮
+// 余额刷新覆盖前，继续用旧窗口得出的最早到期顺序选号。[上游 dbd7c68..origin/main]
+func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.schedMu.Lock()
+	changed := s.cfg.ExpiringSoonWindow != d
+	s.cfg.ExpiringSoonWindow = d
+	poolRef := s.cfg.Pool
+	s.schedMu.Unlock()
+	if changed && poolRef != nil {
+		poolRef.ClearExpiringSnapshots()
+	}
+}
+
+// SetGrowthHook 挂载/替换成长任务队列回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetGrowthHook(fn func()) {
+	s.schedMu.Lock()
+	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config normalize 的回落语义一致）。
 // 参数名沿用面板配置词汇（blackcatHours → 内部 CatHours 域）。[面板层：热配置]
-func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, schoolHours, dailyChatHours []int,
-	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, schoolDisabled, dailyChatDisabled bool) {
+func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours, dailyChatHours []int,
+	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, growthDisabled, dailyChatDisabled bool) {
 	s.schedMu.Lock()
 	if len(checkinHours) > 0 {
 		s.cfg.CheckinHours = checkinHours
@@ -840,8 +932,8 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	if len(blackcatHours) > 0 {
 		s.cfg.CatHours = blackcatHours
 	}
-	if len(schoolHours) > 0 {
-		s.cfg.SchoolHours = schoolHours
+	if len(growthHours) > 0 {
+		s.cfg.GrowthHours = growthHours
 	}
 	if len(dailyChatHours) > 0 {
 		s.cfg.DailyChatHours = dailyChatHours
@@ -851,7 +943,7 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	s.cfg.ActivityDisabled = activityDisabled
 	s.cfg.KeepaliveDisabled = keepaliveDisabled
 	s.cfg.CatDisabled = blackcatDisabled
-	s.cfg.SchoolDisabled = schoolDisabled
+	s.cfg.GrowthDisabled = growthDisabled
 	s.cfg.DailyChatDisabled = dailyChatDisabled
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)

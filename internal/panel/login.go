@@ -269,7 +269,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	if rm, err := p.cfg.Upstream.UserResource(a); err == nil {
 		remain = rm
-		p.cfg.Pool.ReenableIfCredits(acct.UID, rm)
+		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, 0)
 	}
 
 	p.loginMu.Lock()

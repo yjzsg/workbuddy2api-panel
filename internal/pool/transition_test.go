@@ -134,6 +134,7 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 // 【本地刻意变更 fix_iter13】原实现无条件 clearCoolingLocked（含限流软冷却）。但本函数
 // 被余额后台刷新**每 5 分钟**调用一次，而余额充足不代表配额恢复 → 撞 429/6004 的账号
 // 会被反复解冻、立刻又被选中再撞（实测 账号C 反复 6004）。现只清 CoolHard。
+// （上游 dbd7c68..origin/main 独立修了同一处，实现与语义一致——两边收敛。）
 func TestTransitionReenableClearsHardOnlyKeepsBreaker(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -143,7 +144,7 @@ func TestTransitionReenableClearsHardOnlyKeepsBreaker(t *testing.T) {
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1")
 
-	p.ReenableIfCredits("u1", 700)
+	p.ReenableIfCredits("u1", 700, 0)
 
 	st, _ := p.Status("u1")
 	if st.Credits != 700 {
@@ -154,6 +155,8 @@ func TestTransitionReenableClearsHardOnlyKeepsBreaker(t *testing.T) {
 		t.Errorf("CoolHard 应被清：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
 			until, kind, reason, streak, mc)
 	}
+	_ = mc     // 本场景未设模型级冷却，mc 恒 0（该断言在 TestTransitionReenableKeepsSoftAndModelCooldowns）
+	_ = streak // 本场景 streak 恒 0（Cooldown 固定时长入口不累计、带 resetAt 的模型级写入也不累计）
 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
 		t.Fatal("reenable 不得清熔断（chat 通道健康未证明）")
 	}
@@ -168,7 +171,7 @@ func TestTransitionReenableKeepsSoftAndModelCooldowns(t *testing.T) {
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 
-	p.ReenableIfCredits("u1", 700)
+	p.ReenableIfCredits("u1", 700, 0)
 
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
 	if until.IsZero() || kind != CoolSoft || reason == "" || streak == 0 || mc == 0 {
@@ -201,5 +204,18 @@ func TestTransitionReviveClearsEverything(t *testing.T) {
 	}
 	if bt, ok := p.breakerUntil("u1"); ok && !bt.IsZero() {
 		t.Errorf("Revive（显式解冻）应清熔断，got %v", bt)
+	}
+}
+
+// TestTransitionReviveUnfreezesHardCooling 余额耗尽冷却（CoolHard）才是
+// ReenableIfCredits 的解冻对象：余额恢复（remain>0）正是它的权威恢复证据。
+func TestTransitionReviveUnfreezesHardCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	p.ReenableIfCredits("u1", 700, 0)
+	until, kind, reason, _, _ := coolingDomain(t, p, "u1")
+	if !until.IsZero() || kind != 0 || reason != "" {
+		t.Errorf("余额恢复应解冻 CoolHard：until=%v kind=%v reason=%q", until, kind, reason)
 	}
 }

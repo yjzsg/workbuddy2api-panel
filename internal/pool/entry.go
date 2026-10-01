@@ -73,12 +73,19 @@ type Status struct {
 	Realm         string    `json:"realm,omitempty"`
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
+	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
+	// 最早的一批及其剩余量，供「最早到期优先」路由使用（上游 dbd7c68..origin/main 新增）。
+	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
+	Cooling                  bool      `json:"cooling"`
+	CoolKind                 string    `json:"cool_kind,omitempty"`
+	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
+	Until                    time.Time `json:"until,omitempty"`
+	Reason                   string    `json:"reason,omitempty"`
+	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -101,7 +108,10 @@ type Status struct {
 	ErrTotal          int64              `json:"err_total,omitempty"`
 	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
 	LastErrTime       time.Time          `json:"last_err,omitempty"`
-	TokenUsage        TokenUsage         `json:"token_usage,omitempty"`
+	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
+	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
+	CheckinDone bool `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
@@ -116,6 +126,8 @@ type Status struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
+	// Kind 区分限流与模型不可用：6004 是 rate_limit，11102 是 model_unavailable。
+	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
@@ -142,6 +154,8 @@ type ModelCostStatus struct {
 type entry struct {
 	a       *auth.Auth
 	credits int64
+	// creditsTotal 积分总额度（UserResource 聚合；0 = 未知）。上游 dbd7c68..origin/main 引入。
+	creditsTotal int64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -149,6 +163,10 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
+	// creditsEarliestExpiry / creditsEarliestRemaining 全部未来到期批次中的最早一批
+	// 及其剩余量（上游 dbd7c68..origin/main 新增，供「最早到期优先」路由与状态观测）。
+	creditsEarliestExpiry    time.Time
+	creditsEarliestRemaining int64
 	successCount    int64     // 累计成功
 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
@@ -166,6 +184,10 @@ type entry struct {
 	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
 	manualDisabled bool
 	manualReason   string
+	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
+	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
+	// 签到/已签。持久化：跨重启不丢当日状态（上游 dbd7c68..origin/main 新增）。
+	lastCheckinDay string
 	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
@@ -278,8 +300,15 @@ func (e *entry) healthy(now time.Time) bool {
 // 冷却内才放行），探活存在性语义与选号在豁免账号上口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
-	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero()
+	if e.disabled || e.manualDisabled || !e.until.IsZero() || !e.degradeUntil.IsZero() || !e.breakerUntil.IsZero() {
+		return false
+	}
+	for _, mc := range e.modelCooldowns {
+		if !mc.AuditOnly && !mc.Until.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -289,7 +318,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	mc, ok := e.modelCooldowns[reqModel]
-	if !ok {
+	if !ok || mc.AuditOnly {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
@@ -395,6 +424,7 @@ func (e *entry) fallbackKind(now time.Time) string {
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
+	CreditsTotal int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（上游 dbd7c68..origin/main 新增）
 	Disabled     bool      `json:"disabled"`
 	Reason       string    `json:"reason,omitempty"`
 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，
@@ -444,6 +474,15 @@ type stateAccount struct {
 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
 	// 零值也显式写出（运维口径，见 err_total 注释）。
 	CreditsExpiring int64 `json:"credits_expiring"`
+	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
+	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
+	// 上游 dbd7c68..origin/main 新增。
+	LastCheckinDay string `json:"last_checkin_day,omitempty"`
+	// CreditsEarliestExpiry / CreditsEarliestRemaining 最早未来到期批次及剩余量。
+	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
+	// 上游 dbd7c68..origin/main 新增。
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
@@ -463,6 +502,8 @@ type stateModelCooldown struct {
 	Until   time.Time `json:"until,omitempty"`
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	Reason  string    `json:"reason,omitempty"`
+	// AuditOnly 仅展示项（无重置时间的 6004），不参与路由判定。
+	AuditOnly bool `json:"audit_only,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
@@ -506,6 +547,9 @@ type modelCooldown struct {
 	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。运行态不落盘（同 modelCost 口径：
 	// 重启后从 6h 基数重新学习）；6004 条目 Hits 恒 0。持久化来回不会写入该字段。
 	Hits int
+	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
+	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
+	AuditOnly bool
 }
 
 // stateFile 持久化格式。

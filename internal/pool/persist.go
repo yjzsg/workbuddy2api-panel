@@ -167,23 +167,36 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		// （旧文件的 success_ema/error_ema 字段在 stateAccount 已删除，读取时被
 		// JSON 解码自然忽略——无害遗留，不反推不迁移；成功率 EMA 因子已删。）
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			manualDisabled:   s.ManualDisabled,
-			manualReason:     s.ManualReason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			tokenUsage:       s.TokenUsage,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			consecutiveFails: s.ConsecutiveFails,
-			creditsExpiring:  expiring,
+			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:                  s.Credits,
+			creditsTotal:             s.CreditsTotal,
+			disabled:                 s.Disabled,
+			reason:                   s.Reason,
+			manualDisabled:           s.ManualDisabled,
+			manualReason:             s.ManualReason,
+			until:                    s.Until,
+			coolKind:                 s.CoolKind,
+			successCount:             s.SuccessCount,
+			errTotal:                 errTotal,
+			lastErr:                  s.LastErr,
+			lastSuccess:              s.LastSuccess,
+			lastCheckinDay:           s.LastCheckinDay,
+			tokenUsage:               s.TokenUsage,
+			softStreak:               s.SoftStreak,
+			sessionDeadFails:         s.SessionDeadFails,
+			consecutiveFails:         s.ConsecutiveFails,
+			creditsExpiring:          expiring,
+			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
+			creditsEarliestRemaining: s.CreditsEarliestRemaining,
+		}
+		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复
+		// （上游 dbd7c68..origin/main 新增）。
+		if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > e.credits {
+			e.creditsEarliestRemaining = 0
+		}
+		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
+			e.creditsEarliestExpiry = time.Time{}
+			e.creditsEarliestRemaining = 0
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -206,9 +219,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 					continue // 过期/零值丢弃
 				}
 				e.modelCooldowns[m] = modelCooldown{
-					Until:   smc.Until,
-					ResetAt: smc.ResetAt,
-					Reason:  smc.Reason,
+					Until:     smc.Until,
+					ResetAt:   smc.ResetAt,
+					Reason:    smc.Reason,
+					AuditOnly: smc.AuditOnly,
 				}
 			}
 			if len(e.modelCooldowns) == 0 {
@@ -360,9 +374,10 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					continue // 已过期：不落盘（惰性清理）
 				}
 				mcs[m] = stateModelCooldown{
-					Until:   mc.Until,
-					ResetAt: mc.ResetAt,
-					Reason:  mc.Reason,
+					Until:     mc.Until,
+					ResetAt:   mc.ResetAt,
+					Reason:    mc.Reason,
+					AuditOnly: mc.AuditOnly,
 				}
 			}
 			if len(mcs) == 0 {
@@ -414,6 +429,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		coolKind, reason := cooledReasonLocked(e, now)
 		sf.Accounts[uid] = stateAccount{
 			Credits:          e.credits,
+			CreditsTotal:     e.creditsTotal,
 			Disabled:         e.disabled,
 			Reason:           reason,
 			ManualDisabled:   e.manualDisabled,
@@ -424,6 +440,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:         e.errTotal,
 			LastSuccess:      e.lastSuccess,
 			LastErr:          e.lastErr,
+			LastCheckinDay:   e.lastCheckinDay,
 			TokenUsage:       e.tokenUsage,
 			SoftStreak:       e.softStreak,
 			SessionDeadFails: e.sessionDeadFails,
@@ -431,9 +448,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			DegradeUntil:     degradeUntil,
 			BreakerUntil:     breakerUntil,
 			RetryCount:       retryCount,
-			CreditsExpiring:  e.creditsExpiring,
-			ModelCooldowns:   mcs,
-			ModelCosts:       mcosts,
+			CreditsExpiring:          e.creditsExpiring,
+			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
+			CreditsEarliestRemaining: e.creditsEarliestRemaining,
+			ModelCooldowns:           mcs,
+			ModelCosts:               mcosts,
 		}
 	}
 	return sf

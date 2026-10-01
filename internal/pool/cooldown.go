@@ -15,34 +15,81 @@ import (
 // bench 与 server 的 handler_test 等）；生产写余额全走 SetCreditsDetailed
 // （scheduler.go 签到时调用），本入口无生产调用方。保留是因为它是「总量更新」
 // 与「总量+分桶更新」的语义对照锚点（删掉则 expiring 的向后兼容行为失去断言）。
-func (p *Pool) SetCredits(uid string, credits int64) {
+func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.creditsTotal = total
 		p.dirty.Store(true)
 	}
 }
 
-// SetCreditsDetailed 更新账号余额总量 + 快过架子集（签到时调用，供优先消耗快过期积分）。
-// expiring 会被钳到 [0, credits]：上游分桶异常时不污染权重。
-func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
+// NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。
+// 记录本地日期，跨零点自然过期；不触碰冷却/禁用状态（签到与冷却域正交）。
+// 上游 dbd7c68..origin/main 新增（面板「签到/已签」按钮据此显示）。
+func (p *Pool) NoteCheckinDone(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		day := time.Now().Format("2006-01-02")
+		if e.lastCheckinDay != day {
+			e.lastCheckinDay = day
+			p.dirty.Store(true)
+		}
+	}
+}
+
+// SetCreditsDetailed 更新账号余额/总额、配置窗口内的快过架子集，以及最早未来
+// 到期批次。earliestAt 为零或不在未来时清空最早批次；expiring/earliestRemaining
+// 均钳到 [0, credits]，避免上游脏数据污染选号。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		if credits < 0 {
+			credits = 0
+		}
 		if expiring < 0 {
 			expiring = 0
 		}
 		if expiring > credits {
 			expiring = credits
 		}
+		now := time.Now()
+		if earliestRemaining < 0 {
+			earliestRemaining = 0
+		}
+		if earliestRemaining > credits {
+			earliestRemaining = credits
+		}
+		if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
+			earliestAt = time.Time{}
+			earliestRemaining = 0
+		}
 		e.credits = credits
+		e.creditsTotal = total
 		e.creditsExpiring = expiring
+		e.creditsEarliestExpiry = earliestAt
+		e.creditsEarliestRemaining = earliestRemaining
 		p.dirty.Store(true)
 	}
 }
 
-// Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
+// ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
+// 避免在新快照写入前继续使用旧窗口得到的路由数据；下一次签到或余额刷新会重建。
+func (p *Pool) ClearExpiringSnapshots() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.byUID {
+		e.creditsExpiring = 0
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
+	}
+	p.dirty.Store(true)
+}
+
+// Cooldown 冷却账号至 now+d（即时冷却：CoolHard 余额耗尽 / CoolSoft 固定短冷却）。
 //
 // 重构后本入口是「固定时长的账号级冷却」，不再做两件旧事：
 //   - 不再喂熔断器失败计数：熔断器只对「反复失败」（NoteError，5xx）退避。
@@ -57,10 +104,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空 6004 模型级独立冷却表（modelCooldowns），
-		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
-		// （否则换模型请求会错误绕过本次冷却）。
-		e.modelCooldowns = nil
+		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
+		// 模型豁免泄漏到账号级冷却上；AuditOnly 条目不影响路由，保留展示。
+		clearRoutingModelCooldownsLocked(e)
 		p.dirty.Store(true)
 	}
 }
@@ -103,11 +149,59 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
-			e.modelCooldowns = nil
+			clearRoutingModelCooldownsLocked(e)
 		}
 		p.dirty.Store(true)
 	}
 }
+
+// RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
+// 典型场景是 6004 没有可解析重置时间：账号仍按原有有界退避冷却，
+// 本方法只把模型名挂到 e.until 上供账号页展示，不影响 healthyForModel。
+func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
+		return // 已有真实模型冷却，审计记录不得覆盖路由截止
+	}
+	until := e.until
+	if until.IsZero() || !until.After(now) {
+		until = now.Add(p.softRateMaxOr())
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = make(map[string]modelCooldown)
+	}
+	e.modelCooldowns[model] = modelCooldown{
+		Until:     until,
+		Reason:    reason,
+		AuditOnly: true,
+	}
+	p.dirty.Store(true)
+}
+
+// clearRoutingModelCooldownsLocked 删除参与选号豁免的模型冷却，保留 AuditOnly 台账。
+// 调用方必须已持有 p.mu 写锁。
+func clearRoutingModelCooldownsLocked(e *entry) {
+	for model, mc := range e.modelCooldowns {
+		if !mc.AuditOnly {
+			delete(e.modelCooldowns, model)
+		}
+	}
+	if len(e.modelCooldowns) == 0 {
+		e.modelCooldowns = nil
+	}
+}
+
+// modelBlock TTL 常量（11102 负缓存退避）定义在 entry.go（本仓口径 shift=6）。
+// 上游 dbd7c68..origin/main 的同名常量块不重复引入，避免 redeclared。
 
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口（handler.applyErrorPolicy
 // 调用）。复用 modelCooldowns 机制（不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避
@@ -210,7 +304,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
-		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
+		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
 		p.dirty.Store(true)
 	}
 }
@@ -302,6 +396,9 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
+// ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，解冻
+// **余额耗尽冷却**（CoolHard）。软限流（CoolSoft）与模型级台账（modelCooldowns）
+// 不在此清除——它们的恢复证据是上游重置墙钟到期，不是余额恢复（余额刷新周期
+// 任务每 5 分钟到达这里，全清会把限流冷却实际寿命压到一个刷新周期内）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。

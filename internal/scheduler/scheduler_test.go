@@ -67,9 +67,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:    []int{22},
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
-		DailyChatDisabled: true,
+		DailyChatDisabled: true, GrowthDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -131,11 +130,10 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
-		DailyChatDisabled: true,
-		CheckinHours:      []int{9, 21},
-		KeepaliveHours:    []int{22},
+		DailyChatDisabled: true, GrowthDisabled: true,
+		CheckinHours:   []int{9, 21},
+		KeepaliveHours: []int{22},
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
@@ -167,9 +165,8 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		SchoolDisabled:    true,
 		CatDisabled:       true,
-		DailyChatDisabled: true,
+		DailyChatDisabled: true, GrowthDisabled: true,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -203,6 +200,7 @@ type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	resourceEnd    string
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -214,8 +212,14 @@ func (f *fakeUpstream) server() *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			// remain 需 <= size（upstream 取数钳 [0,size]：脏数据 remain>size 会被钳到
 			// size——上游真实数据恒一致，R-C 实测 Cycle{17,482,500}）。
+			// remain 需 <= size（取数钳 [0,size]：脏数据 remain>size 会被钳到 size
+			// ——上游真实数据恒一致，实测 Cycle{17,482,500}）。
+			end := ""
+			if f.resourceEnd != "" {
+				end = `,"CycleEndTime":` + jsonString(f.resourceEnd)
+			}
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":` +
-				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0}]}}}}`))
+				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
@@ -226,6 +230,11 @@ func (f *fakeUpstream) server() *httptest.Server {
 }
 
 func jsonI64(v int64) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func jsonString(v string) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
@@ -781,5 +790,71 @@ func TestCheckinPathIncludesManualDisabled(t *testing.T) {
 	}
 	if st, _ := p.Status("u1"); !st.ManualDisabled || st.Credits != 500 {
 		t.Fatalf("签到后应保留手动位且回填余额: %+v", st)
+	}
+}
+
+// TestNextWakeGrowthSlot growth 排程进候选 + 禁用退场（每日自动执行成长任务队列）。
+func TestNextWakeGrowthSlot(t *testing.T) {
+	s := New(Config{GrowthHours: []int{1}})
+	at, kinds := s.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	hasGrowth := false
+	for _, k := range kinds {
+		if k == taskGrowth {
+			hasGrowth = true
+		}
+	}
+	if !hasGrowth || at.Hour() != 1 || at.Day() != 27 {
+		t.Fatalf("growth 槽位: at=%v kinds=%v（期望 09-27 01:00 含 taskGrowth）", at, kinds)
+	}
+	// 禁用后不进候选（其余 kind 为空 → nextWake 零值返回）
+	s2 := New(Config{GrowthHours: []int{1}, GrowthDisabled: true})
+	_, kinds2 := s2.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	for _, k := range kinds2 {
+		if k == taskGrowth {
+			t.Fatal("禁用后 growth 仍在候选")
+		}
+	}
+}
+
+func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
+	end := time.Now().In(time.FixedZone("CST", 8*3600)).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
+	f := &fakeUpstream{resourceRemain: 100, resourceEnd: end}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	s.RunBalanceRefreshNow()
+
+	st, _ := p.Status("u1")
+	if st.Credits != 100 || st.CreditsExpiring != 100 || st.CreditsEarliestRemaining != 100 || st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("snapshot=%+v", st)
+	}
+
+	f.resourceEnd = ""
+	s.RunBalanceRefreshNow()
+	st, _ = p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("zero expiry refresh did not clear snapshot=%+v", st)
+	}
+}
+
+func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(time.Hour), 50)
+	s := New(Config{Pool: p, ExpiringSoonWindow: 7 * 24 * time.Hour})
+
+	s.SetExpiringSoonWindow(24 * time.Hour)
+	if got := s.ExpiringSoonWindow(); got != 24*time.Hour {
+		t.Fatalf("window=%v want 24h", got)
+	}
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 {
+		t.Fatalf("window change did not clear snapshot=%+v", st)
 	}
 }

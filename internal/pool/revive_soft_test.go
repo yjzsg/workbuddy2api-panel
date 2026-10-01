@@ -21,7 +21,7 @@ func TestReviveCoolingLockedOnlyClearsHard(t *testing.T) {
 		reason:     "429 rate limit",
 		softStreak: 3,
 	}
-	p.reviveCoolingLocked(e, 480)
+	p.reviveCoolingLocked(e, 480, 0)
 	if e.credits != 480 {
 		t.Errorf("credits 应更新为 480，得到 %d", e.credits)
 	}
@@ -32,9 +32,11 @@ func TestReviveCoolingLockedOnlyClearsHard(t *testing.T) {
 
 	hardUntil := time.Now().Add(6 * time.Hour)
 	e2 := &entry{coolKind: CoolHard, until: hardUntil, reason: "credits exhausted", softStreak: 1}
-	p.reviveCoolingLocked(e2, 500)
-	if e2.coolKind != 0 || !e2.until.IsZero() || e2.reason != "" || e2.softStreak != 0 {
-		t.Errorf("余额型冷却（CoolHard）应被清掉: kind=%v until=%v reason=%q streak=%d",
+	p.reviveCoolingLocked(e2, 500, 0)
+	// softStreak 保留：上游 dbd7c68..origin/main 起，softStreak 的恢复证据是
+	// NoteSuccess（成功是最强证据）或自然到期，与余额无关——revive 不动它。
+	if e2.coolKind != 0 || !e2.until.IsZero() || e2.reason != "" || e2.softStreak != 1 {
+		t.Errorf("余额型冷却（CoolHard）应被清掉且 softStreak 保留: kind=%v until=%v reason=%q streak=%d",
 			e2.coolKind, e2.until, e2.reason, e2.softStreak)
 	}
 	if e2.credits != 500 {
@@ -52,7 +54,7 @@ func TestReviveCoolingLockedKeepsModelCooldowns(t *testing.T) {
 		until:          until,
 		modelCooldowns: map[string]modelCooldown{"deepseek-v4.1-flash": {Until: until, Reason: "6004 model rate limit"}},
 	}
-	p.reviveCoolingLocked(e, 100)
+	p.reviveCoolingLocked(e, 100, 0)
 	if len(e.modelCooldowns) == 0 {
 		t.Error("模型级限流冷却不该被余额解冻清掉")
 	}

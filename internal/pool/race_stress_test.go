@@ -27,7 +27,7 @@ func TestCooldownAccountingConcurrent(t *testing.T) {
 	for i := 0; i < uids; i++ {
 		uid := "u" + string(rune('0'+i))
 		p.Add(&auth.Auth{UID: uid})
-		p.SetCredits(uid, 1000)
+		p.SetCredits(uid, 1000, 0)
 	}
 	reset := func(v time.Duration) {
 		old := flushInterval
@@ -54,7 +54,7 @@ func TestCooldownAccountingConcurrent(t *testing.T) {
 				case 3:
 					p.NoteSuccess(uid)
 				case 4:
-					p.SetCreditsDetailed(uid, 500, 100)
+					p.SetCreditsDetailed(uid, 500, 500, 100, time.Time{}, 0)
 				}
 				// 同 goroutine 族读状态（CountsDetailed/List 只读路径）。
 				_, _, _, _, _ = p.CountsDetailed()
@@ -100,7 +100,7 @@ func TestFlusherTickConcurrentWithClose(t *testing.T) {
 
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCredits("u1", 42)
+	p.SetCredits("u1", 42, 0)
 	// 持续 dirty：让每 tick 都真的 saveLocked（与 Close 的 lock/flush 交错）。
 	var wg sync.WaitGroup
 	wg.Add(1)

@@ -157,7 +157,7 @@ func TestCreditsExpiringPersistRoundTrip(t *testing.T) {
 	fp := dir + "/state.json"
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 1000, 500) // credits=1000, creditsExpiring=500
+	p.SetCreditsDetailed("u1", 1000, 1000, 500, time.Now().Add(48*time.Hour), 500) // credits=1000, expiring=500, 有有效最早批次
 	p.Flush()
 
 	// 重启：creditsExpiring 应恢复。
@@ -170,15 +170,16 @@ func TestCreditsExpiringPersistRoundTrip(t *testing.T) {
 	if expiring != 500 {
 		t.Errorf("恢复后 creditsExpiring=%d want 500", expiring)
 	}
-	// 选号第四因子用恢复的值：weightOf 应含 expiring 项。
+	// 到期路由用恢复的值：prefer_expiring 生效时 routingWeightOf 应更大。
+	p2.SetPreferExpiring(true)
 	p2.mu.RLock()
 	e := p2.byUID["u1"]
-	wWith := p2.weightOf(e, 1000, time.Now())
-	// 对比：把 creditsExpiring 清零后权重应更小（快过期加成消失）。
-	saved := e.creditsExpiring
-	e.creditsExpiring = 0
-	wWithout := p2.weightOf(e, 1000, time.Now())
-	e.creditsExpiring = saved
+	wWith := p2.routingWeightOf(e, 1000, time.Now())
+	// 对比：把最早到期批次清零后权重应更小（虚拟实例加成消失）。
+	savedAt, savedRem := e.creditsEarliestExpiry, e.creditsEarliestRemaining
+	e.creditsEarliestExpiry, e.creditsEarliestRemaining = time.Time{}, 0
+	wWithout := p2.routingWeightOf(e, 1000, time.Now())
+	e.creditsEarliestExpiry, e.creditsEarliestRemaining = savedAt, savedRem
 	p2.mu.RUnlock()
 	if wWith <= wWithout {
 		t.Errorf("恢复的 creditsExpiring 应让权重更大: wWith=%.3f wWithout=%.3f", wWith, wWithout)
@@ -192,7 +193,7 @@ func TestCreditsExpiringPersistWritesZero(t *testing.T) {
 	fp := dir + "/state.json"
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 1000, 0) // creditsExpiring=0
+	p.SetCreditsDetailed("u1", 1000, 1000, 0, time.Time{}, 0) // creditsExpiring=0
 	p.Flush()
 
 	raw, _ := os.ReadFile(fp)

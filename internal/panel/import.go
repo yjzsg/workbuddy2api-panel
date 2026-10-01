@@ -151,7 +151,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		//   UserResource       → (remain, err)  两值（total 已由 UserResourceDetailed 拆分）
 		//   ReenableIfCredits  → (uid, remain)
 		if rm, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm)
+			p.cfg.Pool.ReenableIfCredits(uid, rm, 0)
 		}
 
 		imported++
