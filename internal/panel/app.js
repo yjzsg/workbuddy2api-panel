@@ -1987,7 +1987,8 @@ function renderUsage(d) {
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
     usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
-    usKpi(fmtTok(t.cache_hit_tokens), '缓存命中', 'c-soft',
+    usKpi(fmtTok(t.cache_hit_tokens), '缓存命中',
+      usRateTone(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens) === 'warn' ? 'c-warn' : 'c-soft',
       usRate(t.cache_hit_rate, t.cache_hit_tokens, t.cache_miss_tokens) + ' 命中率') +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
@@ -2261,7 +2262,10 @@ async function loadUsage() {
     $('usCreditHead').innerHTML = '';
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
-    $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
+    // colspan 跟着 US_DIMS 走，不写死：上游把三张静态表并成一张维度可切的表之后，
+    // 列数由 dim 决定（账号 12 列 / 模型·域 9 列），写死会在切维度时错位。
+    $('usDimBody').innerHTML = '<tr><td colspan="' + (US_DIMS[usDim] || US_DIMS.account).span +
+      '" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
 }

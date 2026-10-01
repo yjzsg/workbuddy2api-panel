@@ -4,7 +4,9 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -318,7 +320,23 @@ func (a *Auth) SaveAtomic() error {
 	}
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
+		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
+		//
+		// 【本仓注记 2026-10-01】这段指引来自上游 08ca79a，在 2026-09-17 的
+		// 「以上游 64064ce 为主干重贴面板层」(657856e) 中被整文件替换而丢失，
+		// 但 permhint_test.go 留了下来 —— 于是该测试在**非 root** 环境一直失败
+		// （本仓验证一律在 golang:alpine 里以 root 跑，root 会让该测试 t.Skip，
+		// 所以本地从未暴露）。今日合并上游 53 提交时带进了 go-binaries CI
+		// （runner 非 root）才第一次被跑出来。此处按上游 origin/main 版本复原。
+		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		if errors.Is(err, fs.ErrPermission) {
+			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
+				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
+				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
+				"3) compose 设 user: \"0:0\" 以 root 运行）"
+		}
+		return errors.New(msg)
 	}
 	return os.Rename(tmp, a.FilePath)
 }

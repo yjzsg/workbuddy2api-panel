@@ -109,8 +109,8 @@ func main() {
 	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池。
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
-	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
-	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal)   // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
@@ -197,7 +197,7 @@ func main() {
 		CNInviteDisabled: !cfg.Schedule.CNInviteEnabled,
 		// 活跃上报条数（上游语义：领猫前置需 5 次对话）。
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		GrowthHours:    cfg.Schedule.GrowthHours,
+		GrowthHours:         cfg.Schedule.GrowthHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -261,9 +261,9 @@ func main() {
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		APIKey:           cfg.APIKey,
+		SoftCooldown:     cfg.SoftRateDur,
+		RecordClientInfo: cfg.Logging.RequestClientInfo,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -472,9 +472,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		APIKey:           newCfg.APIKey,
+		SoftCooldown:     newCfg.SoftRateDur,
+		RecordClientInfo: newCfg.Logging.RequestClientInfo,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

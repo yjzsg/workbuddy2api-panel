@@ -929,7 +929,7 @@ grep -rn 'appVersion' cmd/server/main.go          # 版本号是否跟上了
 
 ### F. 验证
 ```
-gofmt -l（全树 56 = 与合并前一致，无新增脏文件）
+gofmt -l（全树 56；**当时误判为「与合并前一致」—— 见 §5.11 C-3：真实基线是 46**，本次已补齐）
 go build ./...   通过
 go vet   ./...   通过
 go test -count=1 -timeout 900s ./...   22 包全绿
@@ -940,6 +940,77 @@ school 残留：仅 2 处注释 ✅
 ### G. 一个后续隐患
 `internal/pool` 与 `internal/upstream/client.go` 的分叉**只增不减**：本仓带根上游特性、
 面板带自己的演进。每次同步都要手工移植。若要根治，需要决定「以哪条线为主干」并做一次换基。
+
+## 5.11 2026-10-01 收尾：CI 红叉查因 —— 一个被 root 掩盖两周的真 bug + 三处合并遗漏
+
+### A. 触发：GitHub Actions 邮件
+`go-binaries` run #1（commit `1e71098`）失败。**push 本身没失败**
+（`git rev-list --count fork/main..HEAD` = 0）。但失败**是真的**：
+
+```
+--- FAIL: TestSaveAtomicPermissionHint (0.00s)
+    permhint_test.go:27: 权限错误应包含 Docker 指引，实际:
+      open /tmp/.../workbuddy-u1.json.tmp: permission denied
+FAIL  internal/auth  0.010s        ← 其余 21 包全绿
+```
+
+### B. 根因链（**不是本次合并造成的**，但本次合并才让它暴露）
+
+| 时间 | 事件 |
+|---|---|
+| 2026-09-12 `08ca79a` | 上游加 `SaveAtomic` 权限指引 + `permhint_test.go` |
+| 2026-09-17 `657856e` | 本仓「以上游 `64064ce` 为主干重贴面板层」**整文件替换** `internal/auth/auth.go`，**删掉了指引，却留下了测试** |
+| 至今 | 本仓验证一律在 `golang:1.23-alpine` 里**以 root** 跑；该测试首行 `if os.Geteuid()==0 { t.Skip }` → **每次都静默跳过**，从未暴露 |
+| 2026-10-01 | 本次合并带进上游的 `go-binaries` CI（runner 用户 `runner`，**非 root**）→ 第一次真跑 → 红 |
+
+⇒ 教训：**root 会把 POSIX 权限类用例整批 `t.Skip` 掉**。本地「全绿」与 CI 绿不是同一件事。
+
+**修复**：`internal/auth/auth.go` 按上游 `origin/main` 版本复原指引（3 条解法，含 `PUID/PGID`），
+并加注记说明丢失经过。
+
+### C. 顺带查出并修的三处合并遗漏
+
+| # | 问题 | 处理 |
+|---|---|---|
+| 1 | `app.js` 的 `usRateTone()` 成**死代码** —— 我改写缓存 KPI 时丢了它的调用，命中率配色信号没了 | 接回：`usRateTone(...)==='warn' ? 'c-warn' : 'c-soft'` |
+| 2 | `app.js` `usDimBody` 失败占位 `colspan="10"` **写死**，而 `US_DIMS` 被我改成 12/9 → 切维度错位 | 改为 `US_DIMS[usDim].span` 动态取值 |
+| 3 | **gofmt 基线漂移**：合并前 `0c91110` 是 **46** 个脏文件，合并后 **56** —— 我留下 10 个结构体字面量对齐被改宽的脏文件 | `gofmt -w` 那 10 个，回到 46 |
+
+⛔ **第 3 条差点漏掉**：我上一轮拿 `78dfa26`（**已经含我自己改动的 WIP 提交**）当参照比 gofmt，
+等于自证清白。**比 gofmt 基线必须拿真正的合并前提交（`0c91110`）**。
+
+### D. ⛔ 撤回上一轮的一个错误决定：`go-binaries.yml` 不该删
+
+上一轮我删了它，理由是「无 release/tag 上下文必失败（每 push 一个红叉）」——
+**理由不成立**：它的 `publish` job 有 `if: startsWith(github.ref, 'refs/tags/v')` 门，
+`build` job `needs: test` 在 push main 时正常跑五平台编译并存 artifact。
+而且**它是本仓唯一跑 `go test ./...` 的 workflow** —— 上面那个真 bug 就是它抓到的。
+**已恢复**。
+
+（`docker-ghcr.yml` 删除仍正确：它 `IMAGE_NAME: ${{ github.repository }}` 与本仓
+`build-image.yml` 是**同一个 GHCR 包名**，纯重复且会互相覆盖。）
+
+### E. 新增的两条同步纪律
+
+1. **本地验证必须以非 root 身份跑一遍**（`docker run -u 1001:1001`），否则权限类用例静默跳过：
+   ```bash
+   git archive HEAD | tar x -C /tmp/ci_tree        # 干净树（避开 NAS 上 data/ 属主问题）
+   docker run --rm -u 1001:1001 -v /tmp/ci_tree:/src -v /tmp/nrcache:/gocache -w /src \
+     -e GOMODCACHE=/gocache/mod -e GOCACHE=/gocache/build \
+     golang:1.23-alpine sh -c 'cd /src && go test -count=1 ./...'
+   ```
+2. **静默丢失审计**（合并后必跑）：判据 = 某行在 `ours` 有、`base` 没有（fork 独有），
+   却在 `merged` 里找不到 ⇒ 丢失候选。本次靠它捞出了 `usRateTone`/`colspan` 两处。
+   脚本口径：`git show {ours,base,merged}:<file>` 做行集合差，逐文件报告。
+
+### F. 验证（本次收尾）
+```
+node --check internal/panel/app.js           语法 OK
+go build ./...   通过
+go vet   ./...   通过
+gofmt -l 全树 46 == 合并前 0c91110 的 46（零新增脏文件）
+go test -count=1 -timeout 900s ./...（-u 1001:1001，干净树）  22 包全绿，TEST_EXIT=0
+```
 
 ## 6. 禁止事项
 

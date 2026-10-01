@@ -48,29 +48,29 @@ const fileVersion = 3
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
+	Scope string  `json:"s"`           // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`           // cn / global
+	UID   string  `json:"u"`           // 账号 uid
+	Model string  `json:"m"`           // 上游裸模型名
+	Rate  string  `json:"x,omitempty"` // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`           // 请求数（含失败）
+	Err   int64   `json:"e"`           // 失败数
+	PT    int64   `json:"p"`           // prompt tokens
+	CT    int64   `json:"c"`           // completion tokens
+	TT    int64   `json:"t"`           // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`           // 延迟累计（ms）
+	LatN  int64   `json:"ln"`          // 延迟样本数
+	TPS   float64 `json:"v"`           // 吐字速率累计
+	TPSN  int64   `json:"vn"`          // 速率样本数
 	// prompt cache 三段（计数器语义：缺失即 0，不区分「缺观测」与「显式 0」——
 	// 与 freebuff 的 cache_read/cache_creation 同口径）。命中率的"无观测"
 	// 由 hit+miss==0 在展示侧判定。本仓 2026-09-24 新增。
-	CH    int64   `json:"ch"`           // 缓存命中 token
-	CM    int64   `json:"cm"`           // 缓存未命中 token
-	CW    int64   `json:"cw"`           // 缓存写入 token
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+	CH  int64   `json:"ch"`           // 缓存命中 token
+	CM  int64   `json:"cm"`           // 缓存未命中 token
+	CW  int64   `json:"cw"`           // 缓存写入 token
+	CR  float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
+	CRN int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
+	CRT int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
 }
 
 // file 落盘结构。
@@ -369,7 +369,7 @@ type Agg struct {
 	CacheWriteTokens   int64   `json:"cache_write_tokens"`
 	// CacheHitRate = 命中 / (命中 + 未命中)，分母为 0 时留 0。
 	// **不含 write**：写入是"为后续命中付的费"。前端用 hit+miss==0 判"无观测"。
-	CacheHitRate       float64 `json:"cache_hit_rate"`
+	CacheHitRate float64 `json:"cache_hit_rate"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能

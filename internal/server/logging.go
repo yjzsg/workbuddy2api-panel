@@ -118,9 +118,9 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	credit     float64
 	errorFrame bool
-	cacheHit   int // 末帧 usage.prompt_cache_hit_tokens（供 /v1/stats）
-	cacheMiss  int // 末帧 usage.prompt_cache_miss_tokens
-	cacheWr    int // 末帧 usage.prompt_cache_write_tokens
+	cacheHit   int    // 末帧 usage.prompt_cache_hit_tokens（供 /v1/stats）
+	cacheMiss  int    // 末帧 usage.prompt_cache_miss_tokens
+	cacheWr    int    // 末帧 usage.prompt_cache_write_tokens
 	pend       []byte // 已读未返回的行缓存
 }
 

@@ -26,7 +26,7 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 
 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
-	Panel struct {
+	Panel  struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`
@@ -69,7 +69,7 @@ type Config struct {
 		// 拿不到。用户自己用客户端的日子天然满足，没用客户端的那天由本任务兜住。
 		// 模型按 realm 选 x0.00 免费档（见 scheduler.dailyChatModel），不消耗积分。
 		DailyChatHours []int `json:"daily_chat_hours"` // [8] 每日对话保底
-		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+		GrowthHours    []int `json:"growth_hours"`     // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -95,8 +95,8 @@ type Config struct {
 
 		// ActivityReportCount 每号每次活跃上报的条数（上游语义：领猫前置需 5 次对话，
 		// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为）。
-		ActivityReportCount int `json:"activity_report_count"` // 缺省 5
-		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+		ActivityReportCount int  `json:"activity_report_count"` // 缺省 5
+		GrowthEnabled       bool `json:"growth_enabled"`        // 缺省 true；false = 关成长任务自动排程
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。

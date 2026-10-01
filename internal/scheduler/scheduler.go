@@ -30,8 +30,8 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	// GrowthHours 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，01:00
 	// 自动扫描+执行；避开零点整防解锁竞态）。[上游 dbd7c68..origin/main]
-	GrowthHours    []int
-	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	GrowthHours []int
+	CatHours    []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// DailyChatHours 默认 [8]：每日对话保底（国际版 30 分硬条件——当天须至少
 	// 1 次有效对话；模型按 realm 选 x0.00 免费档，零积分消耗）。
 	DailyChatHours []int
@@ -301,9 +301,9 @@ const wallclockCheckStep = time.Minute
 type slotWake int
 
 const (
-	slotFired slotWake = iota // 墙钟已到达计划时点：补跑本批
-	slotRearm                 // 排程已变（Reconfigure）：上层重算下一次唤醒
-	slotCancel                // ctx 取消：上层优雅退出
+	slotFired  slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                  // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                 // ctx 取消：上层优雅退出
 )
 
 // waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
