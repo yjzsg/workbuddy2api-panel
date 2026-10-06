@@ -160,6 +160,28 @@ func (p *Pool) ManualDisabledState(uid string) (disabled bool, reason string, ok
 	return e.manualDisabled, e.manualReason, true
 }
 
+// Pause / Resume 是手动停用的 bool 形态封装（上游同名 API 对齐）。
+//
+// 上游 dbd7c68..origin/main 引入了独立的 `paused` 状态位 + `Pause/Resume` + 面板按钮；
+// 本仓的等价能力是更早实现的 `manualDisabled`（多一个 reason，且带 /admin 三端点）。
+// 二者语义逐字一致（摘除对话流量、不动冷却/熔断/计数、保号任务照常），本仓保留自己的
+// 状态位与接口，这里提供**同名薄封装**，让上游的面板 UI
+//（`POST /panel/api/accounts/{uid}/pause|resume`）零改动即可复用本仓状态位。
+//
+// 不引入上游 `paused` 字段的理由：`manual_disabled` 已被本仓 CLI（cmd/acct / acct.sh）
+// 与 state.json 使用，改名是用户可见的破坏性变更；且上游 paused 无 reason。
+// uid 不存在返回 false（与上游 Pause/Resume 同语义）。
+func (p *Pool) Pause(uid string) bool {
+	found, _ := p.SetManualDisabled(uid, true, "")
+	return found
+}
+
+// Resume 解除手动停用（幂等，对未停用账号为空操作）。uid 不存在返回 false。
+func (p *Pool) Resume(uid string) bool {
+	found, _ := p.SetManualDisabled(uid, false, "")
+	return found
+}
+
 // ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，更新 credits
 // 并解除**余额型冷却**（CoolHard，余额不足 → 冷却到次日 04:00）。
 //
@@ -413,10 +435,12 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 实测收费即拦。
+	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
+	//（判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
 	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。上游 dbd7c68..origin/main 新增（pool.credit_floor）。
-	if p.floorBlockedForModel(e, model, now) {
+	// 后下次会话重新绑定。上游 dbd7c68..origin/main 新增（pool.credit_floor）；
+	// 倍率兜底同批上游引入（floorBlockedForRealmModel）。
+	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
 		return nil

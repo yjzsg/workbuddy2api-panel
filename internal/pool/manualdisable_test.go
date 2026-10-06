@@ -262,3 +262,43 @@ func TestManualDisableServable(t *testing.T) {
 		t.Error("解除手动停用后 ServableNow 应回归 true")
 	}
 }
+
+// TestManualDisabledUnknownUID 不存在的 uid 返回 (false,false)（供端点区分 404）；
+// Pause/Resume 薄封装同语义返回 false（上游 dbd7c68..origin/main 的同名 API 对齐）。
+func TestManualDisabledUnknownUID(t *testing.T) {
+	p := New("")
+	if found, changed := p.SetManualDisabled("nope", true, ""); found || changed {
+		t.Errorf("SetManualDisabled(未知) = (%v,%v), want (false,false)", found, changed)
+	}
+	if p.Pause("nope") {
+		t.Error("Pause(未知) 应返回 false")
+	}
+	if p.Resume("nope") {
+		t.Error("Resume(未知) 应返回 false")
+	}
+}
+
+// TestManualDisabledPauseResumeAlias Pause/Resume 薄封装与 SetManualDisabled 同效
+// （面板 REST 端点走这对别名）。
+func TestManualDisabledPauseResumeAlias(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.Pause("u1") {
+		t.Fatal("Pause 已存在账号应返回 true")
+	}
+	if st, _ := p.Status("u1"); !st.ManualDisabled {
+		t.Errorf("Pause 后 manual_disabled 应为 true: %+v", st)
+	}
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("Pause 后不应被选中, got %+v", got)
+	}
+	if !p.Resume("u1") {
+		t.Fatal("Resume 应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.ManualDisabled {
+		t.Errorf("Resume 后 manual_disabled 应为 false: %+v", st)
+	}
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
+		t.Fatalf("Resume 后应回到池子, got %+v", got)
+	}
+}

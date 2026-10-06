@@ -59,6 +59,14 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	p.dirty.Store(true)
 }
 
+// ⚠️ 本仓刻意**不**在 disableLocked 里清 manualDisabled（上游对应实现会清 paused）：
+// 我们的语义是「两位独立、各自清除、都清空才回池」——运维手动摘除的号不应被一次
+// 自动禁用/解冻路径悄悄放回选号池。上游的「禁用是更强终态，不叠加」在本仓由
+// /status 的双位透出 + 面板分别给出「启用」/「解冻」按钮承接。
+//
+// 暂停选号的迁移原语在本仓叫 setManualDisabledLocked（见文件末尾），语义与上游
+// pauseLocked/resumeLocked 逐字一致，只多一个 reason 参数。
+
 // reviveCoolingLocked 余额恢复解冻：只清**余额耗尽冷却**（CoolHard 的
 // until/coolKind/reason）并更新 credits/creditsTotal。
 //

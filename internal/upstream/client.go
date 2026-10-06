@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -34,7 +35,7 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
@@ -708,6 +709,12 @@ func Classify(status int, body string) ErrKind {
 		if contentBlockedRule.hit(body, lower) {
 			return ErrContentBlocked
 		}
+		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
+		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
 		}
@@ -1421,9 +1428,30 @@ type ModelInfo struct {
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
 // FetchModels 与 global_models.go 的探测共用。iconUrl/descriptionEn/生成参数等
 // 按「不透出」原则不解析（任务书 §不透出字段）。
+// codeBuddyIDEUA /v3/config 的 IDE UA：该端点对不同 UA 下发**不同模型集合**。
+// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 返回单条字段更全的目录
+// （响应体积更大）。版本号需随上游 IDE 发版跟进。
+// [上游 dbd7c68..origin/main 新增——三路 UA 探测]
+const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
+
+// codeBuddyCLIUA /v3/config 的 CLI 三段式 UA。实测（上游 2026-09-22，本仓 2026-10-02 复核）：
+//   - IDE UA    → 13 条，独有 o4-mini / enhance-1.0 / auto-chat / nes-1.1 / nes-1.2 /
+//     completion-1.0 / codewise-jump / hunyuan-image-alpha
+//   - CLI UA    → 22 条，独有 0（全部被桌面端 + IDE 覆盖）
+//   - 桌面端 UA → 29 条，独有 gpt-6-luna / gpt-6-sol / grok-4.7 / gemini-3.8-flash 等
+//
+// ⚠️ 旧注释称「CLI UA 拿精简目录、IDE UA 才完整」——实测**模型数量恰好相反**；
+// 但 IDE 响应体积更大（单条字段更全）。两路各有独有模型，缺一不可。
+const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
+
 type dynModelEntry struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// ModelID / Model 是 id 的宽松回退键（仅 global 目录的多信封兜底用，CN 目录
+	// 不下发这两个键；字段加在这里只是让 typed 解析能"看见"它们）。
+	// [上游 dbd7c68..origin/main 新增——三路 UA 探测的解析依赖]
+	ModelID         string   `json:"modelId"`
+	Model           string   `json:"model"`
 	Description     string   `json:"descriptionZh"`
 	Credits         string   `json:"credits"`
 	Tags            []string `json:"tags"`
@@ -1501,7 +1529,13 @@ func (c *Client) modelsPath(a *auth.Auth) string {
 // 来源：harness buddy.ts:547-555。三类规则：
 //   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
 //   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
-//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+//   - tags 含生成类标签（图片/视频）：生成模型走各自专用端点，作为对话模型
+//     选上去只会报 11102，非本网关用途。
+//
+// 生成类标签随上游扩充：早期只有 text-to-image，桌面端目录（2026-10-02 实测）
+// 另有 text-to-video / image-to-video（seedance 系列）与 image-to-image
+// （gpt-image 系列）——后者已由 text-to-image 覆盖，此处补齐视频两类。
+// 注意本函数 CN 与 global 共用，新增标签对两域同时生效。
 func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
@@ -1513,7 +1547,8 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 		return true
 	}
 	for _, t := range tags {
-		if t == "text-to-image" {
+		switch t {
+		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
 	}
@@ -1605,6 +1640,127 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 		out = append(out, mi)
 	}
 	return out
+}
+
+// v3ConfigDomain 计算 /v3/config 的 X-Domain 头：账号 domain 优先（去 scheme/尾斜杠），
+// 缺失时从 chatBase 取 host，再兜底 copilot.tencent.com。
+// [上游 dbd7c68..origin/main 新增——三路 UA 探测]
+func v3ConfigDomain(a *auth.Auth, chatBase string) string {
+	if a != nil {
+		// Domain 加锁快照（见 auth.DomainValue：keepalive 刷新在 a.mu 内改写）。
+		if d := strings.TrimSpace(a.DomainValue()); d != "" {
+			d = strings.TrimPrefix(d, "https://")
+			d = strings.TrimPrefix(d, "http://")
+			return strings.TrimSuffix(d, "/")
+		}
+	}
+	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return "copilot.tencent.com"
+}
+
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	if a != nil && a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
+	req.Header.Set("X-Product", "SaaS")
+	if ua == "" {
+		ua = codeBuddyIDEUA
+	}
+	req.Header.Set("User-Agent", ua)
+	c.injectCodeBuddyRequest(req)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	var env struct {
+		Code int `json:"code"`
+		Data struct {
+			Models []dynModelEntry `json:"models"`
+			// 试用模型横幅：上游把「N 天免费试用」的模型放在这里，**不在 data.models 里**。
+			// 实测 global 侧 hy4-preview-f 只出现在此（modelId=hy4-preview-f、
+			// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
+			ProductFeaturesConfig struct {
+				ModelTrialBanner struct {
+					Banners []struct {
+						ModelID       string `json:"modelId"`
+						TargetModelID string `json:"targetModelId"`
+					} `json:"banners"`
+				} `json:"ModelTrialBanner"`
+			} `json:"productFeaturesConfig"`
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("v3/config parse: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, fmt.Errorf("v3/config code=%d", env.Code)
+	}
+	out := make(map[string]ModelInfo, len(env.Data.Models))
+	for _, m := range env.Data.Models {
+		if strings.TrimSpace(m.ID) == "" {
+			continue
+		}
+		out[m.ID] = m.modelInfo()
+	}
+	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，
+	// data.models 里没有，故纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，
+	// 但该模型**实际可调用**）。
+	//
+	// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
+	// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
+	// 但 **Credits 与 Tags 显式清空**——它们描述的是"转正后"的计费与营销信息
+	// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
+	//
+	// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
+	for _, b := range env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners {
+		id := strings.TrimSpace(b.ModelID)
+		if id == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		mi := ModelInfo{ID: id}
+		if tgt := strings.TrimSpace(b.TargetModelID); tgt != "" {
+			if base, ok := out[tgt]; ok {
+				mi = base
+				mi.ID = id
+			}
+		}
+		mi.Credits = ""
+		mi.Tags = nil
+		out[id] = mi
+	}
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
+	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
+	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
+	applyModelPromotions(out, env.Data.ModelPromotions)
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("v3/config returned empty models")
+	}
+	return out, nil
 }
 
 // fetchEnterpriseModels 单路探测企业模型端点（CN → /console/enterprises/personal/models；
@@ -2165,8 +2321,9 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
-	// 按优先级取首个有值字段）。[上游 dbd7c68..origin/main]
+	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
+	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
+	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
@@ -2221,6 +2378,12 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
 					CycleEndTime   string `json:"CycleEndTime"`
+					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
+					// 不能再花」的真失效时刻。CycleEndTime 是周期边界（额度重置点），
+					// 两者语义不同：判「用不完就没了」以本字段为准，CycleEndTime 兜底
+					//（OkRoromori 分支实测结论：请求参数叫 PackageEndTimeRange*，但
+					// 响应里 ExpiredTime 恒空，真正的失效时刻只有这里下发）。
+					DeductionEndTime int64 `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -2244,6 +2407,13 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductName: p.SubProductName,
 		}
 		switch {
+		case p.DeductionEndTime > 0:
+			// 真失效时刻（可抵扣窗口结束），语义见上方字段注释：判「用不完就没了」
+			// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
+			// 共存（前端统一 slice(0,10) 取日期）。ExpiresAt 直接用原始毫秒——
+			// RFC3339 不是 packageEndLayout 形态，交给下方解析会静默失败得 0。
+			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
+			cp.ExpiresAt = p.DeductionEndTime
 		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
 		case p.PackageEndTime != "":
@@ -2251,7 +2421,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		default:
 			cp.EndTime = p.CycleEndTime
 		}
-		if cp.EndTime != "" {
+		if cp.ExpiresAt == 0 && cp.EndTime != "" {
 			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
 				cp.ExpiresAt = end.UnixMilli()
 			}

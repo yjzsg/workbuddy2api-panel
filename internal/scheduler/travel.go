@@ -62,6 +62,10 @@ func travelDay(t time.Time) string {
 // 测试与潜在的手动触发——cmd 侧从未接线，不存在 cmd/travel 入口，部署验证
 // 场景由 RunActivityNow 覆盖）。内部走 runTravel，取背景 ctx（不可取消，
 // 语义与引入前 time.Sleep 版一致）。
+//
+// 禁用账号跳过；手动停用（manual_disabled）账号**照常参与**——旅行是纯 RPC
+//（状态/派出/领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突。
+// [上游 dbd7c68..origin/main 的 paused 同口径说明，术语换成本仓 manual_disabled]
 func (s *Scheduler) RunTravelNow() {
 	s.runTravel(context.Background())
 }

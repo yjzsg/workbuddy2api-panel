@@ -42,12 +42,14 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区；旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 3
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
+// 旧版本缺失字段按零值加载，旧数据不会丢弃。
+const fileVersion = 4
 
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
+<<<<<<< /tmp/tmpvntin3rm/o
 	Scope string  `json:"s"`           // "h:2006-01-02T15" 或 "d:2006-01-02"
 	Realm string  `json:"r"`           // cn / global
 	UID   string  `json:"u"`           // 账号 uid
@@ -71,6 +73,45 @@ type bucket struct {
 	CR  float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
 	CRN int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
 	CRT int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+||||||| /tmp/tmpvntin3rm/b
+	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`            // cn / global
+	UID   string  `json:"u"`            // 账号 uid
+	Model string  `json:"m"`            // 上游裸模型名
+	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`            // 请求数（含失败）
+	Err   int64   `json:"e"`            // 失败数
+	PT    int64   `json:"p"`            // prompt tokens
+	CT    int64   `json:"c"`            // completion tokens
+	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`            // 延迟累计（ms）
+	LatN  int64   `json:"ln"`           // 延迟样本数
+	TPS   float64 `json:"v"`            // 吐字速率累计
+	TPSN  int64   `json:"vn"`           // 速率样本数
+	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
+	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
+	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+=======
+	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`            // cn / global
+	UID   string  `json:"u"`            // 账号 uid
+	Model string  `json:"m"`            // 上游裸模型名
+	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`            // 请求数（含失败）
+	Err   int64   `json:"e"`            // 失败数
+	PT    int64   `json:"p"`            // prompt tokens
+	CT    int64   `json:"c"`            // completion tokens
+	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`            // 延迟累计（ms）
+	LatN  int64   `json:"ln"`           // 延迟样本数
+	TPS   float64 `json:"v"`            // 吐字速率累计
+	TPSN  int64   `json:"vn"`           // 速率样本数
+	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
+	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
+	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
+	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+>>>>>>> /tmp/tmpvntin3rm/t
 }
 
 // file 落盘结构。
@@ -151,11 +192,19 @@ type Delta struct {
 	Credit           float64
 	HasCredit        bool
 	ModelRate        string
+<<<<<<< /tmp/tmpvntin3rm/o
 	// prompt cache 三段。计数器语义（缺失即 0），**不设 Has 标志**：
 	// 上游同一帧里给不给这三项就是"有没有观测"，而我们无法区分"没给"与"给了 0"。
 	CacheHitTokens   int64
 	CacheMissTokens  int64
 	CacheWriteTokens int64
+||||||| /tmp/tmpvntin3rm/b
+=======
+	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
+	HasCacheTokens   bool
+	CacheHitTokens   int64
+	CacheMissTokens  int64
+>>>>>>> /tmp/tmpvntin3rm/t
 	LatencyMs        int64
 	HasLatency       bool
 	TokensPerSecond  float64
@@ -216,6 +265,10 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		} else if d.HasPromptTokens || d.HasCompletion {
 			b.CRT += d.PromptTokens + d.CompletionTokens
 		}
+	}
+	if d.HasCacheTokens {
+		b.CH += d.CacheHitTokens
+		b.CM += d.CacheMissTokens
 	}
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
@@ -280,6 +333,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.CR += src.CR
 			dst.CRN += src.CRN
 			dst.CRT += src.CRT
+			dst.CH += src.CH
+			dst.CM += src.CM
 		}
 		delete(r.buckets, m.from)
 	}
@@ -362,6 +417,9 @@ type Agg struct {
 	CreditSamples      int64   `json:"credit_samples"`
 	CreditTokens       int64   `json:"credit_tokens"`
 	CreditsPer1MTokens float64 `json:"credits_per_1m_tokens"`
+	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
+	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
 	AvgLatencyMs       float64 `json:"avg_latency_ms"`
 	AvgTPS             float64 `json:"avg_tokens_per_second"`
 	CacheHitTokens     int64   `json:"cache_hit_tokens"`
@@ -393,7 +451,11 @@ func (g *aggAcc) add(b *bucket) {
 	g.CreditTokens += b.CRT
 	g.CacheHitTokens += b.CH
 	g.CacheMissTokens += b.CM
+<<<<<<< /tmp/tmpvntin3rm/o
 	g.CacheWriteTokens += b.CW
+||||||| /tmp/tmpvntin3rm/b
+=======
+>>>>>>> /tmp/tmpvntin3rm/t
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -411,8 +473,14 @@ func (g *aggAcc) finish() Agg {
 	if g.CreditTokens > 0 {
 		a.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * 1_000_000
 	}
+<<<<<<< /tmp/tmpvntin3rm/o
 	if d := g.CacheHitTokens + g.CacheMissTokens; d > 0 {
 		a.CacheHitRate = float64(g.CacheHitTokens) / float64(d)
+||||||| /tmp/tmpvntin3rm/b
+=======
+	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
+		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total) * 100
+>>>>>>> /tmp/tmpvntin3rm/t
 	}
 	return a
 }
@@ -444,6 +512,9 @@ type CreditAgg struct {
 	CreditSamples      int64   `json:"credit_samples"`
 	CreditTokens       int64   `json:"credit_tokens"`
 	CreditsPer1MTokens float64 `json:"credits_per_1m_tokens"`
+	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
+	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
 }
 
 type creditAcc struct {
@@ -455,12 +526,17 @@ func (a *creditAcc) add(b *bucket) {
 	a.Credits += b.CR
 	a.CreditSamples += b.CRN
 	a.CreditTokens += b.CRT
+	a.CacheHitTokens += b.CH
+	a.CacheMissTokens += b.CM
 }
 
 func (a *creditAcc) finish() CreditAgg {
 	out := a.CreditAgg
 	if a.CreditTokens > 0 {
 		out.CreditsPer1MTokens = a.Credits / float64(a.CreditTokens) * 1_000_000
+	}
+	if total := a.CacheHitTokens + a.CacheMissTokens; total > 0 {
+		out.CacheHitRate = float64(a.CacheHitTokens) / float64(total) * 100
 	}
 	return out
 }

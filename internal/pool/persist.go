@@ -171,6 +171,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			credits:                  s.Credits,
 			creditsTotal:             s.CreditsTotal,
 			disabled:                 s.Disabled,
+			// 注：本仓用 manualDisabled/manual_reason（上游用 paused/Paused）——
+			// 上游的 paused 回填在本仓无对应字段，见 transition.go 的语义说明。
 			reason:                   s.Reason,
 			manualDisabled:           s.ManualDisabled,
 			manualReason:             s.ManualReason,

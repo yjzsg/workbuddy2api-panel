@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -159,6 +160,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -248,6 +251,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
+		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
+		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
+		"model_locks":  p.cfg.Pool.ModelLockView(),
 	})
 }
 
@@ -477,6 +483,30 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// accountPause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 /
+// 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
+// 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
+func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Pause(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
+func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Resume(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -625,8 +655,64 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Scheduler.RunBalanceRefreshNow()
+	p.syncNicknames()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+}
+
+// syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
+// 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
+// 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
+// upstream.FetchAccountProfile 内即被丢弃）；单号失败静默跳过，不打断余额刷新
+// 的既有结果。
+func (p *Panel) syncNicknames() {
+	type job struct {
+		uid string
+		a   *auth.Auth
+	}
+	var jobs []job
+	for _, st := range p.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
+			jobs = append(jobs, job{uid: st.UID, a: a})
+		}
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	var (
+		mu       sync.Mutex
+		updated  int
+		failed   int
+		sem      = make(chan struct{}, 3)
+		wg       sync.WaitGroup
+	)
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+			if err != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			if p.cfg.Pool.SetNickname(j.uid, nick) {
+				mu.Lock()
+				updated++
+				mu.Unlock()
+			}
+		}(j)
+	}
+	wg.Wait()
+	if updated > 0 || failed > 0 {
+		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
+	}
 }
 
 // ---------------------------------------------------------------------------

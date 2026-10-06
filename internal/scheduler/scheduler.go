@@ -55,6 +55,13 @@ type Config struct {
 	KeepaliveDisabled bool
 	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
 	GrowthDisabled bool
+
+	// IncludeDisabledInTasks 让「保号类」四任务（签到 / 活跃上报 / token 保活 / 余额刷新）
+	// 对已禁用（disabled）的账号也执行（schedule.include_disabled_in_tasks）。
+	// 缺省 false = 保持「禁用的跳过」既有语义；打开后禁用号照常签到保号，但**仍不参与
+	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
+	// [上游 dbd7c68..origin/main 新增]
+	IncludeDisabledInTasks bool
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号待办
 	// 并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
@@ -439,9 +446,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
+	// include_disabled_in_tasks：禁用号默认跳过，打开后一并签到保号（轮换用法）。
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range statuses {
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			oc.Status, oc.Detail = CheckinSkipped, "disabled"
 			skipN++
 			out = append(out, oc)
@@ -572,8 +581,9 @@ func (s *Scheduler) RunActivityNow() {
 func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
 	first := true
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -809,8 +819,9 @@ func (s *Scheduler) markRewardClaimed(uid string) {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -820,7 +831,8 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			// 已禁用的号不再重复计数：它已是终态，再计一次只会打出「— 禁用」的误导日志。
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
@@ -847,8 +859,11 @@ func (s *Scheduler) RunKeepaliveNow() {
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
+	// 注意 ReenableIfCredits 对 disabled 是 no-op，所以本开关**不会**让禁用号被
+	// 自动解冻——它只让已有账号的积分保持新鲜（轮换用法下判断下一个该启用谁）。
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -908,6 +923,25 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// includeDisabledInTasks 返回保号类任务是否应覆盖禁用账号（配置快照，供循环开头取一次）。
+// [上游 dbd7c68..origin/main 新增]
+func (s *Scheduler) includeDisabledInTasks() bool {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.IncludeDisabledInTasks
+}
+
+// SetIncludeDisabledInTasks 热更新「保号类任务是否覆盖禁用账号」
+// （schedule.include_disabled_in_tasks）。
+// 用独立 setter 而非并入 Reconfigure：后者已有 13 个位置参数，继续追加会让调用点难以
+// 校对；本开关语义独立（只影响账号过滤，不影响时点），单独设值更清晰。
+// [上游 dbd7c68..origin/main 新增]
+func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
+	s.schedMu.Lock()
+	s.cfg.IncludeDisabledInTasks = v
 	s.schedMu.Unlock()
 }
 
