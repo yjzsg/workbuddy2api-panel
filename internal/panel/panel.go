@@ -253,7 +253,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"accounts":        p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
-		"model_locks":  p.cfg.Pool.ModelLockView(),
+		"model_locks": p.cfg.Pool.ModelLockView(),
 	})
 }
 
@@ -683,11 +683,11 @@ func (p *Panel) syncNicknames() {
 		return
 	}
 	var (
-		mu       sync.Mutex
-		updated  int
-		failed   int
-		sem      = make(chan struct{}, 3)
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		updated int
+		failed  int
+		sem     = make(chan struct{}, 3)
+		wg      sync.WaitGroup
 	)
 	for _, j := range jobs {
 		wg.Add(1)

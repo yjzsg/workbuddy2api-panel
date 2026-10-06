@@ -49,7 +49,6 @@ const fileVersion = 4
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-<<<<<<< /tmp/tmpvntin3rm/o
 	Scope string  `json:"s"`           // "h:2006-01-02T15" 或 "d:2006-01-02"
 	Realm string  `json:"r"`           // cn / global
 	UID   string  `json:"u"`           // 账号 uid
@@ -73,45 +72,6 @@ type bucket struct {
 	CR  float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
 	CRN int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
 	CRT int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-||||||| /tmp/tmpvntin3rm/b
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-=======
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
-	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
->>>>>>> /tmp/tmpvntin3rm/t
 }
 
 // file 落盘结构。
@@ -192,19 +152,13 @@ type Delta struct {
 	Credit           float64
 	HasCredit        bool
 	ModelRate        string
-<<<<<<< /tmp/tmpvntin3rm/o
-	// prompt cache 三段。计数器语义（缺失即 0），**不设 Has 标志**：
-	// 上游同一帧里给不给这三项就是"有没有观测"，而我们无法区分"没给"与"给了 0"。
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	CacheWriteTokens int64
-||||||| /tmp/tmpvntin3rm/b
-=======
-	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
+	// CacheHitTokens / CacheMissTokens / CacheWriteTokens 前缀缓存观测。
+	// HasCacheTokens 区分「上游没给该维度」与「给了 0」（上游 issue #92 口径）。
+	// CacheWriteTokens 是本仓独有的第三段（缓存写入，上游只有命中/未命中两段）。
 	HasCacheTokens   bool
 	CacheHitTokens   int64
 	CacheMissTokens  int64
->>>>>>> /tmp/tmpvntin3rm/t
+	CacheWriteTokens int64
 	LatencyMs        int64
 	HasLatency       bool
 	TokensPerSecond  float64
@@ -252,9 +206,6 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		// 上游没给 total：用 pt+ct 兜底，保证总量口径连续。
 		b.TT += d.PromptTokens + d.CompletionTokens
 	}
-	b.CH += d.CacheHitTokens
-	b.CM += d.CacheMissTokens
-	b.CW += d.CacheWriteTokens
 	if d.HasCredit {
 		b.CR += d.Credit
 		b.CRN++
@@ -270,6 +221,8 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.CH += d.CacheHitTokens
 		b.CM += d.CacheMissTokens
 	}
+	// CW 是本仓独有第三段：无 Has 标志（缺失即 0，且不参与命中率分母）。
+	b.CW += d.CacheWriteTokens
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
 		b.LatN++
@@ -419,15 +372,14 @@ type Agg struct {
 	CreditsPer1MTokens float64 `json:"credits_per_1m_tokens"`
 	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
-	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
-	AvgLatencyMs       float64 `json:"avg_latency_ms"`
-	AvgTPS             float64 `json:"avg_tokens_per_second"`
-	CacheHitTokens     int64   `json:"cache_hit_tokens"`
-	CacheMissTokens    int64   `json:"cache_miss_tokens"`
-	CacheWriteTokens   int64   `json:"cache_write_tokens"`
-	// CacheHitRate = 命中 / (命中 + 未命中)，分母为 0 时留 0。
-	// **不含 write**：写入是"为后续命中付的费"。前端用 hit+miss==0 判"无观测"。
-	CacheHitRate float64 `json:"cache_hit_rate"`
+	// CacheWriteTokens 本仓独有第三段：缓存写入 token（上游只有命中/未命中两段）。
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+	// CacheHitRate = 命中 / (命中 + 未命中) × 100（**百分比**，与上游 usage.go 同口径），
+	// 分母为 0 时留 0。**不含 write**：写入是"为后续命中付的费"。
+	// 前端用 hit+miss==0 判"无观测"（见 app.js 的 usRate 注释）。
+	CacheHitRate float64 `json:"cache_hit_rate,omitempty"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	AvgTPS       float64 `json:"avg_tokens_per_second"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -451,11 +403,7 @@ func (g *aggAcc) add(b *bucket) {
 	g.CreditTokens += b.CRT
 	g.CacheHitTokens += b.CH
 	g.CacheMissTokens += b.CM
-<<<<<<< /tmp/tmpvntin3rm/o
 	g.CacheWriteTokens += b.CW
-||||||| /tmp/tmpvntin3rm/b
-=======
->>>>>>> /tmp/tmpvntin3rm/t
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -473,14 +421,8 @@ func (g *aggAcc) finish() Agg {
 	if g.CreditTokens > 0 {
 		a.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * 1_000_000
 	}
-<<<<<<< /tmp/tmpvntin3rm/o
-	if d := g.CacheHitTokens + g.CacheMissTokens; d > 0 {
-		a.CacheHitRate = float64(g.CacheHitTokens) / float64(d)
-||||||| /tmp/tmpvntin3rm/b
-=======
 	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
 		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total) * 100
->>>>>>> /tmp/tmpvntin3rm/t
 	}
 	return a
 }

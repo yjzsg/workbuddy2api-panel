@@ -895,7 +895,6 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 }
 
-<<<<<<< /tmp/tmppp6wa004/o
 func TestBalanceRefreshDefaults(t *testing.T) {
 	// 缺省：启用 + 30 分钟
 	c := Default()
@@ -947,8 +946,8 @@ func TestPromptDefaultPassthrough(t *testing.T) {
 		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
 	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
-||||||| /tmp/tmppp6wa004/b
-=======
+}
+
 // TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
 // "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
 func TestServerReadTimeout(t *testing.T) {
@@ -992,5 +991,4 @@ func TestServerReadTimeout(t *testing.T) {
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
 	}
->>>>>>> /tmp/tmppp6wa004/t
 }

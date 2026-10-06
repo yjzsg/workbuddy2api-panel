@@ -919,7 +919,7 @@ func TestRunCheckinIncludesDisabledWhenConfigured(t *testing.T) {
 		t.Errorf("禁用号签到后不应被自动解冻: %+v", st)
 	}
 	// 选号侧不受本开关影响：禁用号依旧不可选。
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
 		t.Errorf("选号应仍只给 u1, got %+v", got)
 	}
 }
@@ -1015,11 +1015,11 @@ func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
 		t.Errorf("暂停号 credits=%d want 700（余额刷新应覆盖）", st.Credits)
 	}
 	// 保号任务不得改变暂停状态（签到解冻的是冷却，不是 paused）
-	if st, _ := p.Status("u2"); !st.Paused {
+	if st, _ := p.Status("u2"); !st.ManualDisabled {
 		t.Errorf("保号任务后暂停状态应保持: %+v", st)
 	}
 	// 选号侧始终排除暂停号
-	if got := p.Pick(); got == nil || got.UID != "u1" {
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
 		t.Errorf("选号应只给 u1, got %+v", got)
 	}
 }
@@ -1047,7 +1047,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
 	}
 }
-
 
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的

@@ -65,13 +65,15 @@ func TestGlobalModelsMergeV3PrimaryV2Supplement(t *testing.T) {
 	names := c.FetchGlobalModels(globalAcct())
 	infos := c.FetchGlobalModelInfos(globalAcct())
 
-	// 两路并发各一次（v2 200 → 不打 /console）。
-	if len(calls) != 2 {
-		t.Fatalf("probe calls=%v want 2 (v3 + v2)", calls)
+	// 四路并发各一次（3x v3/config UA + v2；v2 200 → 不打 /console）。
+	if len(calls) != 4 {
+		t.Fatalf("probe calls=%v want 4 (3x v3 UA + v2)", calls)
 	}
 
-	// 名单：v3 原序（glm-5.2, hy4-preview, deepseek-v4.1-flash）+ v2 补充（gpt-5.3-codex）。
-	want := []string{"glm-5.2", "hy4-preview", "deepseek-v4.1-flash", "gpt-5.3-codex"}
+	// 名单：v3 三路 UA 合并（probeV3 内 sort.Strings 保证稳定字母序）
+	// + v2 补充（gpt-5.3-codex）。上游 desktop-ua 起 probeV3 显式排序，
+	// 本仓对齐（并补了 infos 同序，见 probeV3 注释）。
+	want := []string{"deepseek-v4.1-flash", "glm-5.2", "hy4-preview", "gpt-5.3-codex"}
 	if !sameStrings(names, want) {
 		t.Fatalf("merged names=%v want %v (v3 primary order + v2 supplement)", names, want)
 	}
@@ -108,8 +110,8 @@ func TestGlobalModelsMergeV3FailDegradesToV2(t *testing.T) {
 	names := globalModelsClient(t, srv).FetchGlobalModels(globalAcct())
 
 	// v3 400 + v2 200：降级为 v2 结果（v3 不拖累）。
-	if len(calls) != 2 {
-		t.Fatalf("probe calls=%v want 2 (v3 attempted + v2 succeeded)", calls)
+	if len(calls) != 4 {
+		t.Fatalf("probe calls=%v want 4 (3x v3 UA attempted + v2 succeeded)", calls)
 	}
 	want := []string{"glm-5.2", "hy4-preview", "gpt-5.3-codex"}
 	if !sameStrings(names, want) {
@@ -163,7 +165,8 @@ func TestGlobalModelsMergeStableOutput(t *testing.T) {
 	if !sameStrings(first, second) {
 		t.Fatalf("merge output unstable: %v vs %v", first, second)
 	}
-	want := []string{"glm-5.2", "hy4-preview", "deepseek-v4.1-flash", "gpt-5.3-codex"}
+	// probeV3 内 sort.Strings → 稳定字母序（本仓对齐上游）。
+	want := []string{"deepseek-v4.1-flash", "glm-5.2", "hy4-preview", "gpt-5.3-codex"}
 	if !sameStrings(first, want) {
 		t.Fatalf("names=%v want %v", first, want)
 	}

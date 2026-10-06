@@ -276,8 +276,9 @@ func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	// 上游 dbd7c68..origin/main：11101 归请求级错误，fail-fast 400 透传原文（不再轮转后 503）。
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: 11101 fail-fast)", rec.Code, rec.Body)
 	}
 	var e struct {
 		Error struct {
@@ -335,7 +336,6 @@ func TestChatLocalNoAccountKeepsOwnMessage(t *testing.T) {
 		t.Errorf("message=%q want fixed local scheduling message (no upstream to passthrough)", e.Error.Message)
 	}
 }
-
 
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1724,17 +1724,18 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	// 双号都被 6004 → 全部换完仍限流。末端错误已规范化（冷启动重构）：限流语义
-	// 映射为 429 rate_limit_exceeded（不再原样 503 透传上游原文），换号过程已把 u1 冷却。
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("code=%d want 429 body=%s", rec.Code, rec.Body)
+	// 双号都被 6004 → 全池该模型被锁。上游 #102：模型级阻塞不再伪装成
+	// no_healthy_account，改回 model_unavailable + 400（客户端该换模型而非重试）。
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (model_unavailable) body=%s", rec.Code, rec.Body)
 	}
 	var e map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
-	if errObj, _ := e["error"].(map[string]any); errObj == nil || errObj["code"] != "rate_limit_exceeded" {
-		t.Fatalf("want rate_limit_exceeded envelope: %s", rec.Body)
+	// 上游 #102：全池模型级阻塞回 model_unavailable（400），不再是 rate_limit_exceeded。
+	if errObj, _ := e["error"].(map[string]any); errObj == nil || errObj["code"] != "model_unavailable" {
+		t.Fatalf("want model_unavailable envelope: %s", rec.Body)
 	}
 	// u1 被选中过（已冷却 + 有台账）。
 	st, ok := p.Status("u1")

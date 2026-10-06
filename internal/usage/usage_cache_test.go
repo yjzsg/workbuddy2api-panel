@@ -13,11 +13,13 @@ func TestCacheTokensRecordedAndAggregated(t *testing.T) {
 	r := New("")
 	now := time.Now()
 	r.Add(now, "global", "u1", "deepseek-v4.1-flash", Delta{
-		PromptTokens: 1000, HasPromptTokens: true,
+		HasCacheTokens: true,
+		PromptTokens:   1000, HasPromptTokens: true,
 		CacheHitTokens: 800, CacheMissTokens: 200, CacheWriteTokens: 50,
 	}, true)
 	r.Add(now, "global", "u1", "deepseek-v4.1-flash", Delta{
-		PromptTokens: 1000, HasPromptTokens: true,
+		HasCacheTokens: true,
+		PromptTokens:   1000, HasPromptTokens: true,
 		CacheHitTokens: 1000, CacheMissTokens: 0, CacheWriteTokens: 0,
 	}, true)
 
@@ -26,7 +28,8 @@ func TestCacheTokensRecordedAndAggregated(t *testing.T) {
 		t.Fatalf("cache = %d/%d/%d, want 1800/200/50",
 			s.Totals.CacheHitTokens, s.Totals.CacheMissTokens, s.Totals.CacheWriteTokens)
 	}
-	want := 1800.0 / 2000.0
+	// 量纲为百分比（0~100，与上游 usage.go 同口径；前端 app.js usRate 已同步）。
+	want := 1800.0 / 2000.0 * 100
 	if d := s.Totals.CacheHitRate - want; d > 1e-9 || d < -1e-9 {
 		t.Fatalf("hit rate = %v, want %v（分母不含 write）", s.Totals.CacheHitRate, want)
 	}
@@ -56,9 +59,11 @@ func TestCacheHitRateZeroWhenNoObservation(t *testing.T) {
 func TestCacheSurvivesRollup(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 超出小时保留窗口 → 会被折叠成日桶
-	r.Add(old, "global", "u", "m", Delta{PromptTokens: 10, HasPromptTokens: true,
+	r.Add(old, "global", "u", "m", Delta{
+		HasCacheTokens: true, PromptTokens: 10, HasPromptTokens: true,
 		CacheHitTokens: 900, CacheMissTokens: 100, CacheWriteTokens: 30}, true)
-	r.Add(old, "global", "u", "m", Delta{PromptTokens: 10, HasPromptTokens: true,
+	r.Add(old, "global", "u", "m", Delta{
+		HasCacheTokens: true, PromptTokens: 10, HasPromptTokens: true,
 		CacheHitTokens: 500, CacheMissTokens: 500, CacheWriteTokens: 20}, true)
 
 	r.Rollup(time.Now())
@@ -80,7 +85,8 @@ func TestCacheSurvivesRollup(t *testing.T) {
 func TestCachePersistsAcrossReload(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "usage.json")
 	r := New(p)
-	r.Add(time.Now(), "global", "u", "m", Delta{PromptTokens: 100, HasPromptTokens: true,
+	r.Add(time.Now(), "global", "u", "m", Delta{
+		HasCacheTokens: true, PromptTokens: 100, HasPromptTokens: true,
 		CacheHitTokens: 77, CacheMissTokens: 23, CacheWriteTokens: 11}, true)
 	r.Save()
 

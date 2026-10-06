@@ -81,9 +81,9 @@ func TestFetchGlobalModelsProbePureDynamic(t *testing.T) {
 	if !strings.HasPrefix(srv.URL, "http://") {
 		t.Fatal("unexpected srv.URL")
 	}
-	// v3-config-merge：/v3/config（主）+ /v2（企业首选）各一次，v2 200 即不打 /console。
-	if len(calls) != 2 || !containsStr(calls, "/v3/config") || !containsStr(calls, "/v2/enterprises/personal/models") {
-		t.Fatalf("probe calls=%v want [/v3/config /v2/enterprises/personal/models]", calls)
+	// desktop-ua：/v3/config 三路 UA（桌面端 + IDE + CLI）+ /v2（企业首选）各一次，v2 200 即不打 /console。
+	if len(calls) != 4 || !containsStr(calls, "/v3/config") || !containsStr(calls, "/v2/enterprises/personal/models") {
+		t.Fatalf("probe calls=%v want 4 calls: 3x /v3/config (desktop/IDE/CLI UA) + /v2/enterprises/personal/models", calls)
 	}
 	if gotAuthz != "Bearer at" {
 		t.Errorf("probe authz=%q want Bearer at", gotAuthz)
@@ -119,11 +119,11 @@ func TestFetchGlobalModelsFailureReturnsNil(t *testing.T) {
 
 	got := globalModelsClient(t, srv).FetchGlobalModels(globalAcct())
 
-	// v3 一路 + 企业家族两路（v2 500 → console 500）= 3 个请求。
-	if len(calls) != 3 || !containsStr(calls, "/v3/config") ||
+	// v3 三路 UA + 企业家族两路（v2 500 → console 500）= 5 个请求。
+	if len(calls) != 5 || !containsStr(calls, "/v3/config") ||
 		!containsStr(calls, "/v2/enterprises/personal/models") ||
 		!containsStr(calls, "/console/enterprises/personal/models") {
-		t.Fatalf("fallback calls=%v want [/v3/config /v2/... /console/...]", calls)
+		t.Fatalf("fallback calls=%v want 5 calls: 3x /v3/config + /v2/... + /console/...", calls)
 	}
 	if len(got) != 0 {
 		t.Errorf("failure result=%v want empty (no static fallback)", got)
@@ -145,8 +145,8 @@ func TestFetchGlobalModelsCache(t *testing.T) {
 	first := c.FetchGlobalModels(globalAcct())
 	second := c.FetchGlobalModels(globalAcct())
 
-	if len(calls) != 2 {
-		t.Errorf("cache: probe calls=%d want 2 (v3+v2 once, second hit cache)", len(calls))
+	if len(calls) != 4 {
+		t.Errorf("cache: probe calls=%d want 4 (3x v3 UA + v2 once, second hit cache)", len(calls))
 	}
 	if !reflect.DeepEqual(first, second) {
 		t.Errorf("cached result differs from first")
@@ -169,8 +169,8 @@ func TestFetchGlobalModelsNegativeCache(t *testing.T) {
 	second := c.FetchGlobalModels(globalAcct())
 
 	// 首次 = v3 + 企业家族（v2+console）= 3 个请求；负缓存内二次零新请求。
-	if len(calls) != 3 {
-		t.Errorf("negative cache: probe calls=%d want 3 (v3 + family attempted once)", len(calls))
+	if len(calls) != 5 {
+		t.Errorf("negative cache: probe calls=%d want 5 (3x v3 UA + v2 + console attempted once)", len(calls))
 	}
 	if len(first) != 0 || len(second) != 0 {
 		t.Errorf("negative-cache results should be empty (no static fallback): %v %v", first, second)

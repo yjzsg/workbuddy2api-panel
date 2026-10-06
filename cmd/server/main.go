@@ -375,24 +375,12 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
-<<<<<<< /tmp/tmp1nxicl0d/o
-		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// max_body_mb 已移除（请求体无上限，交由上游自然响应），超大 body 成为
-		// 唯一的自然约束：60s 内传不完会得到连接错误（read timeout）而非 413。
-		ReadTimeout: 60 * time.Second,
-||||||| /tmp/tmp1nxicl0d/b
-		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 请求体已无网关侧上限（max_body_mb 移除），60s 按常规带宽的数十 MB
-		// 上传余量取值；超大 body 慢速上传若超时，由客户端重试。
-		ReadTimeout: 60 * time.Second,
-=======
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
 		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
 		// 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端收到
 		// 400 "read body: ... i/o timeout"）；server.read_timeout="0" 显式关闭。
 		// 改动需重启进程。
 		ReadTimeout: cfg.ServerReadTimeoutDur,
->>>>>>> /tmp/tmp1nxicl0d/t
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
@@ -569,13 +557,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
 		!newCfg.Schedule.GrowthEnabled, !newCfg.Schedule.DailyChatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-<<<<<<< /tmp/tmp1nxicl0d/o
 	sch.SetCNInvite(newCfg.Schedule.CNInviteCode, newCfg.Schedule.CNInviteHours,
 		newCfg.Schedule.CNInviteUntil, !newCfg.Schedule.CNInviteEnabled)
-||||||| /tmp/tmp1nxicl0d/b
-=======
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
->>>>>>> /tmp/tmp1nxicl0d/t
 
 	return restartRequiredFields(newCfg), nil
 }

@@ -57,13 +57,9 @@ docs/
 /cmd/desktopverify*/
 *.zip
 server.exe
-<<<<<<< /tmp/tmpvglz9e3w/o
 
 # 本地备份（换基/调试期间的手工备份，勿入库）
 Dockerfile.bak*
 Dockerfile.orig
 docker-compose.yml.bak*
-||||||| /tmp/tmpvglz9e3w/b
-=======
 .DS_Store
->>>>>>> /tmp/tmpvglz9e3w/t

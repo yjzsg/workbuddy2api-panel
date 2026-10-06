@@ -64,7 +64,7 @@ func travelDay(t time.Time) string {
 // 语义与引入前 time.Sleep 版一致）。
 //
 // 禁用账号跳过；手动停用（manual_disabled）账号**照常参与**——旅行是纯 RPC
-//（状态/派出/领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突。
+// （状态/派出/领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突。
 // [上游 dbd7c68..origin/main 的 paused 同口径说明，术语换成本仓 manual_disabled]
 func (s *Scheduler) RunTravelNow() {
 	s.runTravel(context.Background())

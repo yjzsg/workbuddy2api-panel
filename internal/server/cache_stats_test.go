@@ -21,7 +21,7 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 	feedStatsLines(s,
 		`data: {"usage":{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005,"credit":0.1,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}`,
 	)
-	if hit, miss, ok := s.CacheTokens(); !ok || hit != 900 || miss != 100 {
+	if hit, miss, _, ok := s.CacheTokens(); !ok || hit != 900 || miss != 100 {
 		t.Fatalf("hit=%d miss=%d ok=%v, want 900/100/true", hit, miss, ok)
 	}
 
@@ -29,7 +29,7 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 	feedStatsLines(s2,
 		`data: {"usage":{"prompt_tokens":8500,"prompt_cache_hit_tokens":8400}}`,
 	)
-	if hit, miss, ok := s2.CacheTokens(); !ok || hit != 8400 || miss != 100 {
+	if hit, miss, _, ok := s2.CacheTokens(); !ok || hit != 8400 || miss != 100 {
 		t.Fatalf("derived miss: hit=%d miss=%d ok=%v, want 8400/100/true", hit, miss, ok)
 	}
 
@@ -37,7 +37,7 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 	feedStatsLines(s3,
 		`data: {"usage":{"prompt_tokens":100,"completion_tokens":5}}`,
 	)
-	if _, _, ok := s3.CacheTokens(); ok {
+	if _, _, _, ok := s3.CacheTokens(); ok {
 		t.Fatal("无缓存字段应 ok=false")
 	}
 }

@@ -1721,6 +1721,13 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		if strings.TrimSpace(m.ID) == "" {
 			continue
 		}
+		// disabled 模型剔除（本仓补，上游此路径漏了）：目录里被上游标记禁用的模型
+		// 选中即 11102，不应出现在 /v1/models（本仓
+		// TestFetchGlobalModelsProbePureDynamic 实测复现 disabled-y 泄漏）。
+		// 与 parseGlobalModelNames 的同名过滤口径一致。
+		if m.Disabled {
+			continue
+		}
 		out[m.ID] = m.modelInfo()
 	}
 	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，

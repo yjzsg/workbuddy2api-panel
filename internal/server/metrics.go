@@ -328,9 +328,12 @@ func fillStatFromUsage(st *chatStat, resp map[string]any) {
 	}
 	st.hasUsage = true
 	st.prompt = intFromUsage(u, "prompt_tokens")
-	st.cacheHit = intFromUsage(u, "prompt_cache_hit_tokens")
-	st.cacheMiss = intFromUsage(u, "prompt_cache_miss_tokens")
-	st.cacheWr = intFromUsage(u, "prompt_cache_write_tokens")
+	st.cacheHit = int64(intFromUsage(u, "prompt_cache_hit_tokens"))
+	st.cacheMiss = int64(intFromUsage(u, "prompt_cache_miss_tokens"))
+	st.cacheWr = int64(intFromUsage(u, "prompt_cache_write_tokens"))
+	if st.cacheHit > 0 || st.cacheMiss > 0 {
+		st.hasCache = true
+	}
 	if c, ok := u["credit"].(float64); ok {
 		st.credit = c
 		st.hasCredit = true

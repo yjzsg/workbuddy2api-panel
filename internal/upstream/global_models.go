@@ -210,6 +210,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 				outInfos = append(outInfos, mi)
 			}
 			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+			// ⚠️ outInfos 必须与 ids 同序（本仓补，上游漏了）：下游
+			// extractEfforts(v3.infos) 会**从 infos 反推 names**，infos 顺序即
+			// 输出顺序；不排会让 /v1/models 的 global 段顺序随 map 迭代序抖动
+			//（本仓 TestGlobalModelsMergeStableOutput 实测复现）。
+			sort.Slice(outInfos, func(i, j int) bool { return outInfos[i].ID < outInfos[j].ID })
 			ch <- probeResult{names: ids, infos: outInfos}
 		}()
 		return ch
@@ -258,6 +263,13 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
+		// ⚠️ 窄表兜底（本仓补，上游此分支漏了）：企业端点为纯 ID 数组时 infos 为空，
+		// extractEfforts 推不出任何 name → 名单整体丢失（本仓
+		// TestModelListGlobalNarrowContextLookup 实测复现）。后面「两路皆成功」的
+		// 分支有同样的 `len(entNames)==0 → enterprise.names` 兜底，此处对齐。
+		if len(names) == 0 {
+			names = enterprise.names
+		}
 		return names, infos, efforts, defaults, nil
 	}
 	if enterprise.err != nil {
@@ -520,13 +532,20 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 			mi := m.modelInfo()
 			mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
 			objInfos = append(objInfos, mi)
+			// effort 桶：supportedEfforts 数组优先；缺数组但 reasoning.effort 单档
+			// 非空 → 视作单档表。[本仓增强，上游此分支无单档回落]
 			if len(m.Reasoning.SupportedEfforts) > 0 {
 				if efforts == nil {
 					efforts = make(map[string][]string)
 				}
 				efforts[id] = m.Reasoning.SupportedEfforts
+			} else if e := strings.TrimSpace(m.Reasoning.Effort); e != "" {
+				if efforts == nil {
+					efforts = make(map[string][]string)
+				}
+				efforts[id] = []string{e}
 			}
-			if d := m.Reasoning.DefaultEffort; d != "" {
+			if d := strings.TrimSpace(m.Reasoning.DefaultEffort); d != "" {
 				if defaults == nil {
 					defaults = make(map[string]string)
 				}

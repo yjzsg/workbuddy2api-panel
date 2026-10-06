@@ -338,14 +338,9 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-<<<<<<< /tmp/tmp8q7ro9mp/o
-  if (v === 'taskscenter') { loadCNInvite(true); reattachQueueView(); }
-||||||| /tmp/tmp8q7ro9mp/b
-  if (v === 'taskscenter') reattachQueueView();
-=======
-  if (v === 'accounts') loadExpiry();
-  if (v === 'taskscenter') reattachQueueView();
->>>>>>> /tmp/tmp8q7ro9mp/t
+    if (v === accounts) loadExpiry();
+    // taskscenter：CN 邀请面板（本仓自研）+ 队列视图（上游）。
+    if (v === taskscenter) { loadCNInvite(true); reattachQueueView(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -1867,15 +1862,15 @@ function fmtModelRate(rate) {
    口径与后端一致：分母不含 write（写入是"为后续命中付的费"）。 */
 function usRate(rate, hit, miss) {
   if (!(Number(hit || 0) + Number(miss || 0))) return '—';
-  return (Number(rate || 0) * 100).toFixed(1) + '%';
+  return Number(rate || 0).toFixed(1) + '%';  // 后端已为百分比量纲，不再 ×100
 }
 
 /* usRateTone 命中率配色：≥80% 好、<30% 警告、无观测不上色。 */
 function usRateTone(rate, hit, miss) {
   if (!(Number(hit || 0) + Number(miss || 0))) return '';
   const r = Number(rate || 0);
-  if (r >= 0.8) return 'good';
-  if (r < 0.3) return 'warn';
+  if (r >= 80) return 'good';  // 百分比量纲
+  if (r < 30) return 'warn';
   return '';
 }
 

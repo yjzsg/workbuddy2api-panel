@@ -72,11 +72,11 @@ type chatStat struct {
 
 	// metrics 采集字段（供 /v1/stats 聚合）：全部来自上游 usage，缺失时保持零值
 	// 并由 hasUsage 区分「缺观测」与「显式 0」——与成本账本同一纪律。
-	hasUsage  bool
-	prompt    int
-	cacheHit  int
-	cacheMiss int
-	cacheWr   int
+	// 注：cacheHit/cacheMiss 复用上方字段（上游 issue #92 引入），此处只补本仓
+	// 独有的第三段 cacheWr（缓存写入）。
+	hasUsage bool
+	prompt   int
+	cacheWr  int64
 
 	logged bool
 }
@@ -125,22 +125,16 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	credit     float64
 	errorFrame bool
-<<<<<<< /tmp/tmprvvfamuu/o
-	cacheHit   int    // 末帧 usage.prompt_cache_hit_tokens（供 /v1/stats）
-	cacheMiss  int    // 末帧 usage.prompt_cache_miss_tokens
-	cacheWr    int    // 末帧 usage.prompt_cache_write_tokens
-	pend       []byte // 已读未返回的行缓存
-||||||| /tmp/tmprvvfamuu/b
-	pend       []byte // 已读未返回的行缓存
-=======
 	// cacheHit/cacheMiss 上游末帧 usage.prompt_cache_hit_tokens / miss_tokens，
-	// 供用量桶的命中率维度与 reqlog 逐次记录（issue #92）。
+	// 供用量桶的命中率维度与 reqlog 逐次记录（issue #92）；hasCache 区分「上游没给」
+	// 与「给了 0」（上游口径，单一标志——上游只有命中/未命中两段，任一给到即算有观测）。
 	hasCacheHit  bool
-	cacheHit     int
-	cacheMiss    int
+	cacheHit     int64
+	cacheMiss    int64
 	hasCacheMiss bool
-	pend         []byte // 已读未返回的行缓存
->>>>>>> /tmp/tmprvvfamuu/t
+	// cacheWr 是本仓独有的第三段：缓存写入 token（上游只有命中/未命中两段）。
+	cacheWr int64
+	pend    []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -173,8 +167,26 @@ func (s *chatStatsReader) PromptTokens() int { return s.promptTokens }
 //
 // 三项不参与面板展示，故不设 pointer 语义：缺失按 0 计。
 // 命中率分母是「命中 + 未命中」，**不含 write**（写入是"为后续命中付的费"）。
-func (s *chatStatsReader) CacheTokens() (hit, miss, write int) {
-	return s.cacheHit, s.cacheMiss, s.cacheWr
+// CacheTokens 返回末帧 usage 的缓存三段（命中 / 未命中 / 写入）。ok=false 表示
+// 上游未下发缓存维度（此时三段均为 0，调用方不应据此算命中率）。
+//
+// miss 缺失时按 prompt - hit 推导（上游 issue #92 口径）：部分上游形态只回
+// prompt_cache_hit_tokens，此时未命中 = prompt - hit 是唯一可得的估算。
+// write 是本仓独有的第三段（上游只有命中/未命中两段），无推导、缺失即 0。
+// [上游 dbd7c68..origin/main 引入两段 + ok + 推导；本仓多第三段 write]
+func (s *chatStatsReader) CacheTokens() (hit, miss, write int64, ok bool) {
+	if !s.hasCacheHit {
+		return 0, 0, s.cacheWr, false
+	}
+	hit = s.cacheHit
+	miss = s.cacheMiss
+	if !s.hasCacheMiss {
+		if !s.hasPromptTokens || int64(s.promptTokens) < s.cacheHit {
+			return hit, 0, s.cacheWr, true
+		}
+		miss = int64(s.promptTokens) - s.cacheHit
+	}
+	return hit, miss, s.cacheWr, true
 }
 
 // Usage 返回流式响应中已收到的 token usage 字段（面板用量记录用）。
@@ -209,28 +221,14 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
 		Usage *struct {
-<<<<<<< /tmp/tmprvvfamuu/o
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			TotalTokens      *int     `json:"total_tokens"`
-			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
-			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
-			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
-			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
-||||||| /tmp/tmprvvfamuu/b
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			TotalTokens      *int     `json:"total_tokens"`
-			Credit           *float64 `json:"credit"`
-=======
 			PromptTokens         *int     `json:"prompt_tokens"`
 			CompletionTokens     *int     `json:"completion_tokens"`
 			TotalTokens          *int     `json:"total_tokens"`
 			Credit               *float64 `json:"credit"`
 			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
->>>>>>> /tmp/tmprvvfamuu/t
+			// 本仓独有第三段：缓存写入（上游只有命中/未命中两段）。
+			PromptCacheWriteTokens *int `json:"prompt_cache_write_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -255,47 +253,22 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
 	}
-	s.cacheHit = chunk.Usage.PromptCacheHitTokens
-	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
-	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
 	}
-<<<<<<< /tmp/tmprvvfamuu/o
-	// 缓存三段：普通 int（缺失即 0），与上面四个 pointer 字段的「缺失≠0」口径无关
-	// ——它们只喂 metrics 的命中率，不参与面板展示与成本账本。
-	s.cacheHit = chunk.Usage.PromptCacheHitTokens
-	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
-	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
-||||||| /tmp/tmprvvfamuu/b
-=======
 	if chunk.Usage.PromptCacheHitTokens != nil {
 		s.hasCacheHit = true
-		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+		s.cacheHit = int64(*chunk.Usage.PromptCacheHitTokens)
 	}
 	if chunk.Usage.PromptCacheMissTok != nil {
 		s.hasCacheMiss = true
-		s.cacheMiss = *chunk.Usage.PromptCacheMissTok
+		s.cacheMiss = int64(*chunk.Usage.PromptCacheMissTok)
 	}
-}
-
-// CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
-// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
-func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
-	if !s.hasCacheHit {
-		return 0, 0, false
+	// cacheWr 本仓独有第三段：无独立 has 标志（缺失即 0，且不参与命中率分母）。
+	if chunk.Usage.PromptCacheWriteTokens != nil {
+		s.cacheWr = int64(*chunk.Usage.PromptCacheWriteTokens)
 	}
-	hit = int64(s.cacheHit)
-	miss = int64(s.cacheMiss)
-	if !s.hasCacheMiss {
-		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
-			return hit, 0, true
-		}
-		miss = int64(s.promptTokens - s.cacheHit)
-	}
-	return hit, miss, true
->>>>>>> /tmp/tmprvvfamuu/t
 }
 
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。

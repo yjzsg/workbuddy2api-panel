@@ -167,10 +167,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		// （旧文件的 success_ema/error_ema 字段在 stateAccount 已删除，读取时被
 		// JSON 解码自然忽略——无害遗留，不反推不迁移；成功率 EMA 因子已删。）
 		e := &entry{
-			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:                  s.Credits,
-			creditsTotal:             s.CreditsTotal,
-			disabled:                 s.Disabled,
+			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:      s.Credits,
+			creditsTotal: s.CreditsTotal,
+			disabled:     s.Disabled,
 			// 注：本仓用 manualDisabled/manual_reason（上游用 paused/Paused）——
 			// 上游的 paused 回填在本仓无对应字段，见 transition.go 的语义说明。
 			reason:                   s.Reason,

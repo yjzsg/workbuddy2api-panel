@@ -453,13 +453,11 @@ func TestRepackThenCleanupRealShape(t *testing.T) {
 	assertPairingSymmetric(t, msgs)
 }
 
-
 // ─────────────────────────────────────────────────────────────────────
 // 以下用例来自上游 dbd7c68..origin/main（tool_call 合并/折叠/拆分族）。
 // 本仓另有一套孤儿配对清理用例（TestCleanupOrphan*/TestRepackToolResultBlocks*），
 // 两套覆盖不同路径，合并保留。
 // ─────────────────────────────────────────────────────────────────────
-
 
 // msgs 解析测试用的 messages JSON 数组。
 func msgs(t *testing.T, s string) []any {
@@ -473,7 +471,6 @@ func msgs(t *testing.T, s string) []any {
 
 // summarize 把消息序列压成可读摘要：assistant 带 tool_calls 记 "assistant(id1,id2)"，
 // 其余记 "role(-)"。用于逐条比对「合并后长什么样」。
-
 
 // summarize 把消息序列压成可读摘要：assistant 带 tool_calls 记 "assistant(id1,id2)"，
 // 其余记 "role(-)"。用于逐条比对「合并后长什么样」。
@@ -509,7 +506,6 @@ func summarize(messages []any) []string {
 	return out
 }
 
-
 func assertSummary(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -526,7 +522,6 @@ func assertSummary(t *testing.T, got, want []string) {
 //
 // 这是部分 OpenAI 兼容 agent 客户端回放并行工具调用的报文形状（同一批调用
 // 拆成多条独立 assistant 消息），上游 deepseek 系模型对它判 11148。
-
 
 // TestMergeAdjacentToolCalls 背靠背的两条 assistant.tool_calls 必须合成一条。
 //
@@ -642,7 +637,6 @@ func TestMergeAdjacentToolCalls(t *testing.T) {
 // 断言的正是线上对照实验的结论：合成一条 assistant（本测试期望的输出形态）→ 200；
 // 拆成两条 → deepseek 系模型 503/11148。
 
-
 // TestPrepareBodyMergesSplitParallelToolCalls 全链路：出站管线必须把「拆开的并行调用」
 // 归一到上游认可的形态。
 //
@@ -681,7 +675,6 @@ func TestPrepareBodyMergesSplitParallelToolCalls(t *testing.T) {
 }
 
 // TestRepackToolResultBlocks 结果之间的插入消息必须挪到整组之后（上游判配对断裂的另一形态）。
-
 
 // TestCleanupOrphanToolCalls 缺一侧的配对必须两侧同口径剔除（否则残留半截配对 → 11148）。
 func TestCleanupOrphanToolCalls(t *testing.T) {
@@ -759,7 +752,6 @@ func TestCleanupOrphanToolCalls(t *testing.T) {
 // 有客户端把"没有正文"发成 `content: []`（而不是 null），此前 emptyContent 只认
 // nil / 空串 → 背靠背的 assistant(tool_calls) 不合并 → 上游 deepseek 系判 11148。
 
-
 // TestMergeAdjacentToolCallsEmptyArrayContent 空数组 content 也必须触发合并：
 // 有客户端把"没有正文"发成 `content: []`（而不是 null），此前 emptyContent 只认
 // nil / 空串 → 背靠背的 assistant(tool_calls) 不合并 → 上游 deepseek 系判 11148。
@@ -804,7 +796,6 @@ func TestMergeAdjacentToolCallsEmptyArrayContent(t *testing.T) {
 // TestFoldTextIntoPrevToolCall 反向形态：前一条是带 tool_calls 但没正文的 assistant，
 // 本条是纯正文 assistant（正文排在工具调用之后）——折进前一条，合成
 // assistant(正文 + tool_calls)，让"工具调用紧跟自己的结果"在两种拆分顺序下都成立。
-
 
 // TestFoldTextIntoPrevToolCall 反向形态：前一条是带 tool_calls 但没正文的 assistant，
 // 本条是纯正文 assistant（正文排在工具调用之后）——折进前一条，合成

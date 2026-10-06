@@ -1012,6 +1012,69 @@ gofmt -l 全树 46 == 合并前 0c91110 的 46（零新增脏文件）
 go test -count=1 -timeout 900s ./...（-u 1001:1001，干净树）  22 包全绿，TEST_EXIT=0
 ```
 
+## 5.12 2026-10-06 同步：面板上游 `8584e45..47613d8`（46 提交）—— **三方合并路线**（用户拍板：不换基）
+
+### A. 路线决策
+用户先提「直接换基，以上游为准」，我做完换基盘点后用户改主意：**走三方合并，保留本仓实现**。
+盘点数据（`git diff --name-status HEAD origin/main`）：
+
+| 类 | 数量 | 含义 |
+|---|---|---|
+| **D** | 145 | 本仓独有（21 生产 + 109 测试 + 15 非 Go） |
+| **A** | 11 | 上游独有 → 白拿 |
+| **M** | 92 | 双方都有但不同（⚔️双方都大改 13） |
+
+⇒ **不换基是对的**：D 类 145 文件里 109 个是测试（本仓的回归网），换基等于把它们全部重贴一遍。
+
+### B. ⛔ 本轮最重要的一条：**上游把我们的自研官方化了 —— 但不能无脑换**
+实测对比后逐点定调（**不是"都取上游"也不是"都留我们的"**）：
+
+| 点 | 上游 | 本仓 | 决策 |
+|---|---|---|---|
+| **暂停选号** | `paused` + `Pause/Resume` + **面板 UI 按钮** | `manualDisabled` + `/admin/{disable,enable,revive}` + **无 UI** | **保留本仓状态位**（`manual_disabled` 已被 `cmd/acct`/`acct.sh`/state.json 使用，改名是用户可见的破坏性变更）；**补 `Pause`/`Resume` 薄封装**让上游面板 UI 零改动复用；上游 `paused` 的 14 文件引用全部适配为本仓字段 |
+| **缓存命中率** | 两段（CH/CM）+ **百分比 ×100** + `HasCacheTokens` | 三段（CH/CM/**CW**）+ 小数 0~1 | **并集**：保留 CW 第三段；量纲**取上游百分比**（减少未来分叉）；`fileVersion` 4；前端 `app.js` 的 `usRate`/`usRateTone` 同步改百分比阈值 |
+| **global 探测** | `/v3/config` × **三路 UA**（桌面端/IDE/CLI）+ 企业端点 | 单 UA（`defaultWorkBuddyUAFor`）+ 企业端点 | **取上游三路 UA**（实测多拿 8 条 IDE 独有模型：`o4-mini`/`enhance-1.0`/`auto-chat`/`nes-1.1`/`nes-1.2`/`completion-1.0`/`codewise-jump`/`hunyuan-image-alpha`），**同时保留本仓的企业端点路**（补 `gpt-5.3-codex`）⇒ 38 条 |
+
+实测证据（2026-10-02，同一 global 账号打 `/v3/config`）：桌面端 29 条 / IDE 13 条（独有 8）/ CLI 22 条（独有 0）⇒ 三路并集 37 条，本仓当时只有 30 条。
+
+### C. 顺手修掉的 **3 个上游 bug**（都带复现测试）
+1. **`fetchV3ConfigModelMap` 不过滤 `disabled`** → 被上游标记禁用的模型泄漏进 `/v1/models`（选中即 11102）。
+   本仓 `TestFetchGlobalModelsProbePureDynamic` 复现（`disabled-y` 泄漏）。已补过滤。
+2. **`probeV3` 只 sort 了 `ids` 没 sort `outInfos`** → 下游 `extractEfforts(v3.infos)` 会**从 infos 反推 names**，导致 `/v1/models` 的 global 段顺序随 map 迭代序抖动。
+   本仓 `TestGlobalModelsMergeStableOutput` 复现。已补 `sort.Slice(outInfos, ...)`。
+3. **`probeGlobalModels` 的「v3 失败降级」分支漏了 `enterprise.names` 兜底**（后面「两路皆成功」分支有，这个分支没有）→ 企业端点为纯 ID 数组（窄表）时名单**整体丢失**。
+   本仓 `TestModelListGlobalNarrowContextLookup` 复现。已补 `if len(names)==0 { names = enterprise.names }`。
+
+### D. 本次吸收的上游特性
+`include_disabled_in_tasks`（保号任务覆盖禁用号）· `ModelBlocked`/`ModelLockView`（#102：模型级阻塞不再伪装成 `no_healthy_account`，回 `model_unavailable`+400）·
+`isUpstreamTimeout`（上游超时**不换号不罚号**，`upstream_timeout` 文案）· 11101 `bad_params` fail-fast（不轮转，立即 400 透传）·
+GPT 系 `max_tokens` 下限 16（修 Claude Code 切 `gpt-6-sol` 必 503）· `tool_pairing` 的 tool_call 合并/折叠/拆分族 · `profile.go` 昵称同步 ·
+`DeductionEndTime`（积分包真失效时刻）· `server.read_timeout`（#100，默认 300s）· `include_disabled_in_tasks` ·
+生成类标签扩充（`text-to-video`/`image-to-video`/`image-to-image`）· reqlog `ReadArchive` 按事件时间排序 · 吐字速率扣除首 token 等待（#34）
+
+### E. 本仓自研（全部存活，已符号级审计）
+`ErrEdgeAuth`/`edgeGate`（IP 级熔断，**本仓的 `edgegate.go` 是上游 `wafip.go` 的泛化版**：覆盖 401+403，故不引入上游 `wafip.go`）·
+`contentSafetyRule`（内容审核）· `NoteContentBlockEvidence`/行为判别 · `manualDisabled` + `Pause/Resume` 别名 · `PickByUIDForModel` ·
+`ModelCost` 成本账本 · `/v1/stats` · **每日对话保底** · **CN 邀请**（排程+面板+上游调用）· `admin` 三端点 · `auths` 热加载 · `DesktopDailyChat`
+
+### F. 合并过程记录（给下次的自己）
+- **重排导致的假冲突**：本仓的 `Status`/`entry`/`Config` 等结构体字段顺序与上游不同，`git merge-file` 会把"我们挪了位置"误判为"我们删了它"（`[OURS]` 段为空但 `[BASE]`/`[THEIRS]` 有）。
+  **判据**：先看上游对该文件的**净 diff**（`git diff <base>..origin/main -- <file>`）；若净 diff 全是要丢弃的东西，直接取 ours。
+- **并集策略会产生重复字段**：`chatStat`/`chatStatsReader`/`Agg` 都出现过「上游一组 + 我加的一组」重复声明。**并集后必须 `go build` 验证**。
+- **取 theirs 时注意 ours 段是否含多个 case**：`handler.go` 的错误构造 switch 里 ours 段同时含 `ErrEdgeAuth` + `ErrContentBlocked`，取 theirs 会把两个 case 一起丢掉（回归被 `contentblock_test.go`/`edgegate_test.go` 抓到）。
+- **测试期望更新分两类**：① 上游行为变化（探测 2→4 路、fail-fast、`model_unavailable`）→ 改期望；② 本仓自研的测试（`TestModelListGlobalNarrowContextLookup` 等）失败 → **先查是不是真回归**（本轮 3 个上游 bug 都是这样挖出来的）。
+
+### G. 验证
+```
+gofmt -l 全树 46 == 合并前基线（零新增脏文件）
+go build ./...   通过
+go vet   ./...   通过
+go test -count=1 -timeout 900s ./...        22 包全绿（root）
+go test -u 1001:1001 干净树 ./...           22 包全绿（CI 非 root 口径）← 上次踩过的坑
+符号级遗漏审计：15 项自研 + 14 项上游特性逐条 grep ✅
+冲突标记 0 ✅
+```
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）

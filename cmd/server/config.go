@@ -25,8 +25,9 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
-	Panel  struct {
+	// Server 段见下方（含 issue #100 的 read_timeout）。max_body_mb 已退役：
+	// 旧配置该段下的未知键因 JSON 未知字段而自然忽略。
+	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`

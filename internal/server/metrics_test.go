@@ -17,7 +17,7 @@ func TestMetricsAggregatesByModel(t *testing.T) {
 	resetMetricsForTest(t)
 
 	// 两次成功 + 一次失败，同一模型。
-	mk := func(status int, ttfbMS, toks, prompt, hit, miss, wr int, credit float64, mode string) *chatStat {
+	mk := func(status int, ttfbMS, toks, prompt int, hit, miss, wr int64, credit float64, mode string) *chatStat {
 		return &chatStat{
 			model: "global:deepseek-v4.1-flash", mode: mode, status: status,
 			ttfb: time.Duration(ttfbMS) * time.Millisecond,
