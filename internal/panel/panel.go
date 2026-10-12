@@ -234,7 +234,10 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
+	// 用 WithManualDisabled 而不是 CountsDetailed：后者把手动停用号并进 disabled
+	//（/status 的「不可用」口径），而概况卡片要分开展示（上游 issue #125 的 paused 单列同旨）。
+	// 键名用本仓术语 manual_disabled（与 /status 账号级字段一致），UI 文案沿用上游「暂停选号」。
+	total, healthy, cooling, disabled, manualDisabled, inFlightFull := p.cfg.Pool.CountsDetailedWithManualDisabled()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -249,6 +252,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"healthy":         healthy,
 		"cooling":         cooling,
 		"disabled":        disabled,
+		"manual_disabled": manualDisabled,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
@@ -518,7 +522,12 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
+	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
+	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
+	if a.IsEnterprise() {
+		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
 		if upstream.IsAlreadyCheckin(err) {
@@ -530,6 +539,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		checkinDone = true
 	}
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	if a.IsEnterprise() {
+		resp["enterprise"] = true
+	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}

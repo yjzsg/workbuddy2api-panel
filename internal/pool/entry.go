@@ -71,6 +71,10 @@ type TokenUsageDelta struct {
 type Status struct {
 	UID           string    `json:"uid"`
 	Realm         string    `json:"realm,omitempty"`
+	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
+	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
+	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
+	Enterprise    bool      `json:"enterprise,omitempty"`
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
 	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）

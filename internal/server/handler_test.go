@@ -2858,3 +2858,372 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 // 同 TestCooldownSoftExponentialBackoff 的旧语义（上游只在进入新冷却时推进退避）。
 // 软退避的现口径由 pool 的 TestCooldownSoftBoundedBackoffIfNotCooling /
 // TestCooldownSoftRateNoDoubleWhenAlreadyCooling + server/backoff_test.go 覆盖。
+
+// ─────────────────────────────────────────────────────────────────────
+// 以下用例来自上游 47613d8..origin/main（DSML 原生工具调用标记修复族）。
+// 合并时本仓 handler_test.go 走了「取 ours」路线（该文件双方大改、重排），
+// 上游新增的这部分测试需显式补回——否则修复层无回归网。
+// ─────────────────────────────────────────────────────────────────────
+
+// TestChatLargeBodyNoGatewayLimit 请求体无网关侧上限（max_body_mb 已移除）：
+// 数 MB 的合法 body 完整读入并照常打上游，网关不再 413（超限类问题交由上游
+// 自然响应，对齐上游 e34cfa4 规约）。
+func TestChatLargeBodyNoGatewayLimit(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	pad := strings.Repeat("a", 4<<20) // 4MB 合法 JSON 字符串值
+	body := []byte(`{"model":"glm-5.2","messages":[],"pad":"` + pad + `"}`)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (large valid body must proceed)", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+}
+
+// TestChatBadParamsFailsFastWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
+// → 请求级错误：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），**且不轮转**——
+// 同一 body 换号必然同样失败。端到端断言只打一次上游、直接回 400、账号完好。
+
+func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
+	// 吸收上游语义：带解析重置时间的 body 对齐墙钟；无时间文案走有界退避，且
+	// **冷却中的重复触发不堆加**（旧「每次都翻倍」正是全池被推到 2h 封顶的元凶）。
+	// 跨冷却期的堆加语义由 pool 包 CooldownSoftRate 测试覆盖；此处锚定 handler 侧
+	// 的调用形态：连续 3 次软限流错误 → 首次 600s，后续不延长。
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+	for i := 1; i <= 3; i++ {
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
+		st, _ := p.Status("u1")
+		if !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i, st)
+		}
+		if st.SoftStreak != 1 {
+			t.Errorf("call %d: 冷却中兜底探测不应推进 soft_streak, got %d", i, st.SoftStreak)
+		}
+		if st.CoolRemaining < 600-3 || st.CoolRemaining > 600 {
+			t.Errorf("call %d: cool_remaining_sec=%d want ~600（不堆加）", i, st.CoolRemaining)
+		}
+	}
+}
+
+func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+	// 吸收上游 9832283：models 拉取失败只进负缓存，不 NoteError——
+	// NoteError 喂的是 chat 熔断器，models 端点 5xx 跨界惩罚 chat 通道健康号。
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若仍罚号，一次 fetch 失败即熔断
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 500, `boom`, false
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("models fetch failure must not trip chat breaker: %+v", st)
+	}
+}
+
+// markupFixture 拼一段「正文 + 原生工具调用标记」，模拟上游在没有 tools 的请求里
+// 把工具调用吐成文本的形态。分隔符按码点构造，避免测试源码里出现裸全角字面量。
+func markupFixture(prose, cmd string) string {
+	return markupFixtureNamed(prose, "exec_command", cmd)
+}
+
+// markupFixtureNamed 同 markupFixture，但可指定工具名（用于弱判定的形态把关测试）。
+
+// markupFixtureNamed 同 markupFixture，但可指定工具名（用于弱判定的形态把关测试）。
+func markupFixtureNamed(prose, name, cmd string) string {
+	const pipe = "\uFF5C\uFF5C"
+	tag := func(rest string) string { return "<" + pipe + "DSML" + pipe + " " + rest + ">" }
+	ctag := func(rest string) string { return "</" + pipe + "DSML" + pipe + " " + rest + ">" }
+	return prose + tag("calls") + "\n" +
+		tag(`invoke name="`+name+`"`) + "\n" +
+		tag(`parameter name="cmd" string="true"`) + cmd + ctag("parameter") + "\n" +
+		ctag("invoke") + "\n" + ctag("calls")
+}
+
+// markupUpstreamSSE 用一段正文拼上游 SSE（role 首帧 + 正文帧 + stop 收尾帧 + [DONE]）。
+
+// markupUpstreamSSE 用一段正文拼上游 SSE（role 首帧 + 正文帧 + stop 收尾帧 + [DONE]）。
+func markupUpstreamSSE(content string) string {
+	chunk := func(delta map[string]any, finish any) string {
+		b, _ := json.Marshal(map[string]any{
+			"id": "resp-1", "object": "chat.completion.chunk", "created": 1, "model": "glm-5.2",
+			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+		})
+		return "data: " + string(b) + "\n\n"
+	}
+	return chunk(map[string]any{"role": "assistant"}, nil) +
+		chunk(map[string]any{"content": content}, nil) +
+		chunk(map[string]any{}, "stop") +
+		"data: [DONE]\n\n"
+}
+
+// declaredToolsBody 是带 tools 声明的请求体（标记修复的启用前提）。
+
+// declaredToolsBody 是带 tools 声明的请求体（标记修复的启用前提）。
+const declaredToolsBody = `"tools":[{"type":"function","function":{"name":"exec_command",` +
+	`"parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}]`
+
+// TestChatNonStreamRepairsMarkupToolCalls 非流式：上游把工具调用吐成正文标记时，
+// 网关还原成 message.tool_calls，正文不再残留标记，finish_reason 收敛为 tool_calls。
+
+// TestChatNonStreamRepairsMarkupToolCalls 非流式：上游把工具调用吐成正文标记时，
+// 网关还原成 message.tool_calls，正文不再残留标记，finish_reason 收敛为 tool_calls。
+func TestChatNonStreamRepairsMarkupToolCalls(t *testing.T) {
+	content := markupFixture("先读一遍控制器。\n\n", "ls -la")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, markupUpstreamSSE(content), true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "\uFF5C") {
+		t.Fatalf("响应里仍残留标记: %s", rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+	if msg["content"] != "先读一遍控制器。\n\n" {
+		t.Errorf("content=%q", msg["content"])
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls=%#v want 1 个", msg["tool_calls"])
+	}
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn == nil || fn["name"] != "exec_command" {
+		t.Fatalf("function=%#v", tcs[0])
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
+		t.Fatalf("arguments 不是合法 JSON: %v", fn["arguments"])
+	}
+	if args["cmd"] != "ls -la" {
+		t.Errorf("cmd=%v", args["cmd"])
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v want tool_calls", choice["finish_reason"])
+	}
+}
+
+// TestChatStreamRepairsMarkupToolCalls 流式：同样还原成 delta.tool_calls，且收尾帧
+// finish_reason 为 tool_calls、排在调用帧之后。
+
+// TestChatStreamRepairsMarkupToolCalls 流式：同样还原成 delta.tool_calls，且收尾帧
+// finish_reason 为 tool_calls、排在调用帧之后。
+func TestChatStreamRepairsMarkupToolCalls(t *testing.T) {
+	content := markupFixture("先读一遍控制器。\n\n", "ls -la")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, markupUpstreamSSE(content), true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	reqBody := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "\uFF5C") {
+		t.Fatalf("流式响应里仍残留标记: %s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("缺 [DONE] 收尾: %s", body)
+	}
+	var text strings.Builder
+	var calls int
+	frameNo, lastCallFrame, finishFrame := 0, -1, -1
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		frameNo++
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+			t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
+		}
+		chs, _ := obj["choices"].([]any)
+		if len(chs) == 0 {
+			continue
+		}
+		ch, _ := chs[0].(map[string]any)
+		d, _ := ch["delta"].(map[string]any)
+		if v, ok := d["content"].(string); ok {
+			text.WriteString(v)
+		}
+		if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+			calls += len(tcs)
+			lastCallFrame = frameNo
+			fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+			if fn == nil || fn["name"] != "exec_command" {
+				t.Fatalf("调用帧 function=%#v", tcs[0])
+			}
+		}
+		if v, ok := ch["finish_reason"].(string); ok && v != "" {
+			finishFrame = frameNo
+			if v != "tool_calls" {
+				t.Errorf("finish_reason=%q want tool_calls", v)
+			}
+		}
+	}
+	if text.String() != "先读一遍控制器。\n\n" {
+		t.Errorf("正文错误: %q", text.String())
+	}
+	if calls != 1 {
+		t.Errorf("tool_call 帧数=%d want 1", calls)
+	}
+	if lastCallFrame < 0 || finishFrame < 0 {
+		t.Fatalf("缺调用帧或收尾帧: lastCall=%d finish=%d", lastCallFrame, finishFrame)
+	}
+	if finishFrame < lastCallFrame {
+		t.Errorf("收尾帧（第 %d 帧）必须排在调用帧（第 %d 帧）之后", finishFrame, lastCallFrame)
+	}
+}
+
+// --- 弱判定（名单为空）端到端：这是实测最常见的泄漏形态 ---------------------
+
+// TestChatRepairsMarkupWithoutDeclaredTools 请求体里**没有** tools 声明时（tools 在
+// 中转环节丢失是实测常态），弱判定必须照样把正文标记还原成 tool_calls——否则修复层
+// 恰好对主场景不设防。夹具用生产环境真实泄漏的正文。
+
+// TestChatRepairsMarkupWithoutDeclaredTools 请求体里**没有** tools 声明时（tools 在
+// 中转环节丢失是实测常态），弱判定必须照样把正文标记还原成 tool_calls——否则修复层
+// 恰好对主场景不设防。夹具用生产环境真实泄漏的正文。
+func TestChatRepairsMarkupWithoutDeclaredTools(t *testing.T) {
+	content := markupFixture("", "ls -la")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, markupUpstreamSSE(content), true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "\uFF5C") {
+		t.Fatalf("响应里仍残留标记: %s", rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+	tcs, _ := msg["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls=%#v want 1 个", msg["tool_calls"])
+	}
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn == nil || fn["name"] != "exec_command" {
+		t.Fatalf("function=%#v", tcs[0])
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v want tool_calls", choice["finish_reason"])
+	}
+}
+
+// TestChatMarkupRepairRejectsNonIdentifierToolName 弱判定的把关：名字不像工具名
+// （模型在正文里「讨论」这段语法时的占位符）→ 原文透传，绝不改写成工具调用。
+
+// TestChatMarkupRepairRejectsNonIdentifierToolName 弱判定的把关：名字不像工具名
+// （模型在正文里「讨论」这段语法时的占位符）→ 原文透传，绝不改写成工具调用。
+func TestChatMarkupRepairRejectsNonIdentifierToolName(t *testing.T) {
+	content := markupFixtureNamed("", "<tool_name>", "ls -la")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, markupUpstreamSSE(content), true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatalf("占位符工具名不得转换: %#v", msg["tool_calls"])
+	}
+	if got, _ := msg["content"].(string); !strings.Contains(got, "\uFF5C") {
+		t.Fatalf("应原文透传，实际 content=%q", got)
+	}
+}
+
+// TestChatMarkupRepairStrictModeRejectsUndeclaredTool 名单非空时走严格判定：
+// 块内工具名不在名单里 → 不转换（即使名字形态合法）。
+
+// TestChatMarkupRepairStrictModeRejectsUndeclaredTool 名单非空时走严格判定：
+// 块内工具名不在名单里 → 不转换（即使名字形态合法）。
+func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
+	content := markupFixtureNamed("", "rm_rf_everything", "ls -la")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, markupUpstreamSSE(content), true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}

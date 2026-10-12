@@ -86,6 +86,9 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
 		}
+		if a.IsEnterprise() {
+			continue // 企业版门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
+		}
 		if !first {
 			if !sleepCtx(ctx, travelAccountDelay) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再巡

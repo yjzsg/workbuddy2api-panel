@@ -1075,6 +1075,93 @@ go test -u 1001:1001 干净树 ./...           22 包全绿（CI 非 root 口径
 冲突标记 0 ✅
 ```
 
+## 5.13 面板上游 47613d8..6b31db6（20 提交，v1.12.0 → v1.13.0）
+
+### A. 路线：增量同步（不是全量合并）
+关键判据：`git merge-base HEAD origin/main` = **`3f55d50`**（≠ `47613d8`）。
+因为本仓 HEAD 是上次合并的**单提交**、不是上游的后代，merge-base 会退化到很早的上游点
+⇒ 直接用 `git merge origin/main` 会把上次已解的 46 提交冲突**全部再来一遍**。
+正确做法：**以 `47613d8`（上次同步到的上游点）为 base 做三方合并**。
+
+### B. 结果
+上游改动 31 文件 / +3133 −97；干净合并 16 / 上游新增 8 / 冲突 7 文件 11 处；零残留标记。
+
+### C. 冲突处理（7 处）
+| 文件 | 冲突性质 | 处理 |
+|---|---|---|
+| `internal/pool/entry.go` | 重排假冲突（ours 段为空） | 取 ours + 补上游 `Enterprise` 字段 |
+| `internal/pool/state.go` | 计数结构 + Status 构造 | 采用上游「暂停号单独计数」结构，**命名换回本仓 `manualDisabled`**；Status 补 `Enterprise` |
+| `internal/scheduler/scheduler.go` | checkin 三块 | 取 ours 完整逻辑（token 预刷新 + 状态回执）+ 包 `if !a.IsEnterprise() {` |
+| `internal/upstream/client.go` | **重复定义**（重排） | 本仓 `UserResource*` 是自研 `CreditBuckets` 重构，与上游签名不同 ⇒ 删掉 theirs 侧的重复定义，**只保留上游新增的 `enterpriseResource`**；企业分流插进本仓版 `UserResourceDetailedWithExpiry` |
+| `internal/panel/app.js` | tab 路由 | 上游新注释 + 本仓 CN 邀请行；**去掉 `loadExpiry` 分支**（跟上游「到期卡片默认可见」新机制） |
+| `internal/panel/index.html` | stats 列数 | 取 theirs（7 列）；本仓 HEAD 的 4 列是上次误改（8584e45/47613d8 都是 6 列） |
+| `internal/server/handler_test.go` | 重排假冲突 | 取 ours + **补回上游 12 个顶层声明**（5 个 DSML 测试 + 7 个 helper） |
+
+### D. ⛔ 修掉一个上次合并引入的真 bug
+`app.js` 的 tab 路由（上次合并产物）：
+```js
+if (v === accounts) loadExpiry();                  // ← 缺引号
+if (v === taskscenter) { loadCNInvite(true); ... }
+```
+`accounts` / `taskscenter` 未定义 ⇒ **每次切 tab 抛 ReferenceError**，
+`loadCNInvite` / `reattachQueueView` **从未执行**（CN 邀请面板永远"加载中"）。
+
+**根因**：上次用 `ssh fnos 'python3 - <<'"'"'PY'"'"' … PY'` 内联改 JS 时，
+heredoc 内容里的单引号**关闭了外层的单引号字符串**，`'accounts'` 被 shell 剥成 `accounts`。
+**教训：改 JS 或任何含单引号的字符串，一律写脚本文件 + scp（老规矩）。**
+
+### E. 本次吸收的上游特性
+- **DSML 原生工具调用标记修复**（`upstream/dsml.go` 新增 +495 / `sse.go` +266−44）：
+  上游在没有 tools 的请求里会把工具调用吐成正文标记文本，修复层还原成
+  `delta.tool_calls` / `message.tool_calls`，修 Codex 回合空转。
+- **企业版能力门控**（`auth.IsEnterprise` + scheduler 五类任务/panel 入口跳过）+
+  **企业额度展示**（`enterpriseResource` 走 `/v2/billing/meter/get-enterprise-user-usage`；
+  `credit`=本周期已用、`limitNum`=分配额 ⇒ remain=limit−used；`limitNum<0` ⇒ 不限量，
+  池内以 `credits_total=-1` 表示）
+- **`prompt_cache_key` 回退会话 key**：无 `conversation_id`（Anthropic/Claude Code 流量）时
+  用 session key，否则同一账号下所有客户端共用一个不断被驱逐的前缀缓存槽
+- **TTFB 速率扣除**（issue #127）：`total−ttfb < 200ms`（`minGenWindow`）退回端到端，
+  防假流式把几百 token 除成上万 tok/s 的幻数
+- **剔除 `function.name` 为空的 tool_call**（`toolCallNameEmpty`，修线上 11133）
+- 面板：**暂停选号单列统计**（#125）· **到期卡片默认可见 + overview 快照渲染**（#137/#145，
+  不再"打开账号池就打上游"）· **图表 tooltip 跟随柱子**（#128，`<g><title>` 包裹）·
+  **「全部历史」显式传 `hours=0`**（#121）
+- 夜猫子门控用例钉住时钟（`nowForNightWindow`）——修"本机白天跑等于什么都没测"的伪测试
+
+### F. 本仓自研（全部存活，已符号级审计 20 项）
+`manualDisabled` + `Pause`/`Resume` 薄封装 · CN 邀请（调度/面板/upstream）· 每日对话保底 ·
+`edgegate`（IP 级熔断，401+403）· `/v1/stats` · `CW` 第三段 · `ModelCosts` 台账 ·
+`RateLimitedModels` · admin 三端点 · `DesktopDailyChat`
+
+### G. 命名约定（本次再次确认）
+| 概念 | 本仓 | 上游 |
+|---|---|---|
+| 暂停选号（字段/API） | `manual_disabled` / `SetManualDisabled` / `CountsDetailedWithManualDisabled` | `paused` / `Pause` / `CountsDetailedWithPaused` |
+| 面板 UI 文案 | **沿用上游「暂停选号」**（行为描述一致） | 「暂停选号」 |
+| 面板 overview 键 | `manual_disabled` | `paused` |
+
+⇒ 上游每次改 `paused` 相关代码，本仓都要按这张表适配。
+
+### H. 验证
+```
+gofmt -l 全树 46 == 合并前基线（零新增）
+go build ./...  /  go vet ./...            通过
+go test -count=1 -timeout 900s ./...       22 包全绿（root）
+go test -u 1001:1001 干净树 ./...          22 包全绿（CI 非 root 口径）
+符号级审计：上游 20 项 + 本仓 20 项 ✅
+冲突标记 0
+```
+
+### I. 方法论沉淀（本次新增 2 条）
+1. **增量同步的 base 必须显式指定为「上次同步到的上游点」**，不能靠 `git merge-base`
+   （本仓 HEAD 是单提交合并，merge-base 会退化到很早的上游点 ⇒ 假冲突海）。
+2. **「取 ours」前必须数 theirs 段里的顶层声明**：`handler_test.go` 的 ours 段 512 行、
+   theirs 段 265 行，直接取 ours 会静默丢掉上游 12 个声明（5 测试 + 7 helper）。
+   正确做法：取 ours 后**按声明名逐个比对**，缺的追加。
+3. **重排文件的三方合并会出现「重复定义」而非冲突标记**：`client.go` 的
+   `UserResource*` 在 ours 与 theirs 各有一份（位置不同）⇒ 编译报重复。判据：先看
+   `git show HEAD:<file>` 与 theirs 的**签名集合**是否重合。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）
