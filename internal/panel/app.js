@@ -3037,6 +3037,13 @@ let keyEditRoot = false;   // 正在编辑的是否为"根密钥"（config.json 
 const keyRevealed = {};    // id → 是否展开明文
 const keyUsageOpen = {};   // id → 是否展开按模型明细
 
+/* 「可用模型」勾选面板的状态（详见下方 keyPick* 一组函数） */
+let keyPickAll = true;        // 白名单为空 = 不限制（服务端口径）
+let keyPickSel = new Set();   // 勾选中的模型 id（目录里的，带域前缀）
+let keyPickQuery = '';        // 勾选面板的筛选词
+let keyModelCatalog = null;   // /panel/api/models 缓存（直连上游，很贵）
+let keyPickSplit = false;     // 本次打开表单是否已把"目录外条目"分流到「其他」
+
 /* keyMask 打码：保留前 4 后 4，中间固定 6 个星号（短串整体打码）。 */
 function keyMask(s) {
   s = String(s || '');
@@ -3077,8 +3084,11 @@ function renderKeys() {
       : '<code>' + esc(keyRevealed[k.id] ? k.secret : keyMask(k.secret)) + '</code> ' +
         '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="reveal">' + (keyRevealed[k.id] ? '隐藏' : '显示') + '</button> ' +
         '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="copy">复制</button>';
-    const models = (k.allowed_models && k.allowed_models.length)
-      ? esc(k.allowed_models.join(', '))
+    // 勾选式白名单可能很长：列前 2 个 + 计数，完整清单放 title。
+    const am = k.allowed_models || [];
+    const models = am.length
+      ? '<span title="' + esc(am.join(', ')) + '">' + esc(am.slice(0, 2).join(', ')) +
+        (am.length > 2 ? ' <span style="color:var(--ink-3)">+' + (am.length - 2) + '</span>' : '') + '</span>'
       : '<span style="color:var(--ink-3)">全部</span>';
     const status = k.orphan
       ? '<span class="tag warn">历史 / 已删除</span>'
@@ -3119,6 +3129,116 @@ function renderKeys() {
   }).join('');
 }
 
+/* ── 「可用模型」勾选面板 ─────────────────────────────────────────────
+   数据来自 /panel/api/models —— 直连上游的**实时**查询，很贵⇒进表单时拉一次并缓存，
+   之后筛选/勾选全在前端完成；只有点「刷新模型列表」才再打一次上游。
+
+   目录项 id 带域前缀（cn:glm-5.2 / global:glm-5.2），响应里没有 realm 字段，域得从
+   id 里取；倍率字段叫 credits（不是 rate）。 */
+
+/* keyPickRealm 从 id 取域前缀，取不到按 cn（与 server.resolveModel 的默认域一致）。 */
+function keyPickRealm(id) {
+  const s = String(id == null ? '' : id);
+  const i = s.indexOf(':');
+  return i > 0 ? s.slice(0, i) : 'cn';
+}
+
+/* keyPickCtx 上下文长度压成 K。 */
+function keyPickCtx(n) {
+  n = Number(n || 0);
+  if (!n) return '';
+  return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n);
+}
+
+/* keyPickMeta 一行右侧的紧凑元信息：倍率 · 上下文 · 图。 */
+function keyPickMeta(m) {
+  const p = [];
+  if (m && m.credits) p.push(m.credits);
+  const c = keyPickCtx(m && m.context_length);
+  if (c) p.push(c);
+  if (m && m.supports_images) p.push('图');
+  return p.join(' · ') || '—';
+}
+
+/* keyPickEnsureSplit 目录到位后，把「已有白名单里不属于目录的条目」挪进「其他」输入框。
+   不静默丢弃，也不擅自改写语义（裸名 glm-5.2 表示任意域，保持原样）。每次打开表单只做一次。 */
+function keyPickEnsureSplit() {
+  if (keyPickSplit || !keyModelCatalog) return;
+  keyPickSplit = true;
+  const ids = new Set(keyModelCatalog.map(m => m.id));
+  const rest = [];
+  for (const a of Array.from(keyPickSel)) {
+    if (!ids.has(a)) { keyPickSel.delete(a); rest.push(a); }
+  }
+  const box = $('kfModelsExtra');
+  if (rest.length && box && !box.value.trim()) box.value = rest.join(', ');
+}
+
+async function loadKeyCatalog(force) {
+  const box = $('kfPickBox');
+  if (!box) return;
+  if (keyModelCatalog && !force) { renderKeyPick(); return; }
+  box.innerHTML = '<div class="none">正在向上游查询模型目录…</div>';
+  try {
+    const d = await api('models');
+    keyModelCatalog = d.models || [];
+  } catch (e) {
+    keyModelCatalog = [];
+    box.innerHTML = '<div class="none">模型目录拉取失败：' + esc(e.message) +
+      '<br>可以改用下面的「其他模型名」手工填写（逗号分隔）。</div>';
+    return;
+  }
+  renderKeyPick();
+}
+
+function renderKeyPick() {
+  const box = $('kfPickBox');
+  if (!box || keyModelCatalog === null) return;
+  if ($('kfUnlimited')) $('kfUnlimited').checked = keyPickAll;
+  keyPickEnsureSplit();
+  const hint = $('kfPickHint');
+  if (hint) {
+    hint.textContent = keyPickAll
+      ? '当前：不限制（白名单为空 = 允许全部模型）。点下面任意一项即改为逐个挑选。'
+      : '勾选该密钥可用的模型（已选 ' + keyPickSel.size + ' 个）。一个都没勾会等同于「不限制」，保存会被拦下。';
+  }
+  box.classList.toggle('dim', keyPickAll);
+  if (!keyModelCatalog.length) {
+    box.innerHTML = '<div class="none">上游没有返回模型目录</div>';
+    return;
+  }
+  const q = keyPickQuery.trim().toLowerCase();
+  const hit = keyModelCatalog.filter(m => !q ||
+    String(m.id).toLowerCase().indexOf(q) >= 0 ||
+    String(m.name || '').toLowerCase().indexOf(q) >= 0);
+  if (!hit.length) {
+    box.innerHTML = '<div class="none">没有匹配「' + esc(keyPickQuery) + '」的模型</div>';
+    return;
+  }
+  const groups = new Map();
+  for (const m of hit) {
+    const r = keyPickRealm(m.id);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(m);
+  }
+  let html = '';
+  for (const [realm, list] of groups) {
+    const n = list.filter(m => keyPickSel.has(m.id)).length;
+    html += '<div class="grp"><b>' + esc(realm.toUpperCase()) + '</b><span>' + n + ' / ' +
+      list.length + '</span><span class="grow"></span>' +
+      '<button type="button" class="xs ghost" data-a="gpickall" data-r="' + esc(realm) + '">全选</button>' +
+      '<button type="button" class="xs ghost" data-a="gpicknone" data-r="' + esc(realm) + '">清空</button></div>';
+    for (const m of list) {
+      html += '<label class="row"><input type="checkbox" data-a="pick" data-id="' + esc(m.id) + '"' +
+        (keyPickSel.has(m.id) ? ' checked' : '') + '>' +
+        '<code>' + esc(m.id) + '</code>' +
+        '<span class="nm">' + esc(m.name || '') + '</span>' +
+        '<span class="mt">' + esc(keyPickMeta(m)) + '</span></label>';
+    }
+  }
+  box.innerHTML = html;
+}
+
 /* keyFormOpen 打开编辑/新增表单；k 为空 = 新增。 */
 function keyFormOpen(k) {
   keyEditID = k ? k.id : null;
@@ -3128,7 +3248,17 @@ function keyFormOpen(k) {
   $('kfName').value = k ? k.name : '';
   $('kfSecret').value = k ? k.secret : '';
   $('kfNote').value = k ? (k.note || '') : '';
-  $('kfModels').value = k && k.allowed_models ? k.allowed_models.join(', ') : '';
+  // 白名单改成勾选式：已有条目先全塞进勾选集，「其他」留空；目录到达后
+  // keyPickEnsureSplit 再把不属于目录的条目分流到「其他」输入框。
+  const am = (k && k.allowed_models) || [];
+  keyPickAll = am.length === 0;
+  keyPickSel = new Set(am);
+  keyPickQuery = '';
+  keyPickSplit = false;
+  if ($('kfPickSearch')) $('kfPickSearch').value = '';
+  if ($('kfModelsExtra')) $('kfModelsExtra').value = '';
+  if ($('kfUnlimited')) $('kfUnlimited').checked = keyPickAll;
+  loadKeyCatalog(false).catch(() => {});
   $('kfEnabled').checked = k ? !!k.enabled : true;
   // 根密钥的「启用」不可改（后端会拒），锁住复选框并给出原因。
   $('kfEnabled').disabled = keyEditRoot;
@@ -3140,22 +3270,51 @@ function keyFormClose() {
   $('keyForm').hidden = true;
   keyEditID = null;
   keyEditRoot = false;
+  keyPickAll = true;
+  keyPickSel = new Set();
+  keyPickQuery = '';
+  keyPickSplit = false;
   $('kfErr').hidden = true;
   if ($('kfRootHint')) $('kfRootHint').hidden = true;
   $('kfEnabled').disabled = false;
 }
 
-/* keyFormModels 解析白名单输入（逗号或换行分隔）。 */
-function keyFormModels() {
-  return $('kfModels').value.split(/[\n,]/).map(x => x.trim()).filter(Boolean);
+/* keyFormAllowed 收集白名单。
+   不限制 ⇒ []（服务端语义：空 = 允许全部）。
+   否则 = 勾选的目录模型 + 「其他模型名」里的自定义条目（去重、丢空白）。
+   ⚠️ 两者都为空时返回 []，与"不限制"同形——调用方 keySave 必须先拦下这种情况，
+   否则界面上"什么都不允许"会静默翻转成"全部允许"。 */
+function keyFormAllowed() {
+  if (keyPickAll) return [];
+  const out = [];
+  const seen = new Set();
+  for (const id of keyPickSel) {
+    const v = String(id).trim();
+    if (v && !seen.has(v)) { seen.add(v); out.push(v); }
+  }
+  const extra = $('kfModelsExtra') ? $('kfModelsExtra').value : '';
+  for (const raw of String(extra).split(/[\n,]/)) {
+    const v = raw.trim();
+    if (v && !seen.has(v)) { seen.add(v); out.push(v); }
+  }
+  return out;
 }
 
 async function keySave() {
+  const allowed = keyFormAllowed();
+  // 空 = 不限制（服务端语义）。取消「不限制」却一个都没勾 ⇒ 用户意图反了，拦下。
+  if (!keyPickAll && !allowed.length) {
+    const msg = '白名单一个模型都没勾：这在服务端等同于「不限制」。请勾选模型，或勾回「不限制（允许全部模型）」。';
+    $('kfErr').hidden = false;
+    $('kfErr').textContent = msg;
+    toast(msg, 'err');
+    return;
+  }
   const body = {
     name: $('kfName').value.trim(),
     secret: $('kfSecret').value.trim(),
     note: $('kfNote').value.trim(),
-    allowed_models: keyFormModels(),
+    allowed_models: allowed,
   };
   // 根密钥不带 enabled：既不误改它，也避免后端硬拦导致整个保存失败。
   if (!keyEditRoot) body.enabled = $('kfEnabled').checked;
@@ -3185,6 +3344,36 @@ async function keySave() {
   $('btnKeyCancel').onclick = keyFormClose;
   $('btnKeySave').onclick = keySave;
   $('keyHours').onchange = () => loadKeys().catch(e => toast(e.message, 'err'));
+  // 「可用模型」勾选面板：目录缓存 + 前端勾选
+  if ($('kfPickReload')) $('kfPickReload').onclick = () => loadKeyCatalog(true).catch(e => toast(e.message, 'err'));
+  if ($('kfUnlimited')) $('kfUnlimited').onchange = () => { keyPickAll = $('kfUnlimited').checked; renderKeyPick(); };
+  if ($('kfPickSelAll')) $('kfPickSelAll').onclick = () => {
+    keyPickAll = false;
+    (keyModelCatalog || []).forEach(m => keyPickSel.add(m.id));
+    renderKeyPick();
+  };
+  if ($('kfPickSelNone')) $('kfPickSelNone').onclick = () => { keyPickSel = new Set(); renderKeyPick(); };
+  if ($('kfPickSearch')) $('kfPickSearch').oninput = () => { keyPickQuery = $('kfPickSearch').value; renderKeyPick(); };
+  if ($('kfPickBox')) {
+    // 勾选/取消：勾任意一项即自动取消「不限制」（否则勾了什么也不生效，很困惑）
+    $('kfPickBox').addEventListener('change', ev => {
+      const c = ev.target.closest('input[data-a="pick"]');
+      if (!c) return;
+      const id = c.dataset.id;
+      if (c.checked) { keyPickAll = false; keyPickSel.add(id); } else keyPickSel.delete(id);
+      renderKeyPick();
+    });
+    // 分组「全选 / 清空」
+    $('kfPickBox').addEventListener('click', ev => {
+      const b = ev.target.closest('button[data-a]');
+      if (!b) return;
+      const realm = b.dataset.r;
+      const list = (keyModelCatalog || []).filter(m => keyPickRealm(m.id) === realm);
+      if (b.dataset.a === 'gpickall') { keyPickAll = false; list.forEach(m => keyPickSel.add(m.id)); }
+      else list.forEach(m => keyPickSel.delete(m.id));
+      renderKeyPick();
+    });
+  }
   $('keyBody').onclick = async ev => {
     const b = ev.target.closest('button[data-a]');
     if (!b) return;

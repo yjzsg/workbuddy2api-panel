@@ -1051,3 +1051,62 @@ func TestPanelIndexViewsMatchNav(t *testing.T) {
 		t.Error("配置表单 <form id=\"cfgForm\"> 不在 <section id=\"view-config\"> 之内（会泄漏到相邻页面）")
 	}
 }
+
+// TestAppJSKeyFormAllowed 钉住勾选式白名单的收集语义。
+//
+// 最关键的一条：服务端把「空白名单」定义为**不限制**（允许全部模型）。于是界面上
+// 取消勾选「不限制」却一个模型都没勾时，语义会从"什么都不允许"静默翻转成"全部允许"
+// —— 这正是最危险的方向。收集函数必须如实返回空数组（本用例），并由 keySave 拦下。
+func TestAppJSKeyFormAllowed(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; key pick test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function keyFormAllowed');
+const end = src.indexOf('async function keySave');
+if (start < 0 || end < 0 || end < start) throw new Error('keyFormAllowed region not found');
+let extra = '';
+const ctx = {
+  $: id => (id === 'kfModelsExtra' ? { value: extra } : null),
+  keyPickAll: true,
+  keyPickSel: new Set(),
+  Set, String, Array, Object,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.keyFormAllowed = keyFormAllowed;', ctx);
+const run = (all, sel, ex) => {
+  ctx.keyPickAll = all;
+  ctx.keyPickSel = new Set(sel);
+  extra = ex;
+  return ctx.keyFormAllowed();
+};
+process.stdout.write(JSON.stringify({
+  unlimited: run(true, ['cn:a'], ''),
+  picked: run(false, ['cn:a', 'global:b'], '   '),
+  merged: run(false, ['cn:a'], ' cn:a , custom-x ,, custom-y '),
+  blank: run(false, [], ' , ,\n '),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "keypick-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("key pick node test failed: %v\n%s", err, out)
+	}
+	// unlimited：不限制 ⇒ 空数组（哪怕勾选集里有残留，也不该带出去）
+	// picked   ：勾选的两个原样带出
+	// merged   ：勾选 + 「其他」合并去重，顺序 = 先勾选后其他
+	// blank    ：两者皆空 ⇒ 仍是空数组（空转"不限制"由 keySave 拦，不在这里编造）
+	const want = `{"unlimited":[],"picked":["cn:a","global:b"],"merged":["cn:a","custom-x","custom-y"],"blank":[]}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("keyFormAllowed=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
