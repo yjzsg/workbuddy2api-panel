@@ -1162,6 +1162,54 @@ go test -u 1001:1001 干净树 ./...          22 包全绿（CI 非 root 口径�
    `UserResource*` 在 ours 与 theirs 各有一份（位置不同）⇒ 编译报重复。判据：先看
    `git show HEAD:<file>` 与 theirs 的**签名集合**是否重合。
 
+## 5.14 本地增强层：多密钥（多 key）+ 根密钥不变量
+
+> 上游没有这个功能（`grep -ri "apikeys\|allowed_models" origin/main -- "*.go"` 为空）。
+> **下次同步上游时，以下文件属于本层，上游版本一律不得覆盖**。
+
+### 文件清单（本层）
+```
+internal/apikeys/{apikeys,apikeys_test}.go     密钥表：存储 / 常量时间匹配 / 白名单
+internal/panel/keys.go                         面板 REST：GET/POST /panel/api/keys、PUT/DELETE /{id}
+internal/panel/{index.html,app.js}「密钥」页    导航 data-view="keys" + <section id="view-keys">
+internal/usage/usage.go                        bucket 多一个 Key 维度（json:"k"）+ Snapshot.ByKey
+internal/server/keys_test.go                   多密钥认证 / 白名单 403 / models 过滤
+internal/usage/keys_usage_test.go              按 key 聚合与下钻
+cmd/server/main.go                             载入 keys.json、注入两处、启动自检
+```
+认证发生在**两处**（server `/v1`,`/status`,`/admin`；panel `/panel/api/*`），同源读
+keys.json，命中身份经 context 下发（`keyFromReq`）。**改一处一定要改另一处**。
+
+### 存储约定
+- 密钥落 `data/keys.json`（与 state.json 同目录），**不写 config.json**——面板会改它，
+  与用户手工编辑互相覆盖。原子写 + 固定 0600。
+- `config.json` 的 `api_key` 只在**首次启动**迁移成默认密钥（值不变，老客户端零改动）。
+- 用量桶 key 为空 = 多密钥启用前的历史记录，面板聚成「未标记」行，**不伪造归属**。
+
+### ⛔ 根密钥不变量（2026-10-13 事故后加）
+`config.json` 的 `api_key` = **根密钥**（`Store.SetRootSecret`），它：
+- **不可停用、不可删除**（`Update`/`Delete` 硬拦）；
+- 轮换路径保留：改掉该密钥的值，或改 config.json 的 `api_key`，保护自动解除；
+- 启动自检：config.api_key 不在密钥表 / 已停用时打 WARN。
+
+事故经过：线上验证时把迁移来的默认密钥停用，仍用原 api_key 的客户端**全体 401**，
+而网关日志毫无提示。**排查成本高，故升级为代码不变量。**
+
+### 与上游 paused 的命名差异（每轮同步都要核）
+| 概念 | 本仓 | 上游 |
+|---|---|---|
+| 暂停选号字段/API | `manual_disabled` / `SetManualDisabled` / `CountsDetailedWithManualDisabled` | `paused` / `Pause` / `CountsDetailedWithPaused` |
+| 面板 UI 文案 | 沿用上游「暂停选号」 | 「暂停选号」 |
+
+### 面板结构约束（新增页面必看）
+`index.html` 里每个导航项 `data-view="X"` 必须对应一个
+`<section class="view" id="view-X">`，且两者一一对应。
+2026-10-13 真实踩过：新增「密钥」页时补丁锚点吃掉了「配置」页的 **section 开标签**，
+于是配置表单（服务 / 定时任务…）变成悬空 DOM 紧跟密钥页渲染——看起来像
+「密钥页里有一堆服务配置、和原配置重复」，点导航「配置」则什么都不显示。
+Go 编译 / `node --check` / app.js 顶层冒烟**全部绿**。
+⇒ 已补 `TestPanelIndexViewsMatchNav` 钉住。
+
 ## 6. 禁止事项
 
 - ⛔ 别用上游 `Dockerfile`/`docker-compose.yml`/`config.example.json` 覆盖（L0 补丁：镜像站 401 绕行、entrypoint 指向 `/app/data/config.json`、PUID/PGID）

@@ -314,6 +314,9 @@ func main() {
 	if err := keyStore.Load(); err != nil {
 		log.Printf("[apikeys] 读取 %s 失败（从空表开始）：%v", keysPath, err)
 	}
+	// 记录根密钥（config.json 的 api_key）：它是网关的原始身份，禁止被停用/删除。
+	// 改 config.json 的 api_key 即解除保护（轮换路径）。
+	keyStore.SetRootSecret(cfg.APIKey)
 	if made, err := keyStore.EnsureDefault(cfg.APIKey,
 		"由 config.json 的 api_key 迁移而来（首次启用多密钥）"); err != nil {
 		log.Printf("[apikeys] 初始化默认密钥失败：%v", err)
@@ -331,6 +334,17 @@ func main() {
 			log.Printf("[apikeys] 未配置任何密钥 ⇒ 网关不鉴权（%s）", keysPath)
 		} else {
 			log.Printf("[apikeys] 多密钥已启用：%d/%d 把启用中（%s）", enabled, n, keysPath)
+		}
+	}
+	// 启动自检：config.json 的 api_key 必须在密钥表里且启用中，否则用它的客户端会 401。
+	// 2026-10-13 真实踩过：面板上把默认密钥停用 ⇒ 老客户端全体 401，日志却毫无提示。
+	if cfg.APIKey != "" {
+		if k, found := keyStore.FindBySecret(cfg.APIKey); !found {
+			log.Printf("[apikeys] ⚠ WARN: config.json 的 api_key 不在 %s 中 —— 仍在使用它的客户端会 401。"+
+				"如需继续使用，请在面板「密钥」页新增一把相同密钥值的密钥，或改 config.json 的 api_key", keysPath)
+		} else if !k.Enabled {
+			log.Printf("[apikeys] ⚠ WARN: config.json 的 api_key（%s，%s）已停用 —— 仍在使用它的客户端会 401。"+
+				"请在面板「密钥」页启用它", k.ID, k.Name)
 		}
 	}
 

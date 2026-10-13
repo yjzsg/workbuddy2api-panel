@@ -22,6 +22,9 @@ type keyRow struct {
 	AllowedModels []string `json:"allowed_models,omitempty"`
 	CreatedAt     string   `json:"created_at,omitempty"`
 	Migrated      bool     `json:"migrated_from_config,omitempty"`
+	// Root 标记该密钥持有 config.json 的 api_key（"根密钥"）：不可停用/删除，
+	// 前端据此隐藏这两个按钮（后端也有硬拦，见 apikeys.Store.Update/Delete）。
+	Root bool `json:"root,omitempty"`
 	// Orphan 标记"这把密钥不在表里"的行：引入多密钥之前的历史记录（ID 为空）
 	// 或已被删除的密钥。只读展示，不可编辑。
 	Orphan bool `json:"orphan,omitempty"`
@@ -71,6 +74,7 @@ func (p *Panel) keys(w http.ResponseWriter, r *http.Request) {
 			AllowedModels: k.AllowedModels,
 			CreatedAt:     k.CreatedAt,
 			Migrated:      k.MigratedFromConfig,
+			Root:          p.cfg.Keys.IsRoot(k),
 		})
 	}
 

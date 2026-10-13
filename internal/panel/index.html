@@ -908,7 +908,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 配置 -->
+    <!-- 密钥 -->
     <section class="view" id="view-keys" hidden>
       <div class="box">
         <header>
@@ -930,6 +930,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
           <div class="fbar" style="margin-top:6px">
             <label><input type="checkbox" id="kfEnabled" checked> 启用</label>
+            <span class="note" id="kfRootHint" hidden>受保护：这是 config.json 的 api_key，不能停用或删除（改 config.json 的 api_key 可解除）</span>
             <span class="grow"></span>
             <button class="xs" id="btnKeyCancel">取消</button>
             <button class="xs primary" id="btnKeySave">保存</button>
@@ -962,6 +963,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </section>
 
 
+    <!-- 配置 -->
+    <section class="view" id="view-config" hidden>
       <form id="cfgForm">
         <div class="box">
           <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>

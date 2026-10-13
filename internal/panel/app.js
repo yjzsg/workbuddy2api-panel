@@ -3033,6 +3033,7 @@ if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
    后端接口：GET/POST /panel/api/keys、PUT/DELETE /panel/api/keys/{id}。 */
 let keysCache = [];
 let keyEditID = null;      // null = 新增模式，非空 = 正在编辑该 id
+let keyEditRoot = false;   // 正在编辑的是否为"根密钥"（config.json 的 api_key）
 const keyRevealed = {};    // id → 是否展开明文
 const keyUsageOpen = {};   // id → 是否展开按模型明细
 
@@ -3082,12 +3083,16 @@ function renderKeys() {
     const status = k.orphan
       ? '<span class="tag warn">历史 / 已删除</span>'
       : (k.enabled ? '<span class="tag">启用</span>' : '<span class="tag warn">已停用</span>') +
-        (k.migrated_from_config ? ' <span class="tag">迁移</span>' : '');
+        (k.migrated_from_config ? ' <span class="tag">迁移</span>' : '') +
+        // 根密钥 = config.json 的 api_key：不可停用/删除（后端硬拦，前端不给按钮）。
+        (k.root ? ' <span class="tag">受保护</span>' : '');
     const nameCell = esc(k.name) + (k.note ? '<div class="id">' + esc(k.note) + '</div>' : '');
     const acts = k.orphan ? '' :
       '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="edit">编辑</button>' +
-      '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="toggle">' + (k.enabled ? '停用' : '启用') + '</button>' +
-      '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="del">删除</button>';
+      // 根密钥不提供停用/删除（它是老客户端仍在用的原始身份）。
+      (k.root ? '' :
+        '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="toggle">' + (k.enabled ? '停用' : '启用') + '</button>' +
+        '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="del">删除</button>');
     let html = '<tr>' +
       '<td>' + nameCell + '</td>' +
       '<td>' + secretCell + '</td>' +
@@ -3117,6 +3122,7 @@ function renderKeys() {
 /* keyFormOpen 打开编辑/新增表单；k 为空 = 新增。 */
 function keyFormOpen(k) {
   keyEditID = k ? k.id : null;
+  keyEditRoot = !!(k && k.root);
   $('keyForm').hidden = false;
   $('kfErr').hidden = true;
   $('kfName').value = k ? k.name : '';
@@ -3124,13 +3130,19 @@ function keyFormOpen(k) {
   $('kfNote').value = k ? (k.note || '') : '';
   $('kfModels').value = k && k.allowed_models ? k.allowed_models.join(', ') : '';
   $('kfEnabled').checked = k ? !!k.enabled : true;
+  // 根密钥的「启用」不可改（后端会拒），锁住复选框并给出原因。
+  $('kfEnabled').disabled = keyEditRoot;
+  if ($('kfRootHint')) $('kfRootHint').hidden = !keyEditRoot;
   $('kfName').focus();
 }
 
 function keyFormClose() {
   $('keyForm').hidden = true;
   keyEditID = null;
+  keyEditRoot = false;
   $('kfErr').hidden = true;
+  if ($('kfRootHint')) $('kfRootHint').hidden = true;
+  $('kfEnabled').disabled = false;
 }
 
 /* keyFormModels 解析白名单输入（逗号或换行分隔）。 */
@@ -3144,8 +3156,9 @@ async function keySave() {
     secret: $('kfSecret').value.trim(),
     note: $('kfNote').value.trim(),
     allowed_models: keyFormModels(),
-    enabled: $('kfEnabled').checked,
   };
+  // 根密钥不带 enabled：既不误改它，也避免后端硬拦导致整个保存失败。
+  if (!keyEditRoot) body.enabled = $('kfEnabled').checked;
   try {
     if (keyEditID) {
       await api('keys/' + encodeURIComponent(keyEditID), { method: 'PUT', body: JSON.stringify(body) });

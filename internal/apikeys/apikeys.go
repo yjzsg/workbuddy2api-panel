@@ -77,6 +77,9 @@ type Store struct {
 	mu   sync.RWMutex
 	path string
 	keys []Key
+	// rootSecret = config.json 的 api_key（"根密钥"）。非空时，持有该值的密钥
+	// 不允许被停用或删除——它是网关的原始身份，老客户端仍在用它。见 SetRootSecret。
+	rootSecret string
 }
 
 // NewStore 创建密钥表。path 为空时禁用落盘（纯内存，测试用）。
@@ -84,6 +87,46 @@ func NewStore(path string) *Store { return &Store{path: path} }
 
 // Path 返回落盘路径。
 func (s *Store) Path() string { return s.path }
+
+// SetRootSecret 记录 config.json 的 api_key（由启动流程调用）。
+//
+// 为什么需要：它是网关的**原始身份**。若被停用/删除，所有仍用它的客户端会静默
+// 401（2026-10-13 真实发生过一次），而网关日志不会提示任何异常。
+// 传入空串表示"config.json 未配 api_key"，此时不施加保护。
+//
+// 轮换路径：改掉该密钥的 secret（或改 config.json 的 api_key）即自动解除保护。
+func (s *Store) SetRootSecret(secret string) {
+	s.mu.Lock()
+	s.rootSecret = strings.TrimSpace(secret)
+	s.mu.Unlock()
+}
+
+// RootSecret 返回当前记录的根密钥值（空 = 无根密钥概念）。
+func (s *Store) RootSecret() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rootSecret
+}
+
+// IsRoot 判断某把密钥是否是 config.json 的 api_key（面板据此显示"受保护"）。
+func (s *Store) IsRoot(k Key) bool {
+	s.mu.RLock()
+	rs := s.rootSecret
+	s.mu.RUnlock()
+	return rs != "" && k.Secret == rs
+}
+
+// FindBySecret 按密钥值查条目（含**已停用**的——调用方通常想知道"是停用了还是不存在"）。
+func (s *Store) FindBySecret(secret string) (Key, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, k := range s.keys {
+		if k.Secret == secret {
+			return k, true
+		}
+	}
+	return Key{}, false
+}
 
 type fileShape struct {
 	Version int    `json:"version"`
@@ -293,6 +336,13 @@ func (s *Store) Update(id string, p Patch) (Key, error) {
 	}
 	if p.Enabled != nil {
 		if !*p.Enabled && cur.Enabled {
+			// 根密钥保护：停用它 = 用 config.json api_key 的客户端全部 401。
+			// 这条不变量在 2026-10-13 被一次运维操作破坏过，故在此硬拦。
+			if s.rootSecret != "" && cur.Secret == s.rootSecret {
+				s.mu.Unlock()
+				return Key{}, fmt.Errorf("这是 config.json 的 api_key（根密钥），不能停用；" +
+					"如需改用它，请先修改 config.json 的 api_key，或在此改掉该密钥值")
+			}
 			// 停用最后一把启用中的密钥 = 网关不再鉴权，拒绝。
 			remain := 0
 			for i, k := range s.keys {
@@ -328,6 +378,12 @@ func (s *Store) Delete(id string) error {
 	if idx < 0 {
 		s.mu.Unlock()
 		return fmt.Errorf("密钥不存在")
+	}
+	// 根密钥保护：删掉它 = 用 config.json api_key 的客户端全部 401。
+	if s.rootSecret != "" && s.keys[idx].Secret == s.rootSecret {
+		s.mu.Unlock()
+		return fmt.Errorf("这是 config.json 的 api_key（根密钥），不能删除；" +
+			"如需移除它，请先修改 config.json 的 api_key")
 	}
 	remain := 0
 	for i, k := range s.keys {

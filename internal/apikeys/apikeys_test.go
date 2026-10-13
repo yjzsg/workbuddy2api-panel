@@ -205,3 +205,114 @@ func TestNormAllowedAndMask(t *testing.T) {
 		t.Fatalf("短密钥应整体打码，实际 %q", got)
 	}
 }
+
+func TestRootKeyProtectedFromDisableAndDelete(t *testing.T) {
+	s := NewStore("")
+	root, _ := s.Add("默认密钥", "legacy-key", "", nil, true)
+	other, _ := s.Add("别的", "other-key", "", nil, true)
+	s.SetRootSecret("legacy-key")
+
+	// 表里还有别的启用密钥 ⇒ 不会被「最后一把」规则拦，只能是被根密钥规则拦。
+	dis := false
+	if _, err := s.Update(root.ID, Patch{Enabled: &dis}); err == nil {
+		t.Fatal("根密钥不应能被停用")
+	}
+	if err := s.Delete(root.ID); err == nil {
+		t.Fatal("根密钥不应能被删除")
+	}
+	if !s.IsRoot(root) {
+		t.Fatal("IsRoot 应认出根密钥")
+	}
+	if s.IsRoot(other) {
+		t.Fatal("非根密钥不应被判为根密钥")
+	}
+
+	// 非根密钥不受影响。
+	if _, err := s.Update(other.ID, Patch{Enabled: &dis}); err != nil {
+		t.Fatalf("非根密钥应可停用：%v", err)
+	}
+	// 根密钥的其他字段照旧可改（改名/备注/白名单）。
+	name := "改个名"
+	got, err := s.Update(root.ID, Patch{Name: &name})
+	if err != nil {
+		t.Fatalf("根密钥应可改名：%v", err)
+	}
+	if got.Name != "改个名" || !got.Enabled || got.Secret != "legacy-key" {
+		t.Fatalf("改名不应影响启用状态与密钥值：%+v", got)
+	}
+}
+
+func TestRootGuardLiftedAfterRotation(t *testing.T) {
+	s := NewStore("")
+	k, _ := s.Add("默认密钥", "legacy-key", "", nil, true)
+	s.SetRootSecret("legacy-key")
+
+	// 先改掉密钥值：它不再是 config.json 的 api_key ⇒ 根密钥保护解除。
+	// （此时仍受「最后一把启用」保护，因为它是唯一启用中的。）
+	rotated := "rotated-key"
+	// 注意用 Update 的返回值判定：k 是 Add 时的旧副本，拿它判会永远命中。
+	rotatedKey, err := s.Update(k.ID, Patch{Secret: &rotated})
+	if err != nil {
+		t.Fatalf("应允许轮换密钥值：%v", err)
+	}
+	if rotatedKey.Secret != rotated {
+		t.Fatalf("密钥值未更新：%+v", rotatedKey)
+	}
+	if s.IsRoot(rotatedKey) {
+		t.Fatal("轮换后不应再是根密钥")
+	}
+	// 注：IsRoot 是 (rootSecret, k.Secret) 的纯函数，拿轮换前的旧副本判仍会命中
+	// "旧值"——那是预期行为（该副本已不对应表里的任何条目），不作断言。
+	dis := false
+	if _, err := s.Update(k.ID, Patch{Enabled: &dis}); err == nil {
+		t.Fatal("唯一启用中的密钥仍应受「最后一把」保护")
+	}
+
+	// 补一把启用的：现在可以停用旧的了（证明根密钥保护确实解除）。
+	if _, err := s.Add("新的", "rotated2", "", nil, true); err != nil {
+		t.Fatalf("新增失败：%v", err)
+	}
+	if _, err := s.Update(k.ID, Patch{Enabled: &dis}); err != nil {
+		t.Fatalf("轮换 + 有别的启用密钥后应可停用：%v", err)
+	}
+	// 已停用且不再是根 ⇒ 可以删除。（不能删新的那把：它是唯一启用中的。）
+	if err := s.Delete(k.ID); err != nil {
+		t.Fatalf("已停用的非根密钥应可删除：%v", err)
+	}
+}
+
+func TestUpdatePartialKeepsOtherFields(t *testing.T) {
+	s := NewStore("")
+	k, _ := s.Add("原名", "s1", "原备注", []string{"glm-5.2"}, true)
+	name := "新名"
+	got, err := s.Update(k.ID, Patch{Name: &name})
+	if err != nil {
+		t.Fatalf("改名失败：%v", err)
+	}
+	// Patch 用指针字段区分「没传」与「传了零值」——没传的字段必须原样保留。
+	// （面板的「编辑」只传部分字段，若语义退化会把 enabled 误写成 false。）
+	if !got.Enabled || got.Secret != "s1" || got.Note != "原备注" || len(got.AllowedModels) != 1 {
+		t.Fatalf("局部更新不应影响其他字段：%+v", got)
+	}
+}
+
+func TestFindBySecret(t *testing.T) {
+	s := NewStore("")
+	k, _ := s.Add("a", "s1", "", nil, true)
+	if got, found := s.FindBySecret("s1"); !found || got.ID != k.ID {
+		t.Fatalf("FindBySecret 未命中：%+v %v", got, found)
+	}
+	if _, found := s.FindBySecret("nope"); found {
+		t.Fatal("不存在的密钥不应命中")
+	}
+	// 停用后仍要能按值找到——调用方需要区分「已停用」与「不存在」。
+	dis := false
+	order, _ := s.Add("b", "s2", "", nil, true)
+	if _, err := s.Update(order.ID, Patch{Enabled: &dis}); err != nil {
+		t.Fatalf("停用失败：%v", err)
+	}
+	got, found := s.FindBySecret("s2")
+	if !found || got.Enabled {
+		t.Fatalf("停用的密钥应能找到且 Enabled=false：%+v %v", got, found)
+	}
+}

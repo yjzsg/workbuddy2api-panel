@@ -113,7 +113,8 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	// 每个导航项都要覆盖：漏一个就等于该页面没有运行时闸门（#keys 是后加的，最初就漏了）。
+	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#keys", "#config", "#logs", "#packages"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -1004,5 +1005,49 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestPanelIndexViewsMatchNav 导航项与视图容器必须一一对应。
+//
+// 为什么需要：新增页面时若把 `<section class="view" id="view-X">` 的**开标签**
+// 弄丢，后果是那个页面的内容变成悬空 DOM——点导航什么都不显示，而后续表单会
+// "泄漏"到上一个页面的位置，看起来像功能重复。
+//
+// 2026-10-13 真实发生过：新增「密钥」页时顶掉了「配置」页的开标签，于是配置表单
+// （服务 / 定时任务 / …）紧跟在密钥页后面渲染。Go 编译、JS 语法检查、app.js 顶层
+// 冒烟（DOM 是惰性桩）三条全绿，只有人肉点开页面才会发现。
+func TestPanelIndexViewsMatchNav(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+
+	nav := map[string]bool{}
+	for _, m := range regexp.MustCompile(`data-view="([a-z]+)"`).FindAllStringSubmatch(html, -1) {
+		nav[m[1]] = true
+	}
+	views := map[string]bool{}
+	for _, m := range regexp.MustCompile(`<section class="view" id="view-([a-z]+)"`).FindAllStringSubmatch(html, -1) {
+		views[m[1]] = true
+	}
+	if len(nav) == 0 || len(views) == 0 {
+		t.Fatalf("解析失败：导航项 %d 个、视图 %d 个", len(nav), len(views))
+	}
+	for v := range nav {
+		if !views[v] {
+			t.Errorf("导航项 %q 没有对应的视图容器 <section id=\"view-%s\">", v, v)
+		}
+	}
+	for v := range views {
+		if !nav[v] {
+			t.Errorf("视图容器 view-%s 没有对应的导航项", v)
+		}
+	}
+
+	// 配置表单必须落在它自己的 section 内，否则会显示在相邻页面下面。
+	if !regexp.MustCompile(`(?s)<section class="view" id="view-config"[^>]*>\s*<form id="cfgForm">`).MatchString(html) {
+		t.Error("配置表单 <form id=\"cfgForm\"> 不在 <section id=\"view-config\"> 之内（会泄漏到相邻页面）")
 	}
 }
