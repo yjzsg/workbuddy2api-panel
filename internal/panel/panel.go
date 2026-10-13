@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -38,8 +39,10 @@ type Config struct {
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	// Keys 多密钥表（nil = 退回单 api_key 语义）。面板提供 CRUD 与按密钥用量视图。
+	Keys      *apikeys.Store
+	RedisMode string // "upstash" / "noop"，仅观测透出
+	Version   string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -154,6 +157,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	// 多密钥（多 key）：列表带每把密钥的用量；增删改直接落 keys.json。
+	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keys))
+	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keyAdd))
+	p.mux.HandleFunc("PUT /panel/api/keys/{id}", p.withAuth(p.keyUpdate))
+	p.mux.HandleFunc("DELETE /panel/api/keys/{id}", p.withAuth(p.keyDelete))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -204,7 +212,15 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		// 多密钥表优先：与主服务读同一份 keys.json，口径不会漂移
+		//（面板与 /v1 用同一把密钥是既有约定，多密钥下自然延续）。
+		// Keys 为 nil 时退回单 api_key 语义（测试/裸用）。
+		if p.cfg.Keys != nil {
+			if _, ok := p.cfg.Keys.MatchAuthz(r.Header.Get("Authorization")); !ok {
+				writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+				return
+			}
+		} else if !httpauth.VerifyBearer(r, p.apiKey()) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -305,6 +306,34 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 多密钥（多 key）表：与 state.json 同目录的 keys.json（独立文件，面板可增删改）。
+	// 首次启用时把 config.json 的 api_key 迁移为默认密钥——**密钥值不变**，
+	// 现有客户端零改动；迁移只做一次，此后以 keys.json 为准。
+	keysPath := stateSibling(cfg.StateFile, "keys.json")
+	keyStore := apikeys.NewStore(keysPath)
+	if err := keyStore.Load(); err != nil {
+		log.Printf("[apikeys] 读取 %s 失败（从空表开始）：%v", keysPath, err)
+	}
+	if made, err := keyStore.EnsureDefault(cfg.APIKey,
+		"由 config.json 的 api_key 迁移而来（首次启用多密钥）"); err != nil {
+		log.Printf("[apikeys] 初始化默认密钥失败：%v", err)
+	} else if made {
+		log.Printf("[apikeys] 已把 config.json 的 api_key 迁移为默认密钥（值不变；%s）", keysPath)
+	}
+	{
+		n, enabled := keyStore.Count(), 0
+		for _, k := range keyStore.List() {
+			if k.Enabled {
+				enabled++
+			}
+		}
+		if n == 0 {
+			log.Printf("[apikeys] 未配置任何密钥 ⇒ 网关不鉴权（%s）", keysPath)
+		} else {
+			log.Printf("[apikeys] 多密钥已启用：%d/%d 把启用中（%s）", enabled, n, keysPath)
+		}
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -313,6 +342,7 @@ func main() {
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
+		Keys:        keyStore,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
@@ -338,6 +368,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		Keys:         keyStore,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,

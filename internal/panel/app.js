@@ -338,7 +338,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', keys: '密钥', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -349,6 +349,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'keys') loadKeys();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
@@ -3024,3 +3025,191 @@ if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+
+/* ── 密钥（多 key）：CRUD + 按密钥用量 ────────────────────────────────
+   用量取自后端 usage 的 ByKey 维度（按 key 单独统计，含按模型下钻）；
+   每把密钥可限制可用模型（留空 = 全部）。密钥值默认打码，点「显示」才展开。
+   后端接口：GET/POST /panel/api/keys、PUT/DELETE /panel/api/keys/{id}。 */
+let keysCache = [];
+let keyEditID = null;      // null = 新增模式，非空 = 正在编辑该 id
+const keyRevealed = {};    // id → 是否展开明文
+const keyUsageOpen = {};   // id → 是否展开按模型明细
+
+/* keyMask 打码：保留前 4 后 4，中间固定 6 个星号（短串整体打码）。 */
+function keyMask(s) {
+  s = String(s || '');
+  if (!s) return '—';
+  if (s.length <= 8) return '*'.repeat(s.length);
+  return s.slice(0, 4) + '******' + s.slice(-4);
+}
+
+function fmtNum(n) {
+  n = Number(n || 0);
+  return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+}
+function fmtCredit(n) {
+  n = Number(n || 0);
+  return n ? n.toFixed(2) : '0';
+}
+
+async function loadKeys() {
+  const hours = $('keyHours') ? $('keyHours').value : '0';
+  const d = await api('keys?hours=' + encodeURIComponent(hours));
+  keysCache = d.keys || [];
+  if ($('keysFile')) $('keysFile').textContent = d.keys_file || '';
+  renderKeys();
+}
+
+function renderKeys() {
+  const tb = $('keyBody');
+  if (!tb) return;
+  if (!keysCache.length) {
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">还没有密钥</div>点右上角「新增密钥」开始；密钥为空时网关不鉴权</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = keysCache.map(k => {
+    const u = k.usage || {};
+    // 密钥列：孤儿行（历史/已删除）没有值可看。
+    const secretCell = k.orphan
+      ? '<span style="color:var(--ink-3)">—</span>'
+      : '<code>' + esc(keyRevealed[k.id] ? k.secret : keyMask(k.secret)) + '</code> ' +
+        '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="reveal">' + (keyRevealed[k.id] ? '隐藏' : '显示') + '</button> ' +
+        '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="copy">复制</button>';
+    const models = (k.allowed_models && k.allowed_models.length)
+      ? esc(k.allowed_models.join(', '))
+      : '<span style="color:var(--ink-3)">全部</span>';
+    const status = k.orphan
+      ? '<span class="tag warn">历史 / 已删除</span>'
+      : (k.enabled ? '<span class="tag">启用</span>' : '<span class="tag warn">已停用</span>') +
+        (k.migrated_from_config ? ' <span class="tag">迁移</span>' : '');
+    const nameCell = esc(k.name) + (k.note ? '<div class="id">' + esc(k.note) + '</div>' : '');
+    const acts = k.orphan ? '' :
+      '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="edit">编辑</button>' +
+      '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="toggle">' + (k.enabled ? '停用' : '启用') + '</button>' +
+      '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="del">删除</button>';
+    let html = '<tr>' +
+      '<td>' + nameCell + '</td>' +
+      '<td>' + secretCell + '</td>' +
+      '<td>' + models + '</td>' +
+      '<td>' + status + '</td>' +
+      '<td><button class="xs ghost" data-k="' + esc(k.id) + '" data-a="models">' +
+        fmtNum(u.requests) + ' / ' + fmtNum(u.errors) + '</button></td>' +
+      '<td>' + fmtNum(u.total_tokens) + '</td>' +
+      '<td>' + fmtCredit(u.credits) + '</td>' +
+      '<td>' + (u.avg_latency_ms ? Math.round(u.avg_latency_ms) + 'ms' : '—') + '</td>' +
+      '<td class="c-acts">' + acts + '</td>' +
+      '</tr>';
+    // 按模型下钻（点「请求 / 失败」那一格展开）
+    if (keyUsageOpen[k.id]) {
+      const rows = (k.by_model || []).map(m =>
+        '<tr><td>' + esc(m.key) + '</td><td>' + fmtNum(m.requests) + '</td>' +
+        '<td>' + fmtNum(m.total_tokens) + '</td><td>' + fmtCredit(m.credits) + '</td></tr>').join('');
+      html += '<tr><td colspan="9"><table class="acc"><thead><tr>' +
+        '<th>模型</th><th>请求</th><th>Tokens</th><th>积分</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="4"><span style="color:var(--ink-3)">该窗口内没有用量</span></td></tr>') +
+        '</tbody></table></td></tr>';
+    }
+    return html;
+  }).join('');
+}
+
+/* keyFormOpen 打开编辑/新增表单；k 为空 = 新增。 */
+function keyFormOpen(k) {
+  keyEditID = k ? k.id : null;
+  $('keyForm').hidden = false;
+  $('kfErr').hidden = true;
+  $('kfName').value = k ? k.name : '';
+  $('kfSecret').value = k ? k.secret : '';
+  $('kfNote').value = k ? (k.note || '') : '';
+  $('kfModels').value = k && k.allowed_models ? k.allowed_models.join(', ') : '';
+  $('kfEnabled').checked = k ? !!k.enabled : true;
+  $('kfName').focus();
+}
+
+function keyFormClose() {
+  $('keyForm').hidden = true;
+  keyEditID = null;
+  $('kfErr').hidden = true;
+}
+
+/* keyFormModels 解析白名单输入（逗号或换行分隔）。 */
+function keyFormModels() {
+  return $('kfModels').value.split(/[\n,]/).map(x => x.trim()).filter(Boolean);
+}
+
+async function keySave() {
+  const body = {
+    name: $('kfName').value.trim(),
+    secret: $('kfSecret').value.trim(),
+    note: $('kfNote').value.trim(),
+    allowed_models: keyFormModels(),
+    enabled: $('kfEnabled').checked,
+  };
+  try {
+    if (keyEditID) {
+      await api('keys/' + encodeURIComponent(keyEditID), { method: 'PUT', body: JSON.stringify(body) });
+      toast('已保存', 'ok');
+    } else {
+      const r = await api('keys', { method: 'POST', body: JSON.stringify(body) });
+      const sec = (r.key || {}).secret || '';
+      toast(sec ? ('已新增，密钥值：' + sec) : '已新增', 'ok');
+    }
+    keyFormClose();
+    await loadKeys();
+  } catch (e) {
+    $('kfErr').hidden = false;
+    $('kfErr').textContent = e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/* 密钥页事件绑定（DOM 就绪后执行一次）。 */
+(function bindKeysPage() {
+  if (!$('keyBody')) return;
+  $('btnKeysRefresh').onclick = () => loadKeys().catch(e => toast(e.message, 'err'));
+  $('btnKeyAdd').onclick = () => keyFormOpen(null);
+  $('btnKeyCancel').onclick = keyFormClose;
+  $('btnKeySave').onclick = keySave;
+  $('keyHours').onchange = () => loadKeys().catch(e => toast(e.message, 'err'));
+  $('keyBody').onclick = async ev => {
+    const b = ev.target.closest('button[data-a]');
+    if (!b) return;
+    const id = b.dataset.k;
+    const act = b.dataset.a;
+    const k = keysCache.find(x => x.id === id);
+    if (!k) return;
+    if (act === 'reveal') {
+      keyRevealed[id] = !keyRevealed[id];
+      renderKeys();
+    } else if (act === 'copy') {
+      try {
+        await navigator.clipboard.writeText(k.secret);
+        toast('已复制到剪贴板', 'ok');
+      } catch (e) {
+        // 非 HTTPS / 浏览器限制：提示改用「显示」手动复制，不静默失败。
+        toast('复制失败（浏览器限制），请点「显示」后手动复制', 'err');
+      }
+    } else if (act === 'edit') {
+      keyFormOpen(k);
+    } else if (act === 'models') {
+      keyUsageOpen[id] = !keyUsageOpen[id];
+      renderKeys();
+    } else if (act === 'toggle') {
+      try {
+        await api('keys/' + encodeURIComponent(id), {
+          method: 'PUT', body: JSON.stringify({ enabled: !k.enabled }),
+        });
+        await loadKeys();
+        toast(k.enabled ? '已停用' : '已启用', 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+    } else if (act === 'del') {
+      if (!confirm('删除密钥「' + k.name + '」？正在使用它的客户端会立即 401。')) return;
+      try {
+        await api('keys/' + encodeURIComponent(id), { method: 'DELETE' });
+        await loadKeys();
+        toast('已删除', 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+    }
+  };
+})();

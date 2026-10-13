@@ -42,27 +42,30 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
-// 旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 4
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计，版本 5 增加密钥维度；
+// 旧版本缺失字段按零值加载，旧数据不会丢弃（旧桶 Key 为空 ⇒ 面板聚成"未标记"行）。
+const fileVersion = 5
 
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`           // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`           // cn / global
-	UID   string  `json:"u"`           // 账号 uid
-	Model string  `json:"m"`           // 上游裸模型名
-	Rate  string  `json:"x,omitempty"` // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`           // 请求数（含失败）
-	Err   int64   `json:"e"`           // 失败数
-	PT    int64   `json:"p"`           // prompt tokens
-	CT    int64   `json:"c"`           // completion tokens
-	TT    int64   `json:"t"`           // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`           // 延迟累计（ms）
-	LatN  int64   `json:"ln"`          // 延迟样本数
-	TPS   float64 `json:"v"`           // 吐字速率累计
-	TPSN  int64   `json:"vn"`          // 速率样本数
+	Scope string `json:"s"`           // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string `json:"r"`           // cn / global
+	UID   string `json:"u"`           // 账号 uid
+	Model string `json:"m"`           // 上游裸模型名
+	Rate  string `json:"x,omitempty"` // 请求时生效积分倍率（规范化数值；旧桶为空）
+	// Key 密钥 ID（多 key 维度的分组键）。为空 = 引入多 key 之前的记录，
+	// 面板把空值聚合成"未标记"一行，不伪造归属。
+	Key   string  `json:"k,omitempty"`
+	Req   int64   `json:"q"`  // 请求数（含失败）
+	Err   int64   `json:"e"`  // 失败数
+	PT    int64   `json:"p"`  // prompt tokens
+	CT    int64   `json:"c"`  // completion tokens
+	TT    int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`  // 延迟累计（ms）
+	LatN  int64   `json:"ln"` // 延迟样本数
+	TPS   float64 `json:"v"`  // 吐字速率累计
+	TPSN  int64   `json:"vn"` // 速率样本数
 	// prompt cache 三段（计数器语义：缺失即 0，不区分「缺观测」与「显式 0」——
 	// 与 freebuff 的 cache_read/cache_creation 同口径）。命中率的"无观测"
 	// 由 hit+miss==0 在展示侧判定。本仓 2026-09-24 新增。
@@ -169,7 +172,7 @@ type Delta struct {
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
-func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+func (r *Recorder) Add(now time.Time, realm, uid, model, keyID string, d Delta, ok bool) {
 	if r == nil {
 		return
 	}
@@ -180,14 +183,14 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		model = "(unknown)"
 	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate + "|" + keyID
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
+		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate, Key: keyID}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -435,6 +438,14 @@ type KeyedAgg struct {
 	Agg
 }
 
+// KeyUsage 单个密钥的用量视图：汇总 + 按模型下钻。
+type KeyUsage struct {
+	ID  string `json:"id"`
+	Agg Agg    `json:"agg"`
+	// ByModel 该密钥按上游裸模型名的分布（按 total_tokens 降序）。
+	ByModel []KeyedAgg `json:"by_model"`
+}
+
 // Point 时序上的一个点。
 type Point struct {
 	T     string `json:"t"`
@@ -492,9 +503,12 @@ type Snapshot struct {
 	Series          []Point     `json:"series"`
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	// ByKey 按密钥维度的用量（汇总 + 按模型下钻）。引入多 key 之前的历史记录
+	// 聚到 ID 为空的"未标记"一行。
+	ByKey     []KeyUsage `json:"by_key"`
+	Buckets   int        `json:"buckets"`
+	FileBytes int64      `json:"file_bytes"`
+	Since     string     `json:"since,omitempty"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
@@ -589,6 +603,8 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
+	keyAgg := map[string]*aggAcc{}
+	keyModelAgg := map[string]map[string]*aggAcc{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 	creditAcctAgg := map[string]*creditAcc{}
@@ -639,6 +655,19 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			modelAgg[b.Model] = &aggAcc{}
 		}
 		modelAgg[b.Model].add(b)
+
+		// 密钥维度：汇总 + (密钥, 模型) 二维下钻。
+		if keyAgg[b.Key] == nil {
+			keyAgg[b.Key] = &aggAcc{}
+		}
+		keyAgg[b.Key].add(b)
+		if keyModelAgg[b.Key] == nil {
+			keyModelAgg[b.Key] = map[string]*aggAcc{}
+		}
+		if keyModelAgg[b.Key][b.Model] == nil {
+			keyModelAgg[b.Key][b.Model] = &aggAcc{}
+		}
+		keyModelAgg[b.Key][b.Model].add(b)
 
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
@@ -703,6 +732,31 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
 	}
+
+	// 按密钥：外层按请求数降序（面板默认先看用得最多的），内层按 total_tokens 降序。
+	keyIDs := make([]string, 0, len(keyAgg))
+	for k := range keyAgg {
+		keyIDs = append(keyIDs, k)
+	}
+	sort.Strings(keyIDs)
+	for _, k := range keyIDs {
+		ku := KeyUsage{ID: k, Agg: keyAgg[k].finish()}
+		models := make([]string, 0, len(keyModelAgg[k]))
+		for m := range keyModelAgg[k] {
+			models = append(models, m)
+		}
+		sort.Strings(models)
+		for _, m := range models {
+			ku.ByModel = append(ku.ByModel, KeyedAgg{Key: m, Agg: keyModelAgg[k][m].finish()})
+		}
+		sort.SliceStable(ku.ByModel, func(i, j int) bool {
+			return ku.ByModel[i].Agg.TotalTokens > ku.ByModel[j].Agg.TotalTokens
+		})
+		snap.ByKey = append(snap.ByKey, ku)
+	}
+	sort.SliceStable(snap.ByKey, func(i, j int) bool {
+		return snap.ByKey[i].Agg.Requests > snap.ByKey[j].Agg.Requests
+	})
 
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
 	dayKeys := make([]string, 0, len(daySeries))

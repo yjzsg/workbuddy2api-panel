@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -29,10 +30,12 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	APIKey   string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）。多密钥启用后仅作回落
+	// Keys 多密钥表（nil = 退回单 api_key 语义；测试与裸用场景）。
+	Keys      *apikeys.Store
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -197,16 +200,60 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// keyCtxKey context 中承载"本次请求命中的密钥"的键。
+type keyCtxKey struct{}
+
+// withKeyCtx 把命中的密钥挂到请求 context，供下游（模型白名单、用量按 key 统计）读取。
+func withKeyCtx(ctx context.Context, k *apikeys.Key) context.Context {
+	return context.WithValue(ctx, keyCtxKey{}, k)
+}
+
+// keyFromReq 取本次请求命中的密钥；未启用多密钥（单 api_key 裸用）时为 nil。
+func keyFromReq(r *http.Request) *apikeys.Key {
+	if v := r.Context().Value(keyCtxKey{}); v != nil {
+		if k, ok := v.(*apikeys.Key); ok {
+			return k
+		}
+	}
+	return nil
+}
+
+// keyIDOf 取本次请求命中的密钥 ID；无密钥上下文时返回空串。
+//
+// 空串在 usage 侧是合法的"未标记"维度：引入多密钥之前的旧记录也是空串，
+// 两者在面板上合并成一行，不伪造归属。
+func keyIDOf(r *http.Request) string {
+	if k := keyFromReq(r); k != nil {
+		return k.ID
+	}
+	return ""
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 面板层：鉴权原语统一走 httpauth（SHA-256 摘要 + 常量时间比较），密钥取
-		// 运行期快照（面板在线改 api_key 后立即生效；Live 为 nil 时回落静态字段）。
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		// 多密钥表优先（能拿到命中身份，供用量按 key 统计与模型白名单）；
+		// Keys 为 nil 时退回旧单密钥语义：httpauth（SHA-256 + 常量时间）+ 运行期
+		// 快照（面板在线改 api_key 立即生效）。
+		key, ok := h.matchKey(r)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(withKeyCtx(r.Context(), key)))
 	}
+}
+
+// matchKey 校验调用方密钥，返回命中的密钥（单密钥模式恒为 nil）与是否放行。
+//
+// 多密钥表为空 ⇒ MatchAuthz 返回 (nil, true)，与"api_key 为空 = 不鉴权"同语义。
+func (h *Handler) matchKey(r *http.Request) (*apikeys.Key, bool) {
+	if h.cfg.Keys != nil {
+		return h.cfg.Keys.MatchAuthz(r.Header.Get("Authorization"))
+	}
+	if httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		return nil, true
+	}
+	return nil, false
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -320,9 +367,23 @@ const (
 
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	list := h.modelList()
+	// 密钥白名单：只列出该密钥可用的模型，避免客户端拿到必然 403 的名字。
+	// 白名单为空 = 不限制，此时直接透传（零额外开销）。
+	if key := keyFromReq(r); key != nil && len(key.AllowedModels) > 0 {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, m := range list {
+			id, _ := m["id"].(string)
+			realm, bare := resolveModel(id)
+			if key.AllowsModel(realm, bare) {
+				filtered = append(filtered, m)
+			}
+		}
+		list = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
 }
 
@@ -622,6 +683,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+
+	// 密钥模型白名单（多密钥特性）：命中密钥限定了模型范围时，名单外的请求直接 403，
+	// 既不消耗上游调用也不参与选号。单密钥/裸用场景 key 为 nil ⇒ 不限制。
+	// 刻意放在 modelRate 查询之前：被白名单拒绝的请求不该产生任何上游/池副作用。
+	if key := keyFromReq(r); key != nil && !key.AllowsModel(realm, bareModel) {
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
+			"model "+peek.Model+" is not allowed for this API key")
+		return
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -764,7 +834,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 				realm = a.Realm
 			}
-			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, keyIDOf(r), usage.Delta{
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
 				CompletionTokens: delta.CompletionTokens,

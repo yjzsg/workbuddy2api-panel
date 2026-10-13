@@ -12,12 +12,12 @@ import (
 func TestCacheTokensRecordedAndAggregated(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now, "global", "u1", "deepseek-v4.1-flash", Delta{
+	r.Add(now, "global", "u1", "deepseek-v4.1-flash", "", Delta{
 		HasCacheTokens: true,
 		PromptTokens:   1000, HasPromptTokens: true,
 		CacheHitTokens: 800, CacheMissTokens: 200, CacheWriteTokens: 50,
 	}, true)
-	r.Add(now, "global", "u1", "deepseek-v4.1-flash", Delta{
+	r.Add(now, "global", "u1", "deepseek-v4.1-flash", "", Delta{
 		HasCacheTokens: true,
 		PromptTokens:   1000, HasPromptTokens: true,
 		CacheHitTokens: 1000, CacheMissTokens: 0, CacheWriteTokens: 0,
@@ -43,7 +43,7 @@ func TestCacheTokensRecordedAndAggregated(t *testing.T) {
 // 由前端按 hit+miss==0 显示 "—"。后端不编造：把"没观测"写成"命中率 0%"是两回事。
 func TestCacheHitRateZeroWhenNoObservation(t *testing.T) {
 	r := New("")
-	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true)
+	r.Add(time.Now(), "cn", "u", "m", "", Delta{PromptTokens: 5, HasPromptTokens: true}, true)
 	s := r.Snapshot(24, nil)
 	if s.Totals.CacheHitTokens != 0 || s.Totals.CacheMissTokens != 0 {
 		t.Fatalf("cache 应为 0，得到 %d/%d", s.Totals.CacheHitTokens, s.Totals.CacheMissTokens)
@@ -59,10 +59,10 @@ func TestCacheHitRateZeroWhenNoObservation(t *testing.T) {
 func TestCacheSurvivesRollup(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 超出小时保留窗口 → 会被折叠成日桶
-	r.Add(old, "global", "u", "m", Delta{
+	r.Add(old, "global", "u", "m", "", Delta{
 		HasCacheTokens: true, PromptTokens: 10, HasPromptTokens: true,
 		CacheHitTokens: 900, CacheMissTokens: 100, CacheWriteTokens: 30}, true)
-	r.Add(old, "global", "u", "m", Delta{
+	r.Add(old, "global", "u", "m", "", Delta{
 		HasCacheTokens: true, PromptTokens: 10, HasPromptTokens: true,
 		CacheHitTokens: 500, CacheMissTokens: 500, CacheWriteTokens: 20}, true)
 
@@ -85,7 +85,7 @@ func TestCacheSurvivesRollup(t *testing.T) {
 func TestCachePersistsAcrossReload(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "usage.json")
 	r := New(p)
-	r.Add(time.Now(), "global", "u", "m", Delta{
+	r.Add(time.Now(), "global", "u", "m", "", Delta{
 		HasCacheTokens: true, PromptTokens: 100, HasPromptTokens: true,
 		CacheHitTokens: 77, CacheMissTokens: 23, CacheWriteTokens: 11}, true)
 	r.Save()
