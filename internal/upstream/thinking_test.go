@@ -303,3 +303,89 @@ func TestInjectThinkingStringPreserved(t *testing.T) {
 		t.Errorf("stream 未强制: %s", out)
 	}
 }
+
+// getOutField 从输出 body 取顶层字段（存在性与取值）。
+func getOutField(t *testing.T, out []byte, key string) (any, bool) {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v (out=%s)", err, out)
+	}
+	v, ok := m[key]
+	return v, ok
+}
+
+// TestInjectThinkingEnableThinkingFlag 布尔开关 enable_thinking 必须被认。
+//
+// 根因（2026-10-13 生产实测）：injectThinking 只看 thinking.type，客户端说
+// enable_thinking=false 也照开思考 —— 实测 enable_thinking=false + reasoning_effort=high
+// 仍返回 524 帧思维链，客户端（deepseek-harness）把意外的 reasoning_content 当正文显示。
+// 修法：显式 thinking.type 优先，缺省时把 enable_thinking 归一化成 thinking.type。
+func TestInjectThinkingEnableThinkingFlag(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantTyp     string
+		wantPresent bool
+		wantEffort  bool
+	}{
+		{"enable_thinking=false 关思考（实测该形态思考帧归零）",
+			`{"model":"deepseek-v4.1-flash","enable_thinking":false,"reasoning_effort":"high","messages":[]}`,
+			"disabled", true, false},
+		{"enable_thinking=\"false\" 字符串形态同样认",
+			`{"model":"deepseek-v4.1-flash","enable_thinking":"false","messages":[]}`,
+			"disabled", true, false},
+		{"enable_thinking=true 开思考",
+			`{"model":"deepseek-v4.1-flash","enable_thinking":true,"messages":[]}`,
+			"enabled", true, true},
+		{"显式 thinking.type 优先于布尔开关",
+			`{"model":"deepseek-v4.1-flash","thinking":{"type":"disabled"},"enable_thinking":true,"messages":[]}`,
+			"disabled", true, false},
+		{"没有 enable_thinking 时保持既有行为（注入 enabled）",
+			`{"model":"deepseek-v4.1-flash","messages":[]}`,
+			"enabled", true, true},
+		{"非 deepseek 模型零改动（enable_thinking 是 qwen 系原生字段）",
+			`{"model":"glm-5.2","enable_thinking":false,"messages":[]}`,
+			"", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+			typ, present := getThinkingType(t, out)
+			if present != c.wantPresent {
+				t.Fatalf("thinking 存在性=%v want %v (out=%s)", present, c.wantPresent, out)
+			}
+			if present && typ != c.wantTyp {
+				t.Errorf("thinking.type=%q want %q (out=%s)", typ, c.wantTyp, out)
+			}
+			if _, has := getOutField(t, out, "reasoning_effort"); has != c.wantEffort {
+				t.Errorf("reasoning_effort 存在性=%v want %v (out=%s)", has, c.wantEffort, out)
+			}
+		})
+	}
+}
+
+// TestBoolFlag 开关解析：bool 与常见字符串都认；不可识别的值保持"未提供"。
+func TestBoolFlag(t *testing.T) {
+	cases := []struct {
+		in  any
+		on  bool
+		has bool
+	}{
+		{true, true, true},
+		{false, false, true},
+		{"true", true, true},
+		{" FALSE ", false, true},
+		{"1", true, true},
+		{"0", false, true},
+		{"maybe", false, false},
+		{nil, false, false},
+		{1, false, false},
+	}
+	for _, c := range cases {
+		on, has := boolFlag(c.in)
+		if on != c.on || has != c.has {
+			t.Errorf("boolFlag(%#v)=(%v,%v) want (%v,%v)", c.in, on, has, c.on, c.has)
+		}
+	}
+}

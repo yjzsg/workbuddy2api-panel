@@ -96,6 +96,9 @@ func prepareBodyOptCore(src []byte, sanitize bool, efforts map[string][]string, 
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	model, _ := obj["model"].(string)
+	// 探针读的是**客户端原样**开关（注入前），一次性记录形态，便于排查
+	// "客户端说了关思考为什么还开"这类问题。
+	probeThinkingFlags(obj)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, model))
 	normalizeReasoningEffort(obj, efforts, realmTag)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content

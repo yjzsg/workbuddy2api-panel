@@ -19,11 +19,21 @@
 //     删 reasoning_effort（snake/camel 双字段）。enabled 但缺 effort → 补默认档（官方 configure 行为）。
 //   - 无 thinking / thinking.type 空 / 已有 reasoning_effort → 注入 {type:"enabled"} + 补默认档。
 //   - 显式 reasoning_effort 一律不覆盖、不降级（降级交给 payload.go normalizeReasoningEffort）。
-//   - 非 deepseek 模型（glm/kimi/qwen 等）→ 零改动。
+//   - **布尔开关 enable_thinking**（harness 等客户端用它表达"要不要思考"）：在显式
+//     thinking.type 缺省时按它归一化 —— false ⇒ 走 disabled 分支（不注入 thinking、
+//     删 effort 档；实测思考帧归零），true ⇒ 走 enabled 分支。
+//     [2026-10-13 补] 此前只看 thinking.type，客户端说 false 也照开思考（实测
+//     enable_thinking=false + reasoning_effort=high 仍出 524 帧思维链），客户端会把
+//     意外的 reasoning_content 当正文显示。
+//   - 非 deepseek 模型（glm/kimi/qwen 等）→ 零改动（enable_thinking 是 qwen 系的原生
+//     字段，绝不能在这里动它）。
 package upstream
 
 import (
+	"fmt"
+	"log"
 	"strings"
+	"sync"
 )
 
 // defaultDeepSeekEffort 官方客户端默认档兜底（configure thinking 无来源时 warn fallback to 'high'，
@@ -164,6 +174,25 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		typ, _ = th["type"].(string)
 		typ = strings.TrimSpace(typ)
 	}
+	// 布尔开关归一化：显式 thinking.type 最具体，优先；缺省时看 enable_thinking。
+	// 为什么必须归一化：harness 用 enable_thinking 表达"要不要思考"，而网关此前只看
+	// thinking.type ⇒ 客户端说 false 也照开（实测 524 帧思维链），客户端把意外的
+	// reasoning_content 当正文显示。翻译成上游认的 thinking.type 才能真的关得上。
+	if typ == "" {
+		if on, has := boolFlag(obj["enable_thinking"]); has {
+			if !ok {
+				th = map[string]any{}
+				obj["thinking"] = th
+				ok = true
+			}
+			if on {
+				typ = "enabled"
+			} else {
+				typ = "disabled"
+			}
+			th["type"] = typ
+		}
+	}
 	// 显式控制分支：type 非空（enabled/disabled 均为明确意图）→ 不改 type。
 	if typ != "" {
 		if strings.EqualFold(typ, "disabled") {
@@ -183,6 +212,69 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		th["type"] = "enabled"
 	}
 	ensureDeepSeekEffort(obj, defaultEffort)
+}
+
+// boolFlag 解析"要不要"类开关：兼容 bool 与字符串（"false"/"0"/"no"/"off" 为假）。
+// 第二个返回值表示"字段存在且可识别"——不存在/不可识别时调用方保持原行为。
+func boolFlag(v any) (bool, bool) {
+	switch t := v.(type) {
+	case bool:
+		return t, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// thinkingProbeMu / thinkingProbeSeen 同形态只记一次，避免刷屏（上限 32 种，防无界增长）。
+var (
+	thinkingProbeMu   sync.Mutex
+	thinkingProbeSeen = map[string]bool{}
+)
+
+// probeThinkingFlags 一次性诊断：把客户端「思考开关」的形态记进日志。
+//
+// 为什么需要：2026-10-13 实测 deepseek-harness 带 enable_thinking=false 时思考仍被打开
+// （网关此前只认 thinking.type），客户端把意外的 reasoning_content 当正文显示。此探针把
+// 「客户端到底发了哪些开关、取值是什么」钉在日志里，不必靠猜；同形态只记一次。
+//
+// 只记开关字段（thinking.type / enable_thinking / reasoning_effort / reasoning_summary）
+// 的**名字与取值** —— 它们是布尔/枚举控制位，不含任何对话内容。
+func probeThinkingFlags(obj map[string]any) {
+	if obj == nil {
+		return
+	}
+	var b strings.Builder
+	if th, isMap := obj["thinking"].(map[string]any); isMap {
+		typ, _ := th["type"].(string)
+		b.WriteString("thinking.type=" + strings.TrimSpace(typ) + " ")
+	} else if _, has := obj["thinking"]; has {
+		b.WriteString("thinking=<非对象> ")
+	}
+	for _, k := range []string{"enable_thinking", "reasoning_effort", "reasoningEffort", "reasoning_summary"} {
+		if v, has := obj[k]; has {
+			b.WriteString(k + "=" + fmt.Sprintf("%v", v) + " ")
+		}
+	}
+	shape := strings.TrimSpace(b.String())
+	if shape == "" {
+		shape = "(无思考开关)"
+	}
+	thinkingProbeMu.Lock()
+	seen := thinkingProbeSeen[shape]
+	if !seen && len(thinkingProbeSeen) < 32 {
+		thinkingProbeSeen[shape] = true
+	}
+	thinkingProbeMu.Unlock()
+	if seen {
+		return
+	}
+	log.Printf("[thinking] 客户端思考开关形态（同形态只记一次）：%s", shape)
 }
 
 // ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
