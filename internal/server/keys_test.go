@@ -21,7 +21,7 @@ const tinySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_re
 func keysStore(t *testing.T, name, secret string, allowed []string) *apikeys.Store {
 	t.Helper()
 	s := apikeys.NewStore("")
-	if _, err := s.Add(name, secret, "", allowed, nil, true); err != nil {
+	if _, err := s.Add(name, secret, "", allowed, nil, "", true); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -231,11 +231,11 @@ func TestKeyModelAliasRewritesRequest(t *testing.T) {
 
 	withAlias := apikeys.NewStore("")
 	if _, err := withAlias.Add("别名", "sk-alias", "", []string{"global:deepseek-v4.1-flash"},
-		map[string]string{"deepseek-v4.1-flash": "global:deepseek-v4.1-flash"}, true); err != nil {
+		map[string]string{"deepseek-v4.1-flash": "global:deepseek-v4.1-flash"}, "", true); err != nil {
 		t.Fatal(err)
 	}
 	noAlias := apikeys.NewStore("")
-	if _, err := noAlias.Add("无别名", "sk-plain", "", []string{"global:deepseek-v4.1-flash"}, nil, true); err != nil {
+	if _, err := noAlias.Add("无别名", "sk-plain", "", []string{"global:deepseek-v4.1-flash"}, nil, "", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -306,7 +306,7 @@ func TestModelsListsKeyAliases(t *testing.T) {
 		map[string]string{
 			"luna":       "global:gpt-6-luna",  // 目标在白名单内 ⇒ 该列
 			"notallowed": "global:gpt-6-astra", // 目标不在白名单 ⇒ 不该列
-		}, true); err != nil {
+		}, "", true); err != nil {
 		t.Fatal(err)
 	}
 	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, Keys: s})
@@ -349,4 +349,96 @@ func keysOf(m map[string]map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestKeyThinkingOverride 密钥级思考开关：客户端请求了思考，密钥可以强制关掉。
+//
+// 场景（2026-10-13 用户报）：harness 那一路请求里只有 reasoning_effort、没有任何
+// "关思考"的字段，网关按官方客户端口径默认注入 enabled ⇒ 它拿到 reasoning_content
+// 后当正文渲染。网关不能替所有客户端决定，但可以按密钥覆盖 —— 不动全局默认。
+//
+// 断言：出站请求体的 thinking.type 被改写；未设开关的密钥不受影响；非 deepseek 模型不动。
+func TestKeyThinkingOverride(t *testing.T) {
+	captured := make(chan map[string]any, 8)
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(b, &obj)
+			captured <- obj
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tinySSE)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	mk := func(thinking string) *apikeys.Store {
+		s := apikeys.NewStore("")
+		if _, err := s.Add("k", "sk-"+thinking+"-x", "", nil, nil, thinking, true); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	post := func(store *apikeys.Store, key, model string) {
+		h := NewHandler(Config{
+			Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+			Upstream: up,
+			Keys:     store,
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+			`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}],"stream":true,`+
+				`"reasoning_effort":"high"}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+
+	thinkingType := func(obj map[string]any) string {
+		th, _ := obj["thinking"].(map[string]any)
+		s, _ := th["type"].(string)
+		return s
+	}
+
+	// 1) 强制关：客户端带 reasoning_effort 也照样关（thinking.type=disabled 且删掉 effort 档）
+	post(mk("off"), "sk-off-x", "deepseek-v4.1-flash")
+	obj := <-captured
+	if got := thinkingType(obj); got != "disabled" {
+		t.Errorf("强制关：thinking.type=%q want disabled（out=%v）", got, obj["thinking"])
+	}
+	if _, has := obj["reasoning_effort"]; has {
+		t.Errorf("强制关：reasoning_effort 应被删掉（disabled 分支），实际 %v", obj["reasoning_effort"])
+	}
+
+	// 2) 强制开：客户端什么都没带也开
+	post(mk("on"), "sk-on-x", "deepseek-v4.1-flash")
+	obj = <-captured
+	if got := thinkingType(obj); got != "enabled" {
+		t.Errorf("强制开：thinking.type=%q want enabled", got)
+	}
+	if _, has := obj["reasoning_effort"]; !has {
+		t.Error("强制开：应补上默认 effort 档")
+	}
+
+	// 3) 跟随客户端（空）：保持既有默认注入（deepseek 无 thinking → 注入 enabled）
+	post(mk(""), "sk--x", "deepseek-v4.1-flash")
+	obj = <-captured
+	if got := thinkingType(obj); got != "enabled" {
+		t.Errorf("跟随客户端：应保持既有默认注入，thinking.type=%q", got)
+	}
+
+	// 4) 非 deepseek 模型：密钥开关不生效（thinking 字段语义不同，不能乱塞）
+	post(mk("off"), "sk-off-x", "glm-5.2")
+	obj = <-captured
+	if _, has := obj["thinking"]; has {
+		t.Errorf("非 deepseek 模型不应被塞 thinking 字段，实际 %v", obj["thinking"])
+	}
 }

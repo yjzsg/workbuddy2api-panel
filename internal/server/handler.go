@@ -617,6 +617,34 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
+// applyKeyThinking 按密钥的思考开关把意图落成请求体的 thinking.type。
+//
+// mode："" = 不动（调用方已过滤）；"on" = enabled；"off" = disabled。
+// 只对 deepseek 系模型生效——其他模型的思考开关语义不同（qwen 用 enable_thinking 等），
+// 乱塞 thinking 对象有风险；与 upstream.injectThinking 的闸同口径（IsDeepSeekModel）。
+//
+// 为什么落成 thinking.type 就够了：upstream.injectThinking 显式 type 优先 —— "disabled"
+// 走它既有的"不注入 + 删 effort 档"分支（实测思考帧归零），"enabled" 走"补默认档"分支。
+func applyKeyThinking(body []byte, model, mode string) []byte {
+	if len(body) == 0 || mode == "" || !upstream.IsDeepSeekModel(model) {
+		return body
+	}
+	typ := "enabled"
+	if mode == "off" {
+		typ = "disabled"
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body // 不可解析时原样返回（不二次错误化，与 rewriteModel 同纪律）
+	}
+	obj["thinking"] = map[string]any{"type": typ}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
 // 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
 func rewriteModel(body []byte, bare string) []byte {
@@ -927,6 +955,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
 		body = rewriteModel(body, bareModel)
+	}
+	// 密钥级思考开关（多密钥特性）：把密钥的意图落成请求体的 thinking.type。
+	// 注入管线只认显式 thinking.type，所以在这里写进去即可覆盖它的默认注入，
+	// 且**只影响这一把密钥**（全局默认不变，官方客户端 issue #43 的依赖不受影响）。
+	if apiKey != nil && apiKey.Thinking != "" {
+		body = applyKeyThinking(body, bareModel, apiKey.Thinking)
 	}
 
 	// 会话头族（issue #35 / #170）：后台按 X-Conversation-Request-ID 聚合请求，官方

@@ -58,6 +58,11 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
+// IsDeepSeekModel 是 isDeepSeekModel 的导出面：handler 的**密钥级思考开关**需要同口径
+// 判定（只对 deepseek 系落 thinking 字段——其他模型的思考开关语义不同，见 thinking.go 头注释）。
+// 与 server.ResolveModel 同一模式：包内用小写，跨包走导出面，避免两处口径漂移。
+func IsDeepSeekModel(model string) bool { return isDeepSeekModel(model) }
+
 // backfillReasoningContent DeepSeek 多轮一致性：保证每条 assistant 消息带
 // reasoning_content 字段且值为 string——即 requiresReasoningContentOnAssistantMessages
 // （官方客户端 matches 规则，issue #165 对齐官方 apply 门控）。

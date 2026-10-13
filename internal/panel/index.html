@@ -986,6 +986,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="fbar" style="margin-top:6px">
             <label><input type="checkbox" id="kfEnabled" checked> 启用</label>
             <span class="note" id="kfRootHint" hidden>受保护：这是 config.json 的 api_key，不能停用或删除（改 config.json 的 api_key 可解除）</span>
+            <label>思考
+              <select id="kfThinking" aria-label="思考开关" title="跟随客户端 = 按客户端发的开关；强制关 = 该密钥的 deepseek 请求一律不返回思维链">
+                <option value="">跟随客户端</option>
+                <option value="on">强制开</option>
+                <option value="off">强制关</option>
+              </select></label>
             <span class="grow"></span>
             <button class="xs" id="btnKeyCancel">取消</button>
             <button class="xs primary" id="btnKeySave">保存</button>

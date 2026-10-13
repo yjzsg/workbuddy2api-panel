@@ -21,9 +21,11 @@ type keyRow struct {
 	Enabled       bool     `json:"enabled"`
 	AllowedModels []string `json:"allowed_models,omitempty"`
 	// ModelMap 别名映射：客户端用左边的名字调用，实际请求右边的模型（可带域前缀）。
-	ModelMap  map[string]string `json:"model_map,omitempty"`
-	CreatedAt string            `json:"created_at,omitempty"`
-	Migrated  bool              `json:"migrated_from_config,omitempty"`
+	ModelMap map[string]string `json:"model_map,omitempty"`
+	// Thinking 密钥级思考开关："" = 跟随客户端；"on" = 强制开；"off" = 强制关。
+	Thinking  string `json:"thinking,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	Migrated  bool   `json:"migrated_from_config,omitempty"`
 	// Root 标记该密钥持有 config.json 的 api_key（"根密钥"）：不可停用/删除，
 	// 前端据此隐藏这两个按钮（后端也有硬拦，见 apikeys.Store.Update/Delete）。
 	Root bool `json:"root,omitempty"`
@@ -75,6 +77,7 @@ func (p *Panel) keys(w http.ResponseWriter, r *http.Request) {
 			Enabled:       k.Enabled,
 			AllowedModels: k.AllowedModels,
 			ModelMap:      k.ModelMap,
+			Thinking:      k.Thinking,
 			CreatedAt:     k.CreatedAt,
 			Migrated:      k.MigratedFromConfig,
 			Root:          p.cfg.Keys.IsRoot(k),
@@ -131,6 +134,7 @@ type keyInput struct {
 	Enabled       *bool              `json:"enabled"`
 	AllowedModels *[]string          `json:"allowed_models"`
 	ModelMap      *map[string]string `json:"model_map"`
+	Thinking      *string            `json:"thinking"`
 }
 
 func decodeKeyInput(w http.ResponseWriter, r *http.Request) (keyInput, error) {
@@ -174,7 +178,11 @@ func (p *Panel) keyAdd(w http.ResponseWriter, r *http.Request) {
 	if in.ModelMap != nil {
 		mmap = *in.ModelMap
 	}
-	key, err := p.cfg.Keys.Add(name, secret, note, allowed, mmap, enabled)
+	thinking := ""
+	if in.Thinking != nil {
+		thinking = *in.Thinking
+	}
+	key, err := p.cfg.Keys.Add(name, secret, note, allowed, mmap, thinking, enabled)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -201,6 +209,7 @@ func (p *Panel) keyUpdate(w http.ResponseWriter, r *http.Request) {
 		Enabled:       in.Enabled,
 		AllowedModels: in.AllowedModels,
 		ModelMap:      in.ModelMap,
+		Thinking:      in.Thinking,
 	}
 	key, err := p.cfg.Keys.Update(id, patch)
 	if err != nil {

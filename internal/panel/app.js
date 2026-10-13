@@ -3101,7 +3101,10 @@ function renderKeys() {
       : (k.enabled ? '<span class="tag">启用</span>' : '<span class="tag warn">已停用</span>') +
         (k.migrated_from_config ? ' <span class="tag">迁移</span>' : '') +
         // 根密钥 = config.json 的 api_key：不可停用/删除（后端硬拦，前端不给按钮）。
-        (k.root ? ' <span class="tag">受保护</span>' : '');
+        (k.root ? ' <span class="tag">受保护</span>' : '') +
+        // 密钥级思考开关：只在显式设置时显示（空 = 跟随客户端，不打扰）。
+        (k.thinking ? ' <span class="tag mute" title="密钥级思考开关（覆盖客户端的请求意图）">思考' +
+          (k.thinking === 'off' ? '强制关' : '强制开') + '</span>' : '');
     const nameCell = esc(k.name) + (k.note ? '<div class="id">' + esc(k.note) + '</div>' : '');
     const acts = k.orphan ? '' :
       '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="edit">编辑</button>' +
@@ -3378,6 +3381,7 @@ function keyFormOpen(k) {
   renderKeyAlias();
   if ($('kfModelsExtra')) $('kfModelsExtra').value = '';
   if ($('kfUnlimited')) $('kfUnlimited').checked = keyPickAll;
+  if ($('kfThinking')) $('kfThinking').value = (k && k.thinking) || '';
   loadKeyCatalog(false).catch(() => {});
   $('kfEnabled').checked = k ? !!k.enabled : true;
   // 根密钥的「启用」不可改（后端会拒），锁住复选框并给出原因。
@@ -3438,6 +3442,7 @@ async function keySave() {
     note: $('kfNote').value.trim(),
     allowed_models: allowed,
     model_map: keyFormModelMap(),
+    thinking: $('kfThinking') ? $('kfThinking').value : '',
   };
   // 根密钥不带 enabled：既不误改它，也避免后端硬拦导致整个保存失败。
   if (!keyEditRoot) body.enabled = $('kfEnabled').checked;

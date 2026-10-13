@@ -61,8 +61,16 @@ type Key struct {
 	//
 	// 语义：命中后**先改写模型名**，再解析域/裸名；**白名单按改写后的名字判定**
 	// （AllowedModels 里存的就是真实模型名）。未命中则原样走既有逻辑。
-	ModelMap  map[string]string `json:"model_map,omitempty"`
-	CreatedAt string            `json:"created_at,omitempty"`
+	ModelMap map[string]string `json:"model_map,omitempty"`
+	// Thinking 密钥级思考开关："" = 跟随客户端（默认）；"on" = 强制开；"off" = 强制关。
+	//
+	// 用途：有些客户端会请求思考（reasoning_effort）却把返回的 reasoning_content 当
+	// 正文渲染出来；网关不能替它决定，但可以按密钥强制关掉。落成请求体的 thinking.type
+	// （注入管线只认显式 thinking.type），**不动全局默认** —— 官方客户端依赖默认注入
+	// （issue #43：deepseek 系不带 thinking 时上游按不思考应答）。
+	// 只对 deepseek 系模型生效（其他模型的思考开关语义不同，见 upstream/thinking.go）。
+	Thinking  string `json:"thinking,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
 	// MigratedFromConfig 标记该密钥由 config.json 的 api_key 迁移而来，
 	// 仅用于面板提示（"这是从旧配置迁移的"），不参与任何判定。
 	MigratedFromConfig bool `json:"migrated_from_config,omitempty"`
@@ -291,10 +299,11 @@ type Patch struct {
 	Enabled       *bool
 	AllowedModels *[]string
 	ModelMap      *map[string]string
+	Thinking      *string
 }
 
 // Add 新增一把密钥。secret 为空时随机生成。返回落盘后的完整密钥。
-func (s *Store) Add(name, secret, note string, allowed []string, mmap map[string]string, enabled bool) (Key, error) {
+func (s *Store) Add(name, secret, note string, allowed []string, mmap map[string]string, thinking string, enabled bool) (Key, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "未命名"
@@ -322,6 +331,7 @@ func (s *Store) Add(name, secret, note string, allowed []string, mmap map[string
 		Enabled:       enabled,
 		AllowedModels: normAllowed(allowed),
 		ModelMap:      normModelMap(mmap),
+		Thinking:      normThinking(thinking),
 		CreatedAt:     time.Now().Format(time.RFC3339),
 	}
 	s.keys = append(s.keys, key)
@@ -363,6 +373,10 @@ func (s *Store) Update(id string, p Patch) (Key, error) {
 	if p.ModelMap != nil {
 		// 传空 map = 显式清空（nil 指针才是"不改"）。
 		cur.ModelMap = normModelMap(*p.ModelMap)
+	}
+	if p.Thinking != nil {
+		// 传空串 = 显式恢复"跟随客户端"。
+		cur.Thinking = normThinking(*p.Thinking)
 	}
 	if p.Secret != nil {
 		sec := strings.TrimSpace(*p.Secret)
@@ -462,7 +476,7 @@ func (s *Store) EnsureDefault(secret, note string) (bool, error) {
 	if n > 0 {
 		return false, nil
 	}
-	key, err := s.Add("默认密钥", secret, note, nil, nil, true)
+	key, err := s.Add("默认密钥", secret, note, nil, nil, "", true)
 	if err != nil {
 		return false, err
 	}
@@ -524,6 +538,18 @@ func normAllowed(in []string) []string {
 		return nil
 	}
 	return out
+}
+
+// normThinking 归一化密钥级思考开关：只认 ""/"on"/"off"，其余一律当"跟随客户端"
+// （不报错——配置写错时宁可退回既有行为，也不要让整把密钥保存失败）。
+func normThinking(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "on", "enabled", "true", "1":
+		return "on"
+	case "off", "disabled", "false", "0":
+		return "off"
+	}
+	return ""
 }
 
 // normModelMap 清洗别名映射：去空白、丢空键/空值/自映射（别名 == 真实名是无操作）。
