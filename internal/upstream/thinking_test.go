@@ -389,3 +389,83 @@ func TestBoolFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestInjectThinkingReasoningEffortOffAndInvalid 2026-10-13 口径：
+//   - 只有 reasoning_effort == "off" 表示"不思考"（与 thinking.type=disabled 同路径）；
+//   - 其余非法/无值（none / "" / null / 未知词 / 缺失）一律回落到默认档 high。
+//
+// 根因（直连官方实测）：官方上游对非法 reasoning_effort **不走 reasoning_content
+// 通道**，把思维链混进 content —— 客户端当正文显示（用户报的"let me 这些思考
+// 显示成正文"）。实测 effort="none" 经网关 ⇒ reasoning=0 且 content 里出现思维链。
+func TestInjectThinkingReasoningEffortOffAndInvalid(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantTyp    string // "" = thinking 字段不应存在
+		wantEffort string // "" = 两个 effort 键都不应存在
+	}{
+		{"off 关思考（删档 + 不注入 thinking）",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":"off","messages":[]}`, "", ""},
+		{"OFF 大小写/空白不敏感",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":" OFF ","messages":[]}`, "", ""},
+		{"none 非法档 → 回落 high（不再透传给上游）",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":"none","messages":[]}`, "enabled", "high"},
+		{"空串 → high",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":"","messages":[]}`, "enabled", "high"},
+		{"null → high",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":null,"messages":[]}`, "enabled", "high"},
+		{"未知词 → high",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":"turbo","messages":[]}`, "enabled", "high"},
+		{"合法档位原样保留",
+			`{"model":"deepseek-v4.1-flash","reasoning_effort":"medium","messages":[]}`, "enabled", "medium"},
+		{"camel 非法 → 就地覆盖 high",
+			`{"model":"deepseek-v4.1-flash","reasoningEffort":"none","messages":[]}`, "enabled", "high"},
+		{"非 deepseek 零改动",
+			`{"model":"glm-5.2","reasoning_effort":"none","messages":[]}`, "", "none"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+			typ, present := getThinkingType(t, out)
+			if c.wantTyp == "" {
+				if present {
+					t.Errorf("thinking 不应存在，实际 type=%q (out=%s)", typ, out)
+				}
+			} else if !present || typ != c.wantTyp {
+				t.Errorf("thinking.type=%q present=%v want %q (out=%s)", typ, present, c.wantTyp, out)
+			}
+			effSnake, hasSnake := objFieldString(t, out, "reasoning_effort")
+			effCamel, hasCamel := objFieldString(t, out, "reasoningEffort")
+			if c.wantEffort == "" {
+				if hasSnake || hasCamel {
+					t.Errorf("两个 effort 键都不应存在，实际 snake=%q/%v camel=%q/%v (out=%s)",
+						effSnake, hasSnake, effCamel, hasCamel, out)
+				}
+				return
+			}
+			got, has := effSnake, hasSnake
+			if !has {
+				got, has = effCamel, hasCamel
+			}
+			if !has || got != c.wantEffort {
+				t.Errorf("effort=%q has=%v want %q (out=%s)", got, has, c.wantEffort, out)
+			}
+		})
+	}
+
+	// 显式 thinking.type=disabled 仍优先：effort 一并删掉。
+	out := PrepareBodyOptWithEfforts(
+		[]byte(`{"model":"deepseek-v4.1-flash","thinking":{"type":"disabled"},"reasoning_effort":"off","messages":[]}`),
+		false, nil)
+	if v, has := objFieldString(t, out, "reasoning_effort"); has {
+		t.Errorf("disabled 应删档，实际 %q (out=%s)", v, out)
+	}
+
+	// 显式 enabled + off：尊重显式开思考，档位回落到默认 high（off 不是档位）。
+	out = PrepareBodyOptWithEfforts(
+		[]byte(`{"model":"deepseek-v4.1-flash","thinking":{"type":"enabled"},"reasoning_effort":"off","messages":[]}`),
+		false, nil)
+	if v, has := objFieldString(t, out, "reasoning_effort"); !has || v != "high" {
+		t.Errorf("显式 enabled + off 应回落默认档 high，got %q has=%v (out=%s)", v, has, out)
+	}
+}

@@ -198,6 +198,17 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 			th["type"] = typ
 		}
 	}
+	// reasoning_effort 的"关思考"取值（off）：与 thinking.type=disabled /
+	// enable_thinking=false 同路径 —— 删档 + 不注入 thinking。
+	// 为什么必须在这里截：客户端用它表达"别思考"，而网关此前既不认、又把非法档透传给
+	// 上游，上游对非法 reasoning_effort 不走 reasoning_content 通道（思维链混进 content，
+	// 客户端当正文显示）。2026-10-13 实测。显式 thinking.type 更具体（上面已归一化），
+	// 故只在 typ 仍空时生效。
+	if typ == "" && isOffReasoningEffort(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+		return
+	}
 	// 显式控制分支：type 非空（enabled/disabled 均为明确意图）→ 不改 type。
 	if typ != "" {
 		if strings.EqualFold(typ, "disabled") {
@@ -282,20 +293,64 @@ func probeThinkingFlags(obj map[string]any) {
 	log.Printf("[thinking] 客户端思考开关形态（同形态只记一次）：%s", shape)
 }
 
-// ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
-// 已有任一 effort → 不覆盖（显式档位不做任何改写，降级交给 normalizeReasoningEffort）。
-// defaultEffort 空串 → 回退 defaultDeepSeekEffort（硬编码 "high"）。
+// isOffReasoningEffort 客户端是否用 reasoning_effort 表达"关思考"（唯一取值 "off"，
+// 大小写/空白不敏感；snake/camel 两键都看）。
+//
+// 为什么只有 "off"（用户口径 2026-10-13）：默认档 high；none / "" / null / 未知词
+// 一律回落到默认档 —— 因为官方上游对非法档**不走 reasoning_content 通道**（见
+// ensureDeepSeekEffort 的说明）。
+func isOffReasoningEffort(obj map[string]any) bool {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		if v, ok := obj[k]; ok {
+			if sv, isStr := v.(string); isStr && strings.EqualFold(strings.TrimSpace(sv), "off") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isEffortTier 是否为真实档位：effortRank 内且不是控制值 "off"（"off" 由
+// injectThinking 在开思考判定前截走，不是档位）。
+func isEffortTier(v any) bool {
+	sv, ok := v.(string)
+	if !ok {
+		return false
+	}
+	sv = strings.TrimSpace(strings.ToLower(sv))
+	if sv == "off" {
+		return false
+	}
+	_, known := effortRank[sv]
+	return known
+}
+
+// ensureDeepSeekEffort 保证「开思考」的请求带一个**真实档位**的 reasoning_effort。
+//
+// 为什么必须真实档位（2026-10-13 直连官方实测）：官方上游只认已知档位；非法/无值
+// （none / "" / null / 非字符串 / 未知词 / 字段缺失）时它**不走 reasoning_content
+// 通道**，而是把思维链混进 content —— 客户端当正文显示（用户报的
+// "let me 这些思考显示成正文" 即此）。故此处把一切非档位值归一到默认档。
+//
+// 规则：
+//   - 任一键已是真实档位 → 原样保留（降级交给 normalizeReasoningEffort）。
+//   - 其余（缺失 / null / 空串 / 非字符串 / 未知词）→ 用默认档（defaultEffort，
+//     空则硬编码 high）；已有键就地覆盖（snake 优先），无则新增 snake。
 func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
-	_, hasSnake := obj["reasoning_effort"]
-	if hasSnake {
-		return
-	}
-	_, hasCamel := obj["reasoningEffort"]
-	if hasCamel {
-		return
-	}
 	if defaultEffort == "" {
 		defaultEffort = defaultDeepSeekEffort
+	}
+	if v, ok := obj["reasoning_effort"]; ok && isEffortTier(v) {
+		return
+	}
+	if v, ok := obj["reasoningEffort"]; ok && isEffortTier(v) {
+		return
+	}
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		if _, ok := obj[k]; ok {
+			obj[k] = defaultEffort
+			return
+		}
 	}
 	obj["reasoning_effort"] = defaultEffort
 }
