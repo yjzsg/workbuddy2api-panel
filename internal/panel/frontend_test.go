@@ -1110,3 +1110,67 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("keyFormAllowed=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
 }
+
+// TestAppJSKeyAliasRules 别名映射的自动生成/清理规则。
+//
+// 背景：裸名在网关上默认解析成 **CN 域**，而客户端只会发它习惯的名字。所以密钥要能把
+// 短名字翻译成 `global:x` —— 但**不能自动剥前缀**（那等于把国际版悄悄变成 CN，
+// 2026-10-13 已踩过）。这里的规则是：勾选带域前缀的模型 → 自动补一条
+// `裸名 → 完整 id` 的别名；同名跨域都勾选时无法确定指向，跳过交用户手填。
+func TestAppJSKeyAliasRules(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; key alias test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function keyPickBare');
+const end = src.indexOf('/* renderKeyAlias');
+if (start < 0 || end < 0 || end < start) throw new Error('alias region not found');
+const ctx = { Map, Set, String, Number, Array, Object };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.gen = keyAliasGenerate; this.prune = keyAliasPrune;', ctx);
+
+const S = a => new Set(a);
+process.stdout.write(JSON.stringify({
+  // 勾 global:X（带前缀）⇒ 自动补 X → global:X
+  gen1: ctx.gen(S(['global:gpt-6-luna']), []),
+  // 裸名模型不需要别名（它本身就是客户端能用的名字）
+  genBare: ctx.gen(S(['deepseek-v4.1-flash']), []),
+  // 同名跨两域 ⇒ 跳过（无法确定指向哪个域）
+  genAmb: ctx.gen(S(['cn:glm-5.2', 'global:glm-5.2']), []),
+  // 已有同名别名（手填过）⇒ 不覆盖
+  genKeep: ctx.gen(S(['global:gpt-6-luna']), [{ a: 'gpt-6-luna', m: 'cn:gpt-6-luna' }]),
+  // 取消勾选：自动生成的清掉
+  pruneAuto: ctx.prune(S([]), [{ a: 'gpt-6-luna', m: 'global:gpt-6-luna' }]),
+  // 手改过别名（别名 != 裸名）⇒ 保留
+  pruneManual: ctx.prune(S([]), [{ a: 'luna', m: 'global:gpt-6-luna' }]),
+  // 目标仍被勾选 ⇒ 保留
+  pruneStill: ctx.prune(S(['global:gpt-6-luna']), [{ a: 'gpt-6-luna', m: 'global:gpt-6-luna' }]),
+  // 空行留给用户填，不清
+  pruneBlank: ctx.prune(S([]), [{ a: '', m: '' }]),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "keyalias-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("key alias node test failed: %v\n%s", err, out)
+	}
+	const want = `{"gen1":[{"a":"gpt-6-luna","m":"global:gpt-6-luna"}],` +
+		`"genBare":[],"genAmb":[],"genKeep":[],` +
+		`"pruneAuto":[],` +
+		`"pruneManual":[{"a":"luna","m":"global:gpt-6-luna"}],` +
+		`"pruneStill":[{"a":"gpt-6-luna","m":"global:gpt-6-luna"}],` +
+		`"pruneBlank":[{"a":"","m":""}]}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("keyAlias=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}

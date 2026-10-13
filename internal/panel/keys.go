@@ -20,8 +20,10 @@ type keyRow struct {
 	Note          string   `json:"note,omitempty"`
 	Enabled       bool     `json:"enabled"`
 	AllowedModels []string `json:"allowed_models,omitempty"`
-	CreatedAt     string   `json:"created_at,omitempty"`
-	Migrated      bool     `json:"migrated_from_config,omitempty"`
+	// ModelMap 别名映射：客户端用左边的名字调用，实际请求右边的模型（可带域前缀）。
+	ModelMap  map[string]string `json:"model_map,omitempty"`
+	CreatedAt string            `json:"created_at,omitempty"`
+	Migrated  bool              `json:"migrated_from_config,omitempty"`
 	// Root 标记该密钥持有 config.json 的 api_key（"根密钥"）：不可停用/删除，
 	// 前端据此隐藏这两个按钮（后端也有硬拦，见 apikeys.Store.Update/Delete）。
 	Root bool `json:"root,omitempty"`
@@ -72,6 +74,7 @@ func (p *Panel) keys(w http.ResponseWriter, r *http.Request) {
 			Note:          k.Note,
 			Enabled:       k.Enabled,
 			AllowedModels: k.AllowedModels,
+			ModelMap:      k.ModelMap,
 			CreatedAt:     k.CreatedAt,
 			Migrated:      k.MigratedFromConfig,
 			Root:          p.cfg.Keys.IsRoot(k),
@@ -122,11 +125,12 @@ func (p *Panel) keys(w http.ResponseWriter, r *http.Request) {
 
 // keyInput 新增/修改的请求体。指针字段用于区分"没传"与"传了零值"。
 type keyInput struct {
-	Name          *string   `json:"name"`
-	Secret        *string   `json:"secret"`
-	Note          *string   `json:"note"`
-	Enabled       *bool     `json:"enabled"`
-	AllowedModels *[]string `json:"allowed_models"`
+	Name          *string            `json:"name"`
+	Secret        *string            `json:"secret"`
+	Note          *string            `json:"note"`
+	Enabled       *bool              `json:"enabled"`
+	AllowedModels *[]string          `json:"allowed_models"`
+	ModelMap      *map[string]string `json:"model_map"`
 }
 
 func decodeKeyInput(w http.ResponseWriter, r *http.Request) (keyInput, error) {
@@ -166,7 +170,11 @@ func (p *Panel) keyAdd(w http.ResponseWriter, r *http.Request) {
 	if in.Enabled != nil {
 		enabled = *in.Enabled
 	}
-	key, err := p.cfg.Keys.Add(name, secret, note, allowed, enabled)
+	var mmap map[string]string
+	if in.ModelMap != nil {
+		mmap = *in.ModelMap
+	}
+	key, err := p.cfg.Keys.Add(name, secret, note, allowed, mmap, enabled)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -192,6 +200,7 @@ func (p *Panel) keyUpdate(w http.ResponseWriter, r *http.Request) {
 		Note:          in.Note,
 		Enabled:       in.Enabled,
 		AllowedModels: in.AllowedModels,
+		ModelMap:      in.ModelMap,
 	}
 	key, err := p.cfg.Keys.Update(id, patch)
 	if err != nil {

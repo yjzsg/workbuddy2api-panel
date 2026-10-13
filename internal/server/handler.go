@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -370,16 +371,47 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	list := h.modelList()
 	// 密钥白名单：只列出该密钥可用的模型，避免客户端拿到必然 403 的名字。
 	// 白名单为空 = 不限制，此时直接透传（零额外开销）。
-	if key := keyFromReq(r); key != nil && len(key.AllowedModels) > 0 {
+	apiKey := keyFromReq(r)
+	if apiKey != nil && len(apiKey.AllowedModels) > 0 {
 		filtered := make([]map[string]any, 0, len(list))
 		for _, m := range list {
 			id, _ := m["id"].(string)
 			realm, bare := resolveModel(id)
-			if key.AllowsModel(realm, bare) {
+			if apiKey.AllowsModel(realm, bare) {
 				filtered = append(filtered, m)
 			}
 		}
 		list = filtered
+	}
+	// 密钥别名（多密钥特性）：客户端就是用别名调用的，不列出来它就不知道能用什么名字。
+	// 只列「别名目标本身在该密钥白名单内」的 —— 否则会广告一个必然 403 的名字。
+	if apiKey != nil && len(apiKey.ModelMap) > 0 {
+		seen := make(map[string]bool, len(list))
+		for _, m := range list {
+			if id, _ := m["id"].(string); id != "" {
+				seen[id] = true
+			}
+		}
+		aliases := make([]string, 0, len(apiKey.ModelMap))
+		for a := range apiKey.ModelMap {
+			aliases = append(aliases, a)
+		}
+		sort.Strings(aliases) // map 迭代序随机，排序保 /v1/models 输出稳定
+		for _, a := range aliases {
+			if seen[a] {
+				continue
+			}
+			rr, bb := resolveModel(apiKey.ModelMap[a])
+			if len(apiKey.AllowedModels) > 0 && !apiKey.AllowsModel(rr, bb) {
+				continue
+			}
+			list = append(list, map[string]any{
+				"id":       a,
+				"object":   "model",
+				"owned_by": "wb2api-alias",
+				"alias_of": apiKey.ModelMap[a],
+			})
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -682,12 +714,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
+	// 密钥级模型别名（多密钥特性）：客户端发来的名字 → 真实模型名（可带域）。
+	// **必须在 resolveModel 之前**：别名可能带域前缀，改写后才是真正的路由目标。
+	// 典型场景：客户端只会发 `deepseek-v4.1-flash`（裸名 ⇒ 默认 CN 域），而该密钥要的
+	// 是 `global:deepseek-v4.1-flash`（国际版号池）。用户控制不了客户端发什么名字，
+	// 所以在密钥这一层做翻译。
+	apiKey := keyFromReq(r)
+	if apiKey != nil {
+		if real, hit := apiKey.ModelAlias(peek.Model); hit {
+			peek.Model = real
+		}
+	}
 	realm, bareModel := resolveModel(peek.Model)
 
 	// 密钥模型白名单（多密钥特性）：命中密钥限定了模型范围时，名单外的请求直接 403，
 	// 既不消耗上游调用也不参与选号。单密钥/裸用场景 key 为 nil ⇒ 不限制。
 	// 刻意放在 modelRate 查询之前：被白名单拒绝的请求不该产生任何上游/池副作用。
-	if key := keyFromReq(r); key != nil && !key.AllowsModel(realm, bareModel) {
+	// 注意白名单比对的是**别名改写后**的名字（面板勾的也是真实模型名）。
+	if apiKey != nil && !apiKey.AllowsModel(realm, bareModel) {
 		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
 			"model "+peek.Model+" is not allowed for this API key")
 		return
@@ -699,6 +743,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	// 日志/统计的模型列用**别名改写后**的名字（= 实际路由目标）。newChatStat 取的是
+	// 请求体里的原名（客户端发的别名），不改的话日志与选号/账本口径不一致，
+	// 排查时分不清这次到底走了哪条池子。
+	st.model = peek.Model
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，

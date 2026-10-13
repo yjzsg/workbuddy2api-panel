@@ -43,9 +43,26 @@ type Key struct {
 	Note    string `json:"note,omitempty"`
 	Enabled bool   `json:"enabled"`
 	// AllowedModels 模型白名单；**空 = 不限制**（放行全部模型）。
-	// 条目写法：`glm-5.2` 匹配任意域的该模型；`global:gpt-6-luna` 精确匹配带域写法。
+	//
+	// 条目写法（与 AllowsModel 一致）：
+	//   - 带域前缀（`global:gpt-6-luna`）⇒ **按域精确匹配**（只允许该域的它）；
+	//   - 裸名（`deepseek-v4.1-flash`）⇒ 匹配**任意域**的该模型。
+	// 面板勾选产生的是带前缀的精确条目。想让客户端用短名字调用，配 ModelMap 别名。
 	AllowedModels []string `json:"allowed_models,omitempty"`
-	CreatedAt     string   `json:"created_at,omitempty"`
+	// ModelMap 别名映射：客户端发来的模型名 → 真实模型名（可带 cn:/global: 前缀）。
+	//
+	// 为什么需要：客户端只会用它习惯的名字调用，而**裸名在网关上默认解析成 CN 域**
+	// （见 server.resolveModel）——要的是国际版就必须改写成 `global:x`。客户端发什么
+	// 名字用户控制不了，所以在密钥这一层做翻译：
+	//
+	//	"deepseek-v4.1-flash": "global:deepseek-v4.1-flash"
+	//
+	// ⇒ 客户端发 `deepseek-v4.1-flash`，该密钥实际请求 `global:deepseek-v4.1-flash`。
+	//
+	// 语义：命中后**先改写模型名**，再解析域/裸名；**白名单按改写后的名字判定**
+	// （AllowedModels 里存的就是真实模型名）。未命中则原样走既有逻辑。
+	ModelMap  map[string]string `json:"model_map,omitempty"`
+	CreatedAt string            `json:"created_at,omitempty"`
 	// MigratedFromConfig 标记该密钥由 config.json 的 api_key 迁移而来，
 	// 仅用于面板提示（"这是从旧配置迁移的"），不参与任何判定。
 	MigratedFromConfig bool `json:"migrated_from_config,omitempty"`
@@ -55,6 +72,10 @@ type Key struct {
 //
 // realm/model 是 handler 解析后的两段（见 server.resolveModel）；model 为裸名。
 // 白名单为空 = 不限制。
+//
+// 面板勾选产生的是**带域前缀的精确条目**（`a == full` 这一支）；手写 keys.json 里
+// 的裸名则匹配任意域（`a == model` 这一支）。想让客户端用短名字调用，配 Key.ModelMap
+// 别名（别名在进入本判定之前就已改写成真实模型名）。
 func (k *Key) AllowsModel(realm, model string) bool {
 	if len(k.AllowedModels) == 0 {
 		return true
@@ -70,6 +91,23 @@ func (k *Key) AllowsModel(realm, model string) bool {
 		}
 	}
 	return false
+}
+
+// ModelAlias 按别名查真实模型名。第二个返回值为 false 表示没有这条映射（用原名）。
+// 键比较前会 TrimSpace；空值视为没有映射。
+func (k *Key) ModelAlias(name string) (string, bool) {
+	if k == nil || len(k.ModelMap) == 0 {
+		return "", false
+	}
+	v, ok := k.ModelMap[strings.TrimSpace(name)]
+	if !ok {
+		return "", false
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", false
+	}
+	return v, true
 }
 
 // Store 并发安全的密钥表（内存镜像 + 落盘）。
@@ -252,10 +290,11 @@ type Patch struct {
 	Note          *string
 	Enabled       *bool
 	AllowedModels *[]string
+	ModelMap      *map[string]string
 }
 
 // Add 新增一把密钥。secret 为空时随机生成。返回落盘后的完整密钥。
-func (s *Store) Add(name, secret, note string, allowed []string, enabled bool) (Key, error) {
+func (s *Store) Add(name, secret, note string, allowed []string, mmap map[string]string, enabled bool) (Key, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "未命名"
@@ -282,6 +321,7 @@ func (s *Store) Add(name, secret, note string, allowed []string, enabled bool) (
 		Note:          note,
 		Enabled:       enabled,
 		AllowedModels: normAllowed(allowed),
+		ModelMap:      normModelMap(mmap),
 		CreatedAt:     time.Now().Format(time.RFC3339),
 	}
 	s.keys = append(s.keys, key)
@@ -319,6 +359,10 @@ func (s *Store) Update(id string, p Patch) (Key, error) {
 	}
 	if p.AllowedModels != nil {
 		cur.AllowedModels = normAllowed(*p.AllowedModels)
+	}
+	if p.ModelMap != nil {
+		// 传空 map = 显式清空（nil 指针才是"不改"）。
+		cur.ModelMap = normModelMap(*p.ModelMap)
 	}
 	if p.Secret != nil {
 		sec := strings.TrimSpace(*p.Secret)
@@ -418,7 +462,7 @@ func (s *Store) EnsureDefault(secret, note string) (bool, error) {
 	if n > 0 {
 		return false, nil
 	}
-	key, err := s.Add("默认密钥", secret, note, nil, true)
+	key, err := s.Add("默认密钥", secret, note, nil, nil, true)
 	if err != nil {
 		return false, err
 	}
@@ -461,6 +505,7 @@ func Mask(secret string) string {
 }
 
 // normAllowed 清洗白名单：去空白、去重、丢空项；结果为空返回 nil（= 不限制）。
+// **不动域前缀**：`global:x` 是"只允许国际版的 x"这个精确语义，剥掉会走错账号池。
 func normAllowed(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -474,6 +519,26 @@ func normAllowed(in []string) []string {
 		}
 		seen[a] = true
 		out = append(out, a)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normModelMap 清洗别名映射：去空白、丢空键/空值/自映射（别名 == 真实名是无操作）。
+// 结果为空返回 nil（JSON 里省掉）。
+func normModelMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if k == "" || v == "" || k == v {
+			continue
+		}
+		out[k] = v
 	}
 	if len(out) == 0 {
 		return nil

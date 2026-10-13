@@ -2,13 +2,16 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 const tinySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null,\"index\":0}]}\n\n" +
@@ -18,7 +21,7 @@ const tinySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_re
 func keysStore(t *testing.T, name, secret string, allowed []string) *apikeys.Store {
 	t.Helper()
 	s := apikeys.NewStore("")
-	if _, err := s.Add(name, secret, "", allowed, true); err != nil {
+	if _, err := s.Add(name, secret, "", allowed, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -185,4 +188,165 @@ func TestModelsListFilteredByWhitelist(t *testing.T) {
 	if len(body2.Data) == 0 {
 		t.Error("不限制模型时 /v1/models 不应为空")
 	}
+}
+
+// TestKeyModelAliasRewritesRequest 密钥别名把客户端发的短名字翻译成真实模型名。
+//
+// 背景：**裸名在网关上默认解析成 CN 域**（见 resolveModel），而客户端只会发它习惯的
+// 名字 —— 用户控制不了。所以要让某个密钥走国际版，只能在密钥这一层做翻译。
+// 本用例钉住三件事（都是"看不见就白做"的）：
+//  1. 白名单是**带域精确**的：没配别名时，客户端发裸名会被 403（裸名 → cn 域，
+//     与 `global:` 条目匹配不上）——这正是别名要解决的痛点；
+//  2. 配了别名后放行，**出站 model 用真实名剥域后的裸名**，且**账号用的是 global 池**那个
+//     （路由真的变了，不只是名字变了）；
+//  3. 别名只作用于配了它的那把密钥。
+func TestKeyModelAliasRewritesRequest(t *testing.T) {
+	type hit struct{ model, authz string }
+	var mu sync.Mutex
+	var hits []hit
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(b, &obj)
+			m, _ := obj["model"].(string)
+			mu.Lock()
+			hits = append(hits, hit{model: m, authz: r.Header.Get("Authorization")})
+			mu.Unlock()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tinySSE)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	cn := &auth.Auth{UID: "u-cn", AccessToken: "tok-cn", ExpiresAt: 9999999999}
+	gl := &auth.Auth{UID: "u-gl", AccessToken: "tok-global", ExpiresAt: 9999999999, Domain: "api.workbuddy.ai"}
+	if gl.Realm() != "global" {
+		t.Fatalf("测试前置：期望 global 账号，实际 realm=%s", gl.Realm())
+	}
+
+	withAlias := apikeys.NewStore("")
+	if _, err := withAlias.Add("别名", "sk-alias", "", []string{"global:deepseek-v4.1-flash"},
+		map[string]string{"deepseek-v4.1-flash": "global:deepseek-v4.1-flash"}, true); err != nil {
+		t.Fatal(err)
+	}
+	noAlias := apikeys.NewStore("")
+	if _, err := noAlias.Add("无别名", "sk-plain", "", []string{"global:deepseek-v4.1-flash"}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(h *Handler, key, model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+			`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1) 配了别名：裸名 → global:... ⇒ 放行，出站裸名，走 global 账号
+	h := NewHandler(Config{Pool: testPoolWith(cn, gl), Upstream: up, Keys: withAlias})
+	rec := post(h, "sk-alias", "deepseek-v4.1-flash")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("配了别名应放行，code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	if len(hits) != 1 {
+		mu.Unlock()
+		t.Fatalf("上游调用次数=%d want 1", len(hits))
+	}
+	got := hits[0]
+	mu.Unlock()
+	if got.model != "deepseek-v4.1-flash" {
+		t.Errorf("出站 model=%q want deepseek-v4.1-flash（真实名剥域后的裸名；上游只认裸名）", got.model)
+	}
+	if !strings.Contains(got.authz, "tok-global") {
+		t.Errorf("别名指向 global 域，应走 global 账号，实际 Authorization=%q", got.authz)
+	}
+
+	// 2) 没配别名：同一个裸名 → cn 域，与 `global:` 白名单条目匹配不上 ⇒ 403 且零上游调用
+	h2 := NewHandler(Config{Pool: testPoolWith(cn, gl), Upstream: up, Keys: noAlias})
+	rec2 := post(h2, "sk-plain", "deepseek-v4.1-flash")
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("带域精确白名单 + 裸名请求应 403（这就是别名要解决的痛点），实际 %d body=%s",
+			rec2.Code, rec2.Body.String())
+	}
+	mu.Lock()
+	n := len(hits)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("被白名单拒的请求不应打上游：调用次数=%d want 1", n)
+	}
+
+	// 3) 无别名的密钥发**带前缀**的真实名 ⇒ 应放行（白名单命中的是它）
+	rec3 := post(h2, "sk-plain", "global:deepseek-v4.1-flash")
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("带前缀的真实名应放行，code=%d body=%s", rec3.Code, rec3.Body.String())
+	}
+	mu.Lock()
+	got3 := hits[len(hits)-1]
+	mu.Unlock()
+	if got3.model != "deepseek-v4.1-flash" || !strings.Contains(got3.authz, "tok-global") {
+		t.Errorf("带前缀请求应同样出站裸名并走 global：model=%q authz=%q", got3.model, got3.authz)
+	}
+}
+
+// TestModelsListsKeyAliases /v1/models 要把该密钥的别名列出来（客户端才知道能用什么名字），
+// 但**只列别名目标本身在白名单内**的 —— 否则会广告一个必然 403 的名字。
+func TestModelsListsKeyAliases(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, tinySSE, true })
+	s := apikeys.NewStore("")
+	if _, err := s.Add("别名", "sk-alias", "",
+		[]string{"global:gpt-6-luna"},
+		map[string]string{
+			"luna":       "global:gpt-6-luna",  // 目标在白名单内 ⇒ 该列
+			"notallowed": "global:gpt-6-astra", // 目标不在白名单 ⇒ 不该列
+		}, true); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, Keys: s})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-alias")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var out struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析响应: %v", err)
+	}
+	ids := map[string]map[string]any{}
+	for _, m := range out.Data {
+		if id, _ := m["id"].(string); id != "" {
+			ids[id] = m
+		}
+	}
+	if _, ok := ids["luna"]; !ok {
+		t.Errorf("/v1/models 应列出别名 luna，实际 id=%v", keysOf(ids))
+	}
+	if got, ok := ids["luna"]; ok {
+		if got["alias_of"] != "global:gpt-6-luna" {
+			t.Errorf("别名条目应带 alias_of，实际 %v", got["alias_of"])
+		}
+	}
+	if _, ok := ids["notallowed"]; ok {
+		t.Error("别名目标不在白名单内时不该列出（否则广告一个必然 403 的名字）")
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

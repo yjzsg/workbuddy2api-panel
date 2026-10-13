@@ -3043,6 +3043,8 @@ let keyPickSel = new Set();   // 勾选中的模型 id（目录里的，带域�
 let keyPickQuery = '';        // 勾选面板的筛选词
 let keyModelCatalog = null;   // /panel/api/models 缓存（直连上游，很贵）
 let keyPickSplit = false;     // 本次打开表单是否已把"目录外条目"分流到「其他」
+let keyPickRealmFilter = '';  // 勾选面板的域筛选：'' | 'cn' | 'global'
+let keyAliasRows = [];        // 别名映射表：[{a: 别名, m: 真实模型名}]
 
 /* keyMask 打码：保留前 4 后 4，中间固定 6 个星号（短串整体打码）。 */
 function keyMask(s) {
@@ -3086,10 +3088,14 @@ function renderKeys() {
         '<button class="xs ghost" data-k="' + esc(k.id) + '" data-a="copy">复制</button>';
     // 勾选式白名单可能很长：列前 2 个 + 计数，完整清单放 title。
     const am = k.allowed_models || [];
-    const models = am.length
+    const mmN = Object.keys(k.model_map || {}).length;
+    const models = (am.length
       ? '<span title="' + esc(am.join(', ')) + '">' + esc(am.slice(0, 2).join(', ')) +
         (am.length > 2 ? ' <span style="color:var(--ink-3)">+' + (am.length - 2) + '</span>' : '') + '</span>'
-      : '<span style="color:var(--ink-3)">全部</span>';
+      : '<span style="color:var(--ink-3)">全部</span>') +
+      (mmN ? ' <span class="tag mute" title="' +
+        esc(Object.keys(k.model_map).map(a => a + ' → ' + k.model_map[a]).join('\n')) +
+        '">别名 ' + mmN + '</span>' : '');
     const status = k.orphan
       ? '<span class="tag warn">历史 / 已删除</span>'
       : (k.enabled ? '<span class="tag">启用</span>' : '<span class="tag warn">已停用</span>') +
@@ -3143,6 +3149,114 @@ function keyPickRealm(id) {
   return i > 0 ? s.slice(0, i) : 'cn';
 }
 
+/* keyPickBare 目录 id → 裸模型名（global:deepseek-v4.1-flash → deepseek-v4.1-flash）。
+   白名单里存的就是裸名：域由客户端发的模型名决定，用户控制不了，
+   所以按裸名匹配任意域（服务端 normAllowed 也会剥前缀）。 */
+function keyPickBare(id) {
+  const s = String(id == null ? '' : id);
+  const i = s.indexOf(':');
+  return i > 0 ? s.slice(i + 1) : s;
+}
+
+/* keyPickRealmTag 行内的域标签：CN / GLOBAL。
+   白名单条目保留域前缀（= 只允许该域），所以这里必须逐条显示域。 */
+function keyPickRealmTag(e) {
+  return String(keyPickRealm(e && e.id)).toUpperCase();
+}
+
+/* ── 别名映射（客户端用短名字调用，密钥把它翻译成真实模型名）───────────
+   为什么需要：裸名在网关上默认解析成 **CN 域**。客户端只会发它习惯的名字，
+   用户改不了；要让它走国际版就必须在密钥这一层翻译成 `global:x`。 */
+
+/* keyAliasGenerate 算出"应自动补的别名行"。规则：
+   - 只给带域前缀的模型生成（裸名模型本身就是客户端能用的名字，不需要别名）；
+   - 同一裸名若勾了多个域，无法确定指向哪个 ⇒ 跳过（交给用户手填）；
+   - 已有同名别名（无论手填还是自动）不覆盖。
+   纯函数，便于单测。 */
+function keyAliasGenerate(sel, rows) {
+  const have = new Set((rows || []).map(function (r) { return r.a; }));
+  const byBare = new Map();
+  for (const id of sel || []) {
+    const b = keyPickBare(id);
+    if (!byBare.has(b)) byBare.set(b, []);
+    byBare.get(b).push(id);
+  }
+  const out = [];
+  for (const [bare, ids] of byBare) {
+    if (ids.length !== 1 || ids[0] === bare || have.has(bare)) continue;
+    out.push({ a: bare, m: ids[0] });
+  }
+  return out.sort(function (x, y) { return x.a < y.a ? -1 : (x.a > y.a ? 1 : 0); });
+}
+
+/* keyAliasPrune 取消勾选时清掉"因它而自动生成、且未被手改"的别名行。
+   判据：值已不在勾选集中，且别名正好是该模型的裸名（改过任一侧就保留）。 */
+function keyAliasPrune(sel, rows) {
+  return (rows || []).filter(function (r) {
+    if (!r.a || !r.m) return true;          // 空行留给用户填
+    if (sel.has(r.m)) return true;          // 目标仍被勾选 ⇒ 保留
+    return r.a !== keyPickBare(r.m);        // 手改过 ⇒ 保留
+  });
+}
+
+/* renderKeyAlias 渲染别名表（两列输入 + 删除）。 */
+function renderKeyAlias() {
+  const box = $('kfAliasBox');
+  if (!box) return;
+  if (!keyAliasRows.length) {
+    box.innerHTML = '<div class="none">没有别名。勾选带域前缀的模型会自动补一条，' +
+      '也可以点「添加一行」自己填。</div>';
+  } else {
+    box.innerHTML = keyAliasRows.map(function (r, i) {
+      return '<div class="row">' +
+        '<input data-a="alias" data-i="' + i + '" value="' + esc(r.a) + '" placeholder="客户端调用的名字（别名）" aria-label="别名">' +
+        '<span class="ar">→</span>' +
+        '<input data-a="amodel" data-i="' + i + '" value="' + esc(r.m) + '" placeholder="真实模型名（可带 cn: / global:）" aria-label="真实模型名">' +
+        '<button type="button" class="xs ghost" data-a="adel" data-i="' + i + '">删除</button>' +
+        '</div>';
+    }).join('');
+  }
+  const hint = $('kfAliasHint');
+  if (hint) {
+    const amb = keyAliasAmbiguous();
+    hint.textContent = amb.length
+      ? '同名模型勾了多个域（' + amb.join(' / ') + '），无法自动确定别名指向哪个域，请手动填。'
+      : '白名单条目保留域前缀（勾 global:x 只允许国际版）。客户端发不出前缀时，用别名把短名字翻译过去。';
+  }
+}
+
+/* keyAliasAmbiguous 勾选集里"同名跨多域"的裸名（无法自动生成别名，需手填）。 */
+function keyAliasAmbiguous() {
+  const byBare = new Map();
+  for (const id of keyPickSel) {
+    const b = keyPickBare(id);
+    if (!byBare.has(b)) byBare.set(b, 0);
+    byBare.set(b, byBare.get(b) + 1);
+  }
+  const out = [];
+  for (const [b, n] of byBare) if (n > 1) out.push(b);
+  return out.sort();
+}
+
+/* keyAliasSync 勾选集变化后：补自动别名 + 清掉失效的自动别名，然后重渲染。 */
+function keyAliasSync() {
+  keyAliasRows = keyAliasPrune(keyPickSel, keyAliasRows);
+  keyAliasRows = keyAliasRows.concat(keyAliasGenerate(keyPickSel, keyAliasRows));
+  renderKeyAlias();
+}
+
+/* keyFormModelMap 收集别名映射（去空白；后出现的同名别名覆盖前面的）。 */
+function keyFormModelMap() {
+  const out = {};
+  for (const r of keyAliasRows) {
+    const a = String(r.a || '').trim();
+    const m = String(r.m || '').trim();
+    if (!a || !m) continue;
+    out[a] = m;
+  }
+  return out;
+}
+
 /* keyPickCtx 上下文长度压成 K。 */
 function keyPickCtx(n) {
   n = Number(n || 0);
@@ -3191,6 +3305,18 @@ async function loadKeyCatalog(force) {
   renderKeyPick();
 }
 
+/* keyPickVisible 当前筛选下可见的条目。「全选 / 清空」作用于**可见项**：
+   配合域筛选即可按域批选（如筛 GLOBAL 后全选）。 */
+function keyPickVisible() {
+  const q = keyPickQuery.trim().toLowerCase();
+  return (keyModelCatalog || []).filter(function (e) {
+    if (keyPickRealmFilter && keyPickRealm(e.id) !== keyPickRealmFilter) return false;
+    if (!q) return true;
+    return String(e.id).toLowerCase().indexOf(q) >= 0 ||
+      String(e.name || '').toLowerCase().indexOf(q) >= 0;
+  });
+}
+
 function renderKeyPick() {
   const box = $('kfPickBox');
   if (!box || keyModelCatalog === null) return;
@@ -3200,41 +3326,29 @@ function renderKeyPick() {
   if (hint) {
     hint.textContent = keyPickAll
       ? '当前：不限制（白名单为空 = 允许全部模型）。点下面任意一项即改为逐个挑选。'
-      : '勾选该密钥可用的模型（已选 ' + keyPickSel.size + ' 个）。一个都没勾会等同于「不限制」，保存会被拦下。';
+      : '勾选该密钥可用的模型（已选 ' + keyPickSel.size + ' 个）。勾选会自动补一条别名，' +
+        '让客户端用短名字也能调到。一个都没勾会等同于「不限制」，保存会被拦下。';
   }
   box.classList.toggle('dim', keyPickAll);
   if (!keyModelCatalog.length) {
     box.innerHTML = '<div class="none">上游没有返回模型目录</div>';
     return;
   }
-  const q = keyPickQuery.trim().toLowerCase();
-  const hit = keyModelCatalog.filter(m => !q ||
-    String(m.id).toLowerCase().indexOf(q) >= 0 ||
-    String(m.name || '').toLowerCase().indexOf(q) >= 0);
+  const hit = keyPickVisible();
   if (!hit.length) {
-    box.innerHTML = '<div class="none">没有匹配「' + esc(keyPickQuery) + '」的模型</div>';
+    box.innerHTML = '<div class="none">没有匹配的模型</div>';
     return;
   }
-  const groups = new Map();
-  for (const m of hit) {
-    const r = keyPickRealm(m.id);
-    if (!groups.has(r)) groups.set(r, []);
-    groups.get(r).push(m);
-  }
-  let html = '';
-  for (const [realm, list] of groups) {
-    const n = list.filter(m => keyPickSel.has(m.id)).length;
-    html += '<div class="grp"><b>' + esc(realm.toUpperCase()) + '</b><span>' + n + ' / ' +
-      list.length + '</span><span class="grow"></span>' +
-      '<button type="button" class="xs ghost" data-a="gpickall" data-r="' + esc(realm) + '">全选</button>' +
-      '<button type="button" class="xs ghost" data-a="gpicknone" data-r="' + esc(realm) + '">清空</button></div>';
-    for (const m of list) {
-      html += '<label class="row"><input type="checkbox" data-a="pick" data-id="' + esc(m.id) + '"' +
-        (keyPickSel.has(m.id) ? ' checked' : '') + '>' +
-        '<code>' + esc(m.id) + '</code>' +
-        '<span class="nm">' + esc(m.name || '') + '</span>' +
-        '<span class="mt">' + esc(keyPickMeta(m)) + '</span></label>';
-    }
+  const selN = hit.filter(function (e) { return keyPickSel.has(e.id); }).length;
+  let html = '<div class="grp"><b>' + hit.length + ' 个模型</b><span>已选 ' + selN +
+    '</span><span class="grow"></span><span>带域前缀的条目按域精确匹配</span></div>';
+  for (const e of hit) {
+    html += '<label class="row"><input type="checkbox" data-a="pick" data-id="' + esc(e.id) + '"' +
+      (keyPickSel.has(e.id) ? ' checked' : '') + '>' +
+      '<code>' + esc(e.id) + '</code>' +
+      '<span class="nm">' + esc(e.name || '') + '</span>' +
+      '<span class="tag mute">' + esc(keyPickRealmTag(e)) + '</span>' +
+      '<span class="mt">' + esc(keyPickMeta(e)) + '</span></label>';
   }
   box.innerHTML = html;
 }
@@ -3255,7 +3369,13 @@ function keyFormOpen(k) {
   keyPickSel = new Set(am);
   keyPickQuery = '';
   keyPickSplit = false;
+  keyPickRealmFilter = '';
+  // 别名表：从已存的 model_map 展开（按键排序，展示稳定）
+  const mm = (k && k.model_map) || {};
+  keyAliasRows = Object.keys(mm).sort().map(function (a) { return { a: a, m: mm[a] }; });
   if ($('kfPickSearch')) $('kfPickSearch').value = '';
+  if ($('kfPickRealm')) $('kfPickRealm').value = '';
+  renderKeyAlias();
   if ($('kfModelsExtra')) $('kfModelsExtra').value = '';
   if ($('kfUnlimited')) $('kfUnlimited').checked = keyPickAll;
   loadKeyCatalog(false).catch(() => {});
@@ -3273,7 +3393,9 @@ function keyFormClose() {
   keyPickAll = true;
   keyPickSel = new Set();
   keyPickQuery = '';
+  keyPickRealmFilter = '';
   keyPickSplit = false;
+  keyAliasRows = [];
   $('kfErr').hidden = true;
   if ($('kfRootHint')) $('kfRootHint').hidden = true;
   $('kfEnabled').disabled = false;
@@ -3315,6 +3437,7 @@ async function keySave() {
     secret: $('kfSecret').value.trim(),
     note: $('kfNote').value.trim(),
     allowed_models: allowed,
+    model_map: keyFormModelMap(),
   };
   // 根密钥不带 enabled：既不误改它，也避免后端硬拦导致整个保存失败。
   if (!keyEditRoot) body.enabled = $('kfEnabled').checked;
@@ -3347,13 +3470,18 @@ async function keySave() {
   // 「可用模型」勾选面板：目录缓存 + 前端勾选
   if ($('kfPickReload')) $('kfPickReload').onclick = () => loadKeyCatalog(true).catch(e => toast(e.message, 'err'));
   if ($('kfUnlimited')) $('kfUnlimited').onchange = () => { keyPickAll = $('kfUnlimited').checked; renderKeyPick(); };
+  // 「全选 / 清空」作用于**当前筛选可见**的条目 ⇒ 配合域筛选即可按域批选
   if ($('kfPickSelAll')) $('kfPickSelAll').onclick = () => {
     keyPickAll = false;
-    (keyModelCatalog || []).forEach(m => keyPickSel.add(m.id));
+    keyPickVisible().forEach(e => keyPickSel.add(e.id));
     renderKeyPick();
   };
-  if ($('kfPickSelNone')) $('kfPickSelNone').onclick = () => { keyPickSel = new Set(); renderKeyPick(); };
+  if ($('kfPickSelNone')) $('kfPickSelNone').onclick = () => {
+    keyPickVisible().forEach(e => keyPickSel.delete(e.id));
+    renderKeyPick();
+  };
   if ($('kfPickSearch')) $('kfPickSearch').oninput = () => { keyPickQuery = $('kfPickSearch').value; renderKeyPick(); };
+  if ($('kfPickRealm')) $('kfPickRealm').onchange = () => { keyPickRealmFilter = $('kfPickRealm').value; renderKeyPick(); };
   if ($('kfPickBox')) {
     // 勾选/取消：勾任意一项即自动取消「不限制」（否则勾了什么也不生效，很困惑）
     $('kfPickBox').addEventListener('change', ev => {
@@ -3362,16 +3490,31 @@ async function keySave() {
       const id = c.dataset.id;
       if (c.checked) { keyPickAll = false; keyPickSel.add(id); } else keyPickSel.delete(id);
       renderKeyPick();
+      keyAliasSync();   // 勾选自动补别名；取消勾选清掉失效的自动别名
     });
-    // 分组「全选 / 清空」
-    $('kfPickBox').addEventListener('click', ev => {
-      const b = ev.target.closest('button[data-a]');
+  }
+  // 别名表：两列输入 + 删除 + 新增 + 从勾选生成
+  if ($('kfAliasAdd')) $('kfAliasAdd').onclick = () => {
+    keyAliasRows.push({ a: '', m: '' });
+    renderKeyAlias();
+  };
+  if ($('kfAliasGen')) $('kfAliasGen').onclick = () => {
+    keyAliasRows = keyAliasRows.concat(keyAliasGenerate(keyPickSel, keyAliasRows));
+    renderKeyAlias();
+  };
+  if ($('kfAliasBox')) {
+    $('kfAliasBox').addEventListener('input', ev => {
+      const el = ev.target.closest('input[data-a]');
+      if (!el) return;
+      const i = Number(el.dataset.i);
+      if (!keyAliasRows[i]) return;
+      if (el.dataset.a === 'alias') keyAliasRows[i].a = el.value; else keyAliasRows[i].m = el.value;
+    });
+    $('kfAliasBox').addEventListener('click', ev => {
+      const b = ev.target.closest('button[data-a="adel"]');
       if (!b) return;
-      const realm = b.dataset.r;
-      const list = (keyModelCatalog || []).filter(m => keyPickRealm(m.id) === realm);
-      if (b.dataset.a === 'gpickall') { keyPickAll = false; list.forEach(m => keyPickSel.add(m.id)); }
-      else list.forEach(m => keyPickSel.delete(m.id));
-      renderKeyPick();
+      keyAliasRows.splice(Number(b.dataset.i), 1);
+      renderKeyAlias();
     });
   }
   $('keyBody').onclick = async ev => {

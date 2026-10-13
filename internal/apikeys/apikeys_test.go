@@ -39,11 +39,11 @@ func TestMatchAuthz(t *testing.T) {
 	}
 
 	s := NewStore("")
-	k1, err := s.Add("a", "secret-a", "", nil, true)
+	k1, err := s.Add("a", "secret-a", "", nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k2, err := s.Add("b", "secret-b", "", nil, true)
+	k2, err := s.Add("b", "secret-b", "", nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,18 +76,18 @@ func TestMatchAuthz(t *testing.T) {
 
 func TestAddRejectsDuplicateSecret(t *testing.T) {
 	s := NewStore("")
-	if _, err := s.Add("a", "dup", "", nil, true); err != nil {
+	if _, err := s.Add("a", "dup", "", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Add("b", "dup", "", nil, true); err == nil {
+	if _, err := s.Add("b", "dup", "", nil, nil, true); err == nil {
 		t.Fatal("重复 secret 应被拒绝")
 	}
 }
 
 func TestCannotDisableOrDeleteLastEnabled(t *testing.T) {
 	s := NewStore("")
-	k1, _ := s.Add("a", "a1", "", nil, true)
-	k2, _ := s.Add("b", "b1", "", nil, true)
+	k1, _ := s.Add("a", "a1", "", nil, nil, true)
+	k2, _ := s.Add("b", "b1", "", nil, nil, true)
 
 	// 有两把启用时，停用一把是允许的。
 	dis := false
@@ -140,10 +140,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	p := filepath.Join(dir, "sub", "keys.json")
 
 	s := NewStore(p)
-	if _, err := s.Add("生产", "wb2a_aaaabbbbccccdddd", "备注", []string{"glm-5.2"}, true); err != nil {
+	if _, err := s.Add("生产", "wb2a_aaaabbbbccccdddd", "备注", []string{"glm-5.2"}, nil, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Add("测试", "wb2a_eeeeffff00001111", "", nil, false); err != nil {
+	if _, err := s.Add("测试", "wb2a_eeeeffff00001111", "", nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,8 +208,8 @@ func TestNormAllowedAndMask(t *testing.T) {
 
 func TestRootKeyProtectedFromDisableAndDelete(t *testing.T) {
 	s := NewStore("")
-	root, _ := s.Add("默认密钥", "legacy-key", "", nil, true)
-	other, _ := s.Add("别的", "other-key", "", nil, true)
+	root, _ := s.Add("默认密钥", "legacy-key", "", nil, nil, true)
+	other, _ := s.Add("别的", "other-key", "", nil, nil, true)
 	s.SetRootSecret("legacy-key")
 
 	// 表里还有别的启用密钥 ⇒ 不会被「最后一把」规则拦，只能是被根密钥规则拦。
@@ -244,7 +244,7 @@ func TestRootKeyProtectedFromDisableAndDelete(t *testing.T) {
 
 func TestRootGuardLiftedAfterRotation(t *testing.T) {
 	s := NewStore("")
-	k, _ := s.Add("默认密钥", "legacy-key", "", nil, true)
+	k, _ := s.Add("默认密钥", "legacy-key", "", nil, nil, true)
 	s.SetRootSecret("legacy-key")
 
 	// 先改掉密钥值：它不再是 config.json 的 api_key ⇒ 根密钥保护解除。
@@ -269,7 +269,7 @@ func TestRootGuardLiftedAfterRotation(t *testing.T) {
 	}
 
 	// 补一把启用的：现在可以停用旧的了（证明根密钥保护确实解除）。
-	if _, err := s.Add("新的", "rotated2", "", nil, true); err != nil {
+	if _, err := s.Add("新的", "rotated2", "", nil, nil, true); err != nil {
 		t.Fatalf("新增失败：%v", err)
 	}
 	if _, err := s.Update(k.ID, Patch{Enabled: &dis}); err != nil {
@@ -283,7 +283,7 @@ func TestRootGuardLiftedAfterRotation(t *testing.T) {
 
 func TestUpdatePartialKeepsOtherFields(t *testing.T) {
 	s := NewStore("")
-	k, _ := s.Add("原名", "s1", "原备注", []string{"glm-5.2"}, true)
+	k, _ := s.Add("原名", "s1", "原备注", []string{"glm-5.2"}, nil, true)
 	name := "新名"
 	got, err := s.Update(k.ID, Patch{Name: &name})
 	if err != nil {
@@ -298,7 +298,7 @@ func TestUpdatePartialKeepsOtherFields(t *testing.T) {
 
 func TestFindBySecret(t *testing.T) {
 	s := NewStore("")
-	k, _ := s.Add("a", "s1", "", nil, true)
+	k, _ := s.Add("a", "s1", "", nil, nil, true)
 	if got, found := s.FindBySecret("s1"); !found || got.ID != k.ID {
 		t.Fatalf("FindBySecret 未命中：%+v %v", got, found)
 	}
@@ -307,7 +307,7 @@ func TestFindBySecret(t *testing.T) {
 	}
 	// 停用后仍要能按值找到——调用方需要区分「已停用」与「不存在」。
 	dis := false
-	order, _ := s.Add("b", "s2", "", nil, true)
+	order, _ := s.Add("b", "s2", "", nil, nil, true)
 	if _, err := s.Update(order.ID, Patch{Enabled: &dis}); err != nil {
 		t.Fatalf("停用失败：%v", err)
 	}
@@ -316,3 +316,65 @@ func TestFindBySecret(t *testing.T) {
 		t.Fatalf("停用的密钥应能找到且 Enabled=false：%+v %v", got, found)
 	}
 }
+
+func TestModelAliasAndNorm(t *testing.T) {
+	s := NewStore("")
+	k, err := s.Add("a", "s1", "", []string{"global:deepseek-v4.1-flash"}, map[string]string{
+		" deepseek-v4.1-flash ": " global:deepseek-v4.1-flash ",
+		"same":                  "same", // 自映射 = 无操作 ⇒ 丢掉
+		"":                      "x",    // 空键 ⇒ 丢掉
+		"y":                     "  ",   // 空值 ⇒ 丢掉
+	}, true)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if len(k.ModelMap) != 1 || k.ModelMap["deepseek-v4.1-flash"] != "global:deepseek-v4.1-flash" {
+		t.Fatalf("别名映射未归一化：%+v", k.ModelMap)
+	}
+	real, hit := k.ModelAlias("deepseek-v4.1-flash")
+	if !hit || real != "global:deepseek-v4.1-flash" {
+		t.Fatalf("ModelAlias=%q,%v", real, hit)
+	}
+	if _, hit := k.ModelAlias("没配过的"); hit {
+		t.Fatal("未配置的名字不应命中")
+	}
+	// 白名单按**真实模型名**判定（用户勾的就是它）；带域条目是精确匹配。
+	if !k.AllowsModel("global", "deepseek-v4.1-flash") {
+		t.Fatal("白名单应放行真实模型（global 域）")
+	}
+	if k.AllowsModel("cn", "deepseek-v4.1-flash") {
+		t.Fatal("带域前缀的白名单条目不应放行 cn 域")
+	}
+}
+
+func TestUpdateModelMap(t *testing.T) {
+	s := NewStore("")
+	k, _ := s.Add("a", "s1", "", nil, nil, true)
+	mm := map[string]string{"x": "global:x"}
+	got, err := s.Update(k.ID, Patch{ModelMap: &mm})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got.ModelMap["x"] != "global:x" {
+		t.Fatalf("Update 未写入别名：%+v", got.ModelMap)
+	}
+	// 传空 map ⇒ 清空（显式清空的语义；nil 指针才是"不改"）
+	empty := map[string]string{}
+	got2, err := s.Update(k.ID, Patch{ModelMap: &empty})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(got2.ModelMap) != 0 {
+		t.Fatalf("空 map 应清空别名：%+v", got2.ModelMap)
+	}
+	// nil 指针不动它
+	got3, err := s.Update(k.ID, Patch{Name: strPtr("改名")})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(got3.ModelMap) != 0 {
+		t.Fatalf("未传 ModelMap 不应改动：%+v", got3.ModelMap)
+	}
+}
+
+func strPtr(s string) *string { return &s }

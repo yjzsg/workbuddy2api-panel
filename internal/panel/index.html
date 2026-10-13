@@ -286,7 +286,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
   font-size: 11.5px; color: var(--ink-3); }
 .kfpick .grp b { color: var(--ink-2); font-weight: 600; letter-spacing: .04em; }
 .kfpick .grp .grow { flex: 1; }
-.kfpick .row { display: grid; grid-template-columns: auto minmax(110px, 1fr) auto auto;
+.kfpick .row { display: grid; grid-template-columns: auto minmax(110px, 1fr) auto auto auto;
   align-items: center; gap: 10px; padding: 4px 10px; border-bottom: 1px solid var(--line-soft);
   font-size: 12px; cursor: pointer; }
 .kfpick .row:hover { background: var(--accent-soft); }
@@ -297,6 +297,13 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 「不限制」时整列表压暗：仍可点（点任意一项即自动取消不限制） */
 .kfpick.dim .row { opacity: .45; }
 .kfpick.dim .row:hover { background: none; }
+
+/* ── 密钥的别名映射表 ─────────────────────────────────────────────── */
+.kfalias .row { display: grid; grid-template-columns: minmax(150px, 1fr) auto minmax(190px, 1.3fr) auto;
+  align-items: center; gap: 8px; padding: 4px 0; }
+.kfalias .row .ar { color: var(--ink-3); font-family: var(--mono); }
+.kfalias .row input { width: 100%; padding: 5px 10px; font-size: 12.5px; border-radius: 6px; }
+.kfalias .none { padding: 10px 0; color: var(--ink-3); font-size: 12px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
@@ -956,9 +963,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <button type="button" class="xs ghost" id="kfPickSelNone">清空</button>
             </div>
             <div id="kfPickHint" style="margin-top:4px;color:var(--ink-3);font-size:12px"></div>
-            <input id="kfPickSearch" type="text" placeholder="筛选模型名（如 luna / glm / deepseek）" style="margin-top:6px;min-width:320px" aria-label="筛选模型">
+            <input id="kfPickSearch" type="text" placeholder="筛选模型名（如 luna / glm / deepseek）" style="margin-top:6px;min-width:280px" aria-label="筛选模型">
+            <select id="kfPickRealm" aria-label="域筛选" style="margin-top:6px">
+              <option value="">全部域</option>
+              <option value="cn">仅 CN</option>
+              <option value="global">仅国际版</option>
+            </select>
             <div id="kfPickBox" class="kfpick" style="margin-top:6px"></div>
             <input id="kfModelsExtra" type="text" placeholder="其他模型名（不在上面列表里时填，逗号或换行分隔，可留空）" style="margin-top:6px;min-width:460px" aria-label="其他模型名">
+          </div>
+
+          <div class="fbar" style="margin-top:8px;display:block">
+            <div class="fbar" style="flex-wrap:wrap;gap:10px;padding:0;border:0;background:none">
+              <label>别名映射 <span style="color:var(--ink-3)">客户端用左列的名字调用，实际请求右列的模型</span></label>
+              <span class="grow"></span>
+              <button type="button" class="xs ghost" id="kfAliasGen">从勾选的模型生成</button>
+              <button type="button" class="xs ghost" id="kfAliasAdd">添加一行</button>
+            </div>
+            <div id="kfAliasBox" class="kfalias"></div>
+            <div id="kfAliasHint" style="margin-top:4px;color:var(--ink-3);font-size:12px"></div>
           </div>
           <div class="fbar" style="margin-top:6px">
             <label><input type="checkbox" id="kfEnabled" checked> 启用</label>
