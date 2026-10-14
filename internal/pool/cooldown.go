@@ -322,13 +322,24 @@ type ModelBlockStatus struct {
 // （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
 // （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
 //
-// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
-// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
-// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
-//
-// 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
-// （只审计不拦截）不会被误报成阻塞。
+// 等价于 ModelBlockedForRealm(model, "")（不限域）。带 realm 前缀的请求
+// （"cn:glm-5.3" / "global:glm-5.3"）应改用 ModelBlockedForRealm——见其注释。
 func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	return p.ModelBlockedForRealm(model, "")
+}
+
+// ModelBlockedForRealm 同 ModelBlocked，但把判定范围限制在 realm 域内
+// （realm 为空 = 不限域，与 ModelBlocked 同义）。
+//
+// 为什么需要域过滤（2026-10-14）：选号是按**请求域**过滤的
+// （PickExcludingForRealm 的 realm 谓词，见 pick.go 的 realmOK），而 realm 前缀是
+// 网关侧路由协议——`cn:glm-5.3` 的请求永远拿不到 global 账号。原实现遍历全池，
+// 于是「CN 号全被 glm-5.3 的 6004 挡住、但 global 号还能服务 glm-5.3」时返回
+// Blocked=false ⇒ 客户端拿到 503 no_healthy_account（"服务端过载"形状，会被重试），
+// 而真实语义是「这个域下该模型没号了，换模型」。
+//
+// 判定口径与选号一致：仍用 modelCooled（AuditOnly 条目不算阻塞）。
+func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
@@ -342,6 +353,9 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/手动停用号不参与：它们的不可用与模型无关
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue // 域过滤：跨域账号对本请求不可达，不构成「还能服务」的证明
 		}
 		if !e.modelCooled(now, model) {
 			// 还有账号能服务这个模型 → 不是模型级阻塞。

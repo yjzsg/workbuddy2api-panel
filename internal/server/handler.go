@@ -1052,7 +1052,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
-			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			// 按**请求域**判定（2026-10-14）：选号本身按 realm 过滤，跨域账号对本请求
+			// 不可达、不构成「还能服务」的证明；不传 realm 会把「CN 该模型全灭」误读成
+			// 「还有 global 能服务」→ 退回 503 可重试形状（实测 CN glm-5.3 全体 6004）。
+			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
 			break
 		}
 		st.uid = acct.UID

@@ -291,6 +291,10 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 //
+// 另有一条**模型级**排除（2026-10-14）：model 非空时跳过对该模型仍处模型级冷却
+// （6004/11102，见 entry.modelCooled）的号。模型级冷却不写账号级 until，若兜底不看它，
+// 同一个号会被反复选中反复撞同一堵墙（CN glm-5.3 全体 6004 时实测 12 连击）。
+//
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
@@ -309,6 +313,24 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if e.modelCooled(now, model) {
+			// 该模型在此号上仍处模型级冷却（6004 / 11102）→ 不参与兜底（2026-10-14）。
+			//
+			// 为什么必须在这里拦：兜底的排序判据是 expiry()（账号级 until / 熔断 /
+			// 降权三者取最早），而模型级冷却**不写账号级 until**（见 CooldownSoftForModel
+			// 的「6004 从不写账号级 until」契约）⇒ 对同一个请求模型，被模型级冷却挡住的
+			// 号在 expiry() 眼里与健康号无异，于是「截止最早」的那个号会被**反复**选中。
+			// 实测（CN glm-5.3 全体 6004 期间）：红花(a72732ea) 被连续兜底选中 12 次，
+			// 15:11:12–15:13:03 每 ~2.3s 白打一次上游、客户端 12 连败——而它的
+			// 上游重置时刻在 4.5 小时后（19:48:10），每次重试注定失败。
+			//
+			// 全被排除则返回 nil，由 handler 走 ModelBlocked* → 400 model_unavailable
+			// （「换模型」而不是「重试」），比让客户端拿到可重试形状的 429/503 更准确。
+			//
+			// 空 model（无模型上下文，如面板探活 Pick("")）时 modelCooled 恒 false，
+			// 既有兜底语义零变化。
+			continue
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
