@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"strings"
 )
 
@@ -222,4 +223,33 @@ func TurnRequestID(turnKey string) string {
 	}
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
 	return hex.EncodeToString(sum[:16])
+}
+
+// SessionIDFromHeader 从入站请求头提取**会话级**会话标识。
+//
+// 用途：部分客户端把会话 ID 放在 header 而非 body，网关需要它做 prompt_cache_key
+// 分桶与粘性路由（否则退化成「首条 user 消息哈希」启发式兜底）。
+//   - Claude Code：X-Claude-Code-Session-Id（官方文档：会话唯一标识，供 proxy 聚合）
+//   - Codex CLI：session_id（源码 codex-rs/codex-api/src/requests/headers.rs）
+//   - 通用：X-Conversation-ID / X-Session-Id
+//
+// ⛔ 绝不能用 X-Conversation-Request-ID —— 它是**轮级**的（跨轮必换），拿它做
+// cache key 会让每轮都变成新 key（见 handler.go 会话头族的「统一轮级」注释）。
+//
+// 找不到返回空串（绝不失败）。
+func SessionIDFromHeader(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	for _, name := range []string{
+		"X-Conversation-ID",
+		"X-Claude-Code-Session-Id",
+		"session_id",
+		"X-Session-Id",
+	} {
+		if v := strings.TrimSpace(h.Get(name)); v != "" {
+			return v
+		}
+	}
+	return ""
 }

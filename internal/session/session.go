@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -403,11 +404,18 @@ func StickyFallbackKey(body []byte) string {
 //
 // 三源皆空（无首条 user 文本，或客户端带 user_id——StickyFallbackKey 的既定语义）
 // 时返回空串，调用方沿用既有「空会话」兜底（buildCacheKey 的账号常量）。
-func CacheKeySource(body []byte) string {
+func CacheKeySource(body []byte, h http.Header) string {
 	if v := ResolveConversationID(body); v != "" {
 		return v
 	}
 	if v := ExtractKey(body); v != "" {
+		return v
+	}
+	// 第三级（2026-10-14 加）：客户端把会话 ID 放在 header 的场景 ——
+	// Claude Code 发 X-Claude-Code-Session-Id、Codex 发 session_id，而经中转层
+	// （New API 等）转发时 body 里的标识常被剥掉。优先级低于 body（body 更精确），
+	// 高于 StickyFallbackKey（header 是客户端自报的精确标识，启发式只是兜底）。
+	if v := SessionIDFromHeader(h); v != "" {
 		return v
 	}
 	return StickyFallbackKey(body)

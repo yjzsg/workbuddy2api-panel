@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -629,7 +630,7 @@ func TestCacheKeySource(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := CacheKeySource([]byte(c.body)); !c.want(got) {
+			if got := CacheKeySource([]byte(c.body), nil); !c.want(got) {
 				t.Fatalf("CacheKeySource = %q（%s）", got, c.why)
 			}
 		})
@@ -639,13 +640,46 @@ func TestCacheKeySource(t *testing.T) {
 // TestCacheKeySourceStableForSameSession 同会话（首条 user 消息不变、历史递增）
 // 必须得到同一个键——这是上游前缀缓存能命中的前提；不同会话必须不同键。
 func TestCacheKeySourceStableForSameSession(t *testing.T) {
-	a := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"}]}`))
-	b := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"},{"role":"assistant","content":"好"},{"role":"user","content":"改成 Python"}]}`))
+	a := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"}]}`), nil)
+	b := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"},{"role":"assistant","content":"好"},{"role":"user","content":"改成 Python"}]}`), nil)
 	if a == "" || a != b {
 		t.Fatalf("同会话键不稳定: a=%q b=%q", a, b)
 	}
-	c := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"另一个话题"}]}`))
+	c := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"另一个话题"}]}`), nil)
 	if c == "" || c == a {
 		t.Fatalf("不同会话应不同键: a=%q c=%q", a, c)
+	}
+}
+
+// TestCacheKeySourceFromHeader 客户端把会话 ID 放 header 的场景
+// （Claude Code / Codex 经中转层转发时 body 标识常被剥掉）。
+// 同时钉住两条纪律：body 优先于 header；轮级头绝不能被采纳。
+func TestCacheKeySourceFromHeader(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+
+	h := http.Header{}
+	h.Set("X-Claude-Code-Session-Id", "sess-claude-1")
+	if got := CacheKeySource(body, h); got != "sess-claude-1" {
+		t.Fatalf("Claude Code header 未被采用: %q", got)
+	}
+
+	h2 := http.Header{}
+	h2.Set("session_id", "codex-sess-1") // Go 规范化为 Session_id
+	if got := CacheKeySource(body, h2); got != "codex-sess-1" {
+		t.Fatalf("Codex session_id header 未被采用: %q", got)
+	}
+
+	// body 标识优先于 header
+	h3 := http.Header{}
+	h3.Set("X-Claude-Code-Session-Id", "from-header")
+	if got := CacheKeySource([]byte(`{"conversation_id":"from-body","messages":[{"role":"user","content":"hi"}]}`), h3); got != "from-body" {
+		t.Fatalf("body 标识应优先于 header: %q", got)
+	}
+
+	// 轮级头（X-Conversation-Request-ID）绝不能被采纳 → 应回落启发式
+	h4 := http.Header{}
+	h4.Set("X-Conversation-Request-ID", "turn-123")
+	if got := CacheKeySource(body, h4); !strings.HasPrefix(got, "fb:") {
+		t.Fatalf("X-Conversation-Request-ID 不应被采纳（轮级），实际 %q", got)
 	}
 }
