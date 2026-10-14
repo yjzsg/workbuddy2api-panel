@@ -155,10 +155,10 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
 		// P1-anti-monopoly：user_id 不再是粘性键（对话级粒度修正，键序四键全 conversation 维度）。
-		{`{"metadata":{"user_id":"mu"}}`, ""},    // user_id 单独出现 → 空（不生成粘性）
-		{`{"user_id":"mu"}}`, ""},                // 顶层 user_id 从未支持，保持空
+		{`{"metadata":{"user_id":"mu"}}`, ""},        // user_id 单独出现 → 空（不生成粘性）
+		{`{"user_id":"mu"}}`, ""},                    // 顶层 user_id 从未支持，保持空
 		{`{"metadata":{"conversation_id":123}}`, ""}, // 非字符串 → 空
-		{`not-json`, ""}, // 非法 JSON → 空
+		{`not-json`, ""},                             // 非法 JSON → 空
 		// issue #35：客户端实际发 camelCase conversationId，ExtractKey 必须识别。
 		{`{"conversationId":"abc"}`, "abc"},                                            // 顶层 camelCase
 		{`{"metadata":{"conversationId":"abc"}}`, "abc"},                               // metadata.camelCase
@@ -605,4 +605,47 @@ func TestStartGCIdempotentAndRestartable(t *testing.T) {
 		t.Errorf("重启后 GC 未生效: count=%d want 0", got)
 	}
 	r.StopGC()
+}
+
+// TestCacheKeySource 三级回退：conversation_id → 会话键（含 prompt_cache_key）
+// → 派生键（首条 user 消息哈希）；全空返回空串。
+func TestCacheKeySource(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want func(string) bool
+		why  string
+	}{
+		{"conversation_id 最优先", `{"conversation_id":"c1","prompt_cache_key":"p1","messages":[{"role":"user","content":"hi"}]}`,
+			func(g string) bool { return g == "c1" }, "conversation 维度优先于 cache_key"},
+		{"无 conversation_id 用 prompt_cache_key", `{"prompt_cache_key":"p1","messages":[{"role":"user","content":"hi"}]}`,
+			func(g string) bool { return g == "p1" }, "ExtractKey 第 5 项"},
+		{"都无 → 派生键", `{"messages":[{"role":"user","content":"帮我写个函数"}]}`,
+			func(g string) bool { return strings.HasPrefix(g, "fb:") }, "StickyFallbackKey"},
+		{"无 user 消息 → 空", `{"messages":[{"role":"system","content":"x"}]}`,
+			func(g string) bool { return g == "" }, "无签名源"},
+		{"带 user_id → 空", `{"user_id":"u9","messages":[{"role":"user","content":"hi"}]}`,
+			func(g string) bool { return g == "" }, "StickyFallbackKey 的既定语义"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := CacheKeySource([]byte(c.body)); !c.want(got) {
+				t.Fatalf("CacheKeySource = %q（%s）", got, c.why)
+			}
+		})
+	}
+}
+
+// TestCacheKeySourceStableForSameSession 同会话（首条 user 消息不变、历史递增）
+// 必须得到同一个键——这是上游前缀缓存能命中的前提；不同会话必须不同键。
+func TestCacheKeySourceStableForSameSession(t *testing.T) {
+	a := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"}]}`))
+	b := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"帮我写个函数"},{"role":"assistant","content":"好"},{"role":"user","content":"改成 Python"}]}`))
+	if a == "" || a != b {
+		t.Fatalf("同会话键不稳定: a=%q b=%q", a, b)
+	}
+	c := CacheKeySource([]byte(`{"messages":[{"role":"user","content":"另一个话题"}]}`))
+	if c == "" || c == a {
+		t.Fatalf("不同会话应不同键: a=%q c=%q", a, c)
+	}
 }

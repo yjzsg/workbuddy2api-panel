@@ -306,11 +306,11 @@ func hashIndex(key string, n int) int {
 //  5. prompt_cache_key（第 5 项，见下）
 //
 // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
-//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
 // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
 // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
-//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
-//（7d 兜底）自然过期，键消失不产生脏绑定。
+// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+// （7d 兜底）自然过期，键消失不产生脏绑定。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -384,6 +384,33 @@ func StickyFallbackKey(body []byte) string {
 	}
 	sum := sha256.Sum256([]byte(text))
 	return "fb:" + hex.EncodeToString(sum[:16])
+}
+
+// CacheKeySource 返回上游 prompt_cache_key 注入所用的会话标识源，逐级回退：
+//
+//  1. ResolveConversationID —— body 的 conversation_id / conversationId（含 metadata 形态）
+//  2. ExtractKey —— 更宽：再含 metadata.conversationId 与 prompt_cache_key
+//  3. StickyFallbackKey —— 无任何会话标识时的派生键（首条 user 消息哈希）
+//
+// 三级与粘性路由（handler 的 stickyKey = ExtractKey || StickyFallbackKey）同源，
+// 保证「同一会话既粘同一账号、又复用同一前缀缓存槽」。
+//
+// 为什么需要第 3 级（2026-10-14）：聚合层客户端（New API 等）转发时不带任何会话
+// 标识，ExtractKey 恒空 ⇒ 上游 cache key 退化成「每账号一个常量」（buildCacheKey
+// 的既定兜底）⇒ 同一账号下所有会话共用一个前缀缓存槽、互相驱逐。实测该账号上首次
+// 大请求命中率仅 7.9~10.4%（只有共享 system 前缀命中），换账号后再全丢。用派生键后，
+// 同会话（首条 user 消息不变）稳定命中同一槽。
+//
+// 三源皆空（无首条 user 文本，或客户端带 user_id——StickyFallbackKey 的既定语义）
+// 时返回空串，调用方沿用既有「空会话」兜底（buildCacheKey 的账号常量）。
+func CacheKeySource(body []byte) string {
+	if v := ResolveConversationID(body); v != "" {
+		return v
+	}
+	if v := ExtractKey(body); v != "" {
+		return v
+	}
+	return StickyFallbackKey(body)
 }
 
 // hasUserID 报告 body 是否携带 user 维度标识（metadata.user_id 或顶层 user_id）。

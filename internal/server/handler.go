@@ -988,10 +988,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the upstream prompt_cache_key degrades into one constant per account and
 	// every client on that account ends up sharing a single, constantly evicted
 	// prefix-cache slot.
-	convID := session.ResolveConversationID(body)
-	if convID == "" {
-		convID = sessKey
-	}
+	// 【2026-10-14】第三级回退补齐：会话键也空时（聚合层客户端如 New API 转发时
+	// 不带任何会话标识）改用 StickyFallbackKey 派生键（首条 user 消息哈希），与
+	// 上方 stickyKey 同源。此前这种情况 convID 恒空 ⇒ buildCacheKey 退化成
+	// 「每账号一个常量」⇒ 同账号下所有会话挤一个前缀缓存槽、互相驱逐；实测该账号
+	// 首次大请求命中率仅 7.9~10.4%，换账号后缓存全丢。派生键让同会话稳定命中。
+	convID := session.CacheKeySource(body)
 	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
