@@ -303,10 +303,30 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+// queueWaitingCode / queueFullCode 明确指向「上游排队」的业务 code。
+//
+// 与 6004（模型级用量限流）、14003（模型繁忙）的区别：队列码是**容量**信号——
+// 上游此刻接不下这个模型的请求，把请求排进队列（6020 queue.waiting，body 带
+// data.{queue_position, retry_after}、client_user_type）或直接拒收（6021 queue.full）。
+// 账号本身健康、号内额度也在；按账号级 600s 冷却既冤枉账号、又会连带停掉它所有模型。
+// 2026-10-15 实测：6 个 CN 号各吃一次 6021 → 全部账号级冷却 600s → CN 池空转 10 分钟。
+const queueWaitingCode = "6020"
+const queueFullCode = "6021"
+
+// QueueBusyReason 排队类冷却条目在 pool.modelCooldowns 里的 reason 前缀。
+// 与 6004（"6004 model rate limit"）、11102（"11102 model not available"）的
+// reason 前缀互不干扰，三者可共存于同一 map 键。
+const QueueBusyReason = "queue busy"
+
 var (
 	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
+	reQueueWaiting    = regexp.MustCompile(`"code"\s*:\s*"?` + queueWaitingCode + `"?`)
+	reQueueFull       = regexp.MustCompile(`"code"\s*:\s*"?` + queueFullCode + `"?`)
+	// reQueueRetryAfter 匹配排队响应 data 里的 retry_after（秒）。
+	// 形如 "data":{"queue_position":526,...,"retry_after":40,...}。
+	reQueueRetryAfter = regexp.MustCompile(`"retry_after"\s*:\s*([0-9]+)`)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
@@ -317,6 +337,34 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
 	return reModelRateLimit.MatchString(body)
+}
+
+// IsQueueBusy 报告 429 body 是否是上游排队类答复（6020 queue.waiting / 6021 queue.full）。
+//
+// 只比对业务 code 字段，绝不做整段文本子串匹配——与 IsModelBlocked 同纪律：
+// 错误体还带 requestId 等字段，拿整段文本匹配会把 "6020" 撞在 ID 上。
+func IsQueueBusy(body string) bool {
+	return reQueueWaiting.MatchString(body) || reQueueFull.MatchString(body)
+}
+
+// IsQueueBusyReason 报告 pool.modelCooldowns 条目的 reason 是否来自排队类避让
+// （handler 写 QueueBusyReason）。末端出口据此区分「等一会儿重试」与「换模型」。
+func IsQueueBusyReason(reason string) bool {
+	return strings.HasPrefix(strings.TrimSpace(reason), QueueBusyReason)
+}
+
+// ParseQueueRetryAfter 解析排队类响应里上游建议的等待时长（data.retry_after，秒）。
+// 命中且为正数才返回 true；缺失/非数值/0 → false（调用方回落默认避让时长）。
+func ParseQueueRetryAfter(body string) (time.Duration, bool) {
+	m := reQueueRetryAfter.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。

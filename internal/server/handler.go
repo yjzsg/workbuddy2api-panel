@@ -119,6 +119,27 @@ const notFoundCooldown = 60 * time.Second
 // 抖动复用 backoff.go jitterDur（单一来源，不重复造轮子）。
 const wafCooldownBase = 60 * time.Second
 
+// queueCooldownDefault 排队类响应（6020 queue.waiting / 6021 queue.full）**未给出**
+// data.retry_after 时的默认避让时长。
+//
+// 与 SoftCooldown（600s 起 + 指数升级）分流的原因：排队是上游**容量**信号
+// （队列满/排队中），不是"本账号被限流"——账号本身健康，只是此刻上游接不下这个模型。
+// 按账号级 600s 罚会连带把所有模型一起停掉；实测 2026-10-15 10:30–10:36 六个 CN 号
+// 各吃一次 6021 → 全部账号级冷却 600s → **CN 池整体空转约 10 分钟**。
+// 故改为**模型级**短避让：只让该模型在这个号上歇一会儿，其他模型照常服务。
+const queueCooldownDefault = 60 * time.Second
+
+// timeoutCooldown 上游超时（响应头迟迟不来）后该 (账号, 模型) 的短时避让时长。
+//
+// 为什么必须有它：超时路径是"不换号、不罚号"（handler 轮转循环内的
+// isUpstreamTimeout 分支），理由是同一份请求换号撞的是同一个慢上游。这个理由对
+// **换号**成立，但对**罚号**不成立——零惩罚会让卡住的号状态最干净、在选号打分里
+// 永远最优，于是被反复选中：实测 2026-10-15 10:26:30–10:29:20 红花(a72732ea)
+// 连续 4 次各烧 120s 头超时（其间同样大小的 prompt 只要 7s），是全池唯一有 >100s
+// 记录的号。给一个 60s 的模型级避让，下一次请求就会落到别的号上。
+// 用模型级而非账号级：卡的是"这个号 + 这个模型"这一次调用，不该连坐其他模型。
+const timeoutCooldown = 60 * time.Second
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -1135,10 +1156,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 也就是上游停滞。客户端主动断连时 r.Context() 已取消，走下面的抖动分支。
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				// 短时**模型级**避让（2026-10-15）：上面的"不换号"是对的（同一份请求
+				// 换号撞的是同一个慢上游），但"不罚号"会让卡住的号状态最干净、在选号
+				// 打分里永远最优 → 被反复选中。实测红花(a72732ea) 10:26:30–10:29:20
+				// 连续 4 次各烧 120s 头超时（其间同样大小的 prompt 只要 7s），是全池
+				// 唯一有 >100s 记录的号。给 60s 模型级避让，下一次请求就落到别的号上。
+				// 用模型级而非账号级：卡的是"这个号 + 这个模型"这一次调用，不连坐其他模型。
+				// 仍不进熔断/连败计数：超时不是账号故障证据（网络/上游抖动同样会超时）。
+				h.cfg.Pool.CooldownSoftForModel(acct.UID, timeoutCooldown,
+					time.Now().Add(timeoutCooldown), bareModel, "upstream timeout")
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
-				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
-					logfmt.Label(acct.UID, acct.Nickname), terr)
+				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized; model-level %s cooldown)",
+					logfmt.Label(acct.UID, acct.Nickname), terr, timeoutCooldown)
 				break
 			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
@@ -1556,6 +1586,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
 	if modelBlock.Blocked {
+		// 排队类例外（2026-10-15）：6020/6021 的模型级避让**不是**「模型不可用」，
+		// 而是「上游队列此刻满」。6004/11102 报 400 是因为「换号重试必然同样失败，
+		// 客户端该换模型」；排队正相反——等一会儿重试才是对的（上游队列几十秒就排空）。
+		// 若也报 400 model_unavailable，会把客户端推向"换模型"这个错误动作。
+		// 故保持 429 + 上游原文（客户端据此退避重试），本地调度信息进 hint。
+		if upstream.IsQueueBusyReason(modelBlock.Reason) {
+			code = "rate_limit_exceeded"
+			if !upstreamMsgPassed {
+				msg = "upstream queue is full for this model, please retry later"
+			}
+			hint = fmt.Sprintf("queue busy on %d account(s)", modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				hint += "; retry after " + modelBlock.Until.Format(time.RFC3339)
+			}
+			status = http.StatusTooManyRequests
+			writeOpenAIErrorHint(w, status, code, msg, hint)
+			st.status = status
+			st.outcome = reqlog.OutcomeHTTPError
+			return
+		}
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -1671,8 +1721,11 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //
 // 十一条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+//   - ErrSoftRate → **排队类（6020 queue.waiting / 6021 queue.full）先分流**：
+//     上游容量信号，走模型级短避让（时长取 body 的 data.retry_after，缺失 60s），
+//     不罚账号、不连坐其他模型（2026-10-15：6 个 CN 号各吃一次 6021 曾把整个 CN 域
+//     打死 10 分钟）。其余按优先级对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级
+//     豁免、非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
 //     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。P1-2 后冷却时长
 //     优先采信 Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
@@ -1724,6 +1777,25 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 排队类（6020 queue.waiting / 6021 queue.full）——上游**容量**信号，最先判。
+		//
+		// 为什么必须与普通 429 分流（2026-10-15 实测）：排队意味着"上游此刻接不下这个
+		// 模型"，账号本身健康、号内额度也在。若按账号级 600s 冷却：
+		//   - 6 个 CN 号各吃一次 6021（10:43:28–10:43:41 一次请求就转完 6 个）→
+		//     全部账号级冷却 600s → **整个 CN 域所有模型一起死**（实测同期
+		//     cn:glm-5.3 / cn:fast-model 均报 rate_limit_exceeded）；
+		//   - 上游队列往往几十秒就排空，我们却自伤 10 分钟。
+		// 故走**模型级**避让：时长优先取上游给的 data.retry_after（6020 实测 40s），
+		// 缺失回落 queueCooldownDefault；只让该模型在这个号上歇一会儿，
+		// 其他模型照常服务，且账号本身不被罚。
+		if upstream.IsQueueBusy(body) {
+			d := queueCooldownDefault
+			if v, ok := upstream.ParseQueueRetryAfter(body); ok {
+				d = v
+			}
+			h.cfg.Pool.CooldownSoftForModel(uid, d, time.Now().Add(d), model, upstream.QueueBusyReason)
+			return
+		}
 		// modelRateLimited 判定该 429 是否明确指向模型级限流（业务 code 6004）：
 		// 是则写模型级独立冷却（切模型豁免），否则走账号级软冷却。
 		// [上游 dbd7c68..origin/main：无重置时间时挂 AuditOnly 展示项]

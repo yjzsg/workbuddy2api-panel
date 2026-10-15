@@ -363,12 +363,15 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		}
 		st.Count++
 		if mc, ok := e.modelCooldowns[model]; ok {
-			if st.Reason == "" {
-				st.Reason = mc.Reason
-			}
-			// 取最早解封：那才是"再等多久值得重试"的答案。
-			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
+			// Reason 与 Until **同源**（取最早解封那一条）：末端出口按 Reason 区分
+			// 「等一会儿重试」（排队类）与「换模型」（6004/11102），若 Reason 取自
+			// map 迭代的首个条目而 Until 取自最早的另一个条目，两者会自相矛盾
+			// （2026-10-15 修：同一模型上同时存在排队避让与 6004 时尤为明显）。
+			if earlier := !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)); earlier {
 				st.Until = mc.Until
+				st.Reason = mc.Reason
+			} else if st.Reason == "" {
+				st.Reason = mc.Reason // 兜底：Until 全零值时仍带出一个原因
 			}
 		}
 	}
