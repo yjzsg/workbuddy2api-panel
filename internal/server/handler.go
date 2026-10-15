@@ -837,6 +837,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if stickyKey == "" {
 		stickyKey = session.StickyFallbackKey(body)
 	}
+	// 调试开关 WB2A_DBG_STICKY：记录粘性键的**来源与指纹**，用于诊断中转层
+	// （New API 等）洗掉会话标识导致逐请求换号。不设置时零开销。
+	// 隐私边界见 sticky_debug.go 文件头注释。
+	dbgSticky := os.Getenv("WB2A_DBG_STICKY") != ""
+	dbgSrc := ""
+	if dbgSticky {
+		switch {
+		case sessKey != "":
+			dbgSrc = "sessKey"
+		case session.SessionIDFromHeader(r.Header) != "":
+			dbgSrc = "header"
+		case stickyKey != "":
+			dbgSrc = "fallback"
+		default:
+			dbgSrc = "空"
+		}
+	}
 	stickyUID := ""
 	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
@@ -848,6 +865,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 			stickyUID = uid
 		}
+	}
+	// 粘性键诊断（仅 WB2A_DBG_STICKY）：hit 判据最关键——
+	// hit=false 说明 ResolveForModel 认为绑定号在本模型/本 realm 不可用而重新
+	// 分配，这就是"同一会话被拆散到多个账号"的直接证据。
+	if dbgSticky {
+		log.Printf("DBG: [sticky] src=%s fp=%s model=%s hit=%v uid=%s msgs=%d tools=%d first=%s",
+			dbgSrc, stickyFingerprint(stickyKey), peek.Model, stickyUID != "",
+			logfmt.Label(stickyUID, ""), countMessages(body), countTools(body),
+			firstUserSnippet(body))
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
