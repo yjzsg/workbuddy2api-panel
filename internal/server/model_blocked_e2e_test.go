@@ -87,9 +87,13 @@ func TestModelCooledRealmScopedOnlyBlocksItsRealm(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: countingUpstream(&called)})
 
 	// cn 域：只有 cn1 可路由，且它被挡 → 400 model_unavailable。
+	//
+	// 【2026-10-15】必须用显式 `cn:` 前缀：裸名现在是 realm=""（地域无关，全池参与
+	// 粘合），此时 global 的 g1 仍能服务该模型 → 放行 200 才是正确行为。
+	// 本用例测的是**带前缀请求的域隔离**，故显式写 cn:。
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"cn:glm-5.3","messages":[{"role":"user","content":"hi"}]}`)))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
 		t.Fatalf("cn 域应报 model_unavailable：code=%d body=%s", rec.Code, rec.Body)
 	}

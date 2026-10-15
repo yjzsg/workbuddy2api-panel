@@ -21,7 +21,8 @@ func realmPool(t *testing.T) *pool.Pool {
 }
 
 // TestRealmAwareAvailableForModel 断言会话粘性的 realm 感知闭包：
-// 带前缀的模型名按 realm 过滤可用账号，裸名走 cn。
+// 带前缀的模型名按 realm 过滤可用账号；裸名 = 地域无关 → **全池**（两域账号都参与
+// 粘合，跨域不再触发重新分配，见 resolve_model.go 的 2026-10-15 变更）。
 func TestRealmAwareAvailableForModel(t *testing.T) {
 	p := realmPool(t)
 	fn := realmAwareAvailableForModel(p)
@@ -30,9 +31,10 @@ func TestRealmAwareAvailableForModel(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1"}},       // 裸名 → cn 集合
-		{"cn:glm-5.2", []string{"cn1"}},    // 显式 cn 前缀 → cn 集合
-		{"global:gpt-5.4", []string{"g1"}}, // global 前缀 → global 集合
+		{"glm-5.2", []string{"cn1", "g1"}},             // 裸名 → 全池（cn1+g1）
+		{"deepseek-v4.1-flash", []string{"cn1", "g1"}}, // 中转层裸名：两域都参与粘合
+		{"cn:glm-5.2", []string{"cn1"}},                // 显式 cn 前缀 → cn 集合
+		{"global:gpt-5.4", []string{"g1"}},             // global 前缀 → global 集合
 	}
 	for _, c := range cases {
 		if got := fn(c.model); !reflect.DeepEqual(got, c.want) {
