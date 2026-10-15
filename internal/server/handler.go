@@ -389,7 +389,11 @@ const (
 
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
-	list := h.modelList()
+	// 裸名（realm-agnostic）条目先追加，再过密钥白名单：
+	// 无白名单的密钥（New API 中转在用的默认密钥）因此能选到裸名模型，
+	// 配合 resolveModel 的 realm="" 走全池粘合；只列带域前缀白名单的密钥
+	// 不会被裸名条目放行（AllowsModel 精确匹配 full），域锁定不受影响。
+	list := appendAnyRealmAliases(h.modelList())
 	// 密钥白名单：只列出该密钥可用的模型，避免客户端拿到必然 403 的名字。
 	// 白名单为空 = 不限制，此时直接透传（零额外开销）。
 	apiKey := keyFromReq(r)
