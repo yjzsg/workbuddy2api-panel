@@ -188,8 +188,11 @@ func TestGlobalRefreshUsesGlobalChatBase(t *testing.T) {
 	}
 }
 
-// TestCNChatPathUnchanged 零回归：CN 账号（realm=cn）chat 仍打 CN base + /v2/chat/completions，
-// 无首条 system 兜底（ensureConsoleSystem 只对 global）。
+// TestCNChatPathUnchanged CN 账号（realm=cn）chat 仍打 CN base + /v2/chat/completions。
+//
+// 【2026-10-16 语义反转】原先断言「CN 不注入首条 system 兜底」，因 ensureConsoleSystem
+// 从 global-only 扩为两域，该断言已不再成立。改为断言「CN 也前置兜底 system」——
+// 上游 11128 是会话格式校验（必须以 system 开启），不区分域。
 func TestCNChatPathUnchanged(t *testing.T) {
 	var gotPath, gotMsgsJSON string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
@@ -211,9 +214,40 @@ func TestCNChatPathUnchanged(t *testing.T) {
 	if gotPath != "/v2/chat/completions" {
 		t.Errorf("cn chat path=%q", gotPath)
 	}
-	// 零回归：body 不因 ensureConsoleSystem 注入 system。
-	if bytes.Contains([]byte(gotMsgsJSON), []byte(`"system"`)) {
-		t.Errorf("cn chat body should not be modified with system fallback: %s", gotMsgsJSON)
+	// CN 同样前置兜底 system（上游 11128 要求会话以 system 开启，两域一致）。
+	if !bytes.Contains([]byte(gotMsgsJSON), []byte(`"role":"system"`)) {
+		t.Errorf("cn chat body 缺兜底 system（上游 11128 会拒）: %s", gotMsgsJSON)
+	}
+	// 且必须是 messages[0]（上游只认首条，system 放中间仍被拒）。
+	if !strings.Contains(gotMsgsJSON, `{"content":"You are a helpful assistant.","role":"system"}`) {
+		t.Errorf("cn chat 兜底 system 应在 messages[0]: %s", gotMsgsJSON)
+	}
+}
+
+// TestCNChatSystemFallbackNotDuplicated 零回归：客户端已自带首条 system 时不重复注入
+// （避免两条 system 影响 prompt 拼接与前缀缓存）。
+func TestCNChatSystemFallbackNotDuplicated(t *testing.T) {
+	var gotMsgsJSON string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		gotMsgsJSON = string(raw)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"mine"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("cn chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if n := strings.Count(gotMsgsJSON, `"role":"system"`); n != 1 {
+		t.Errorf("system 消息条数=%d want 1（客户端自带时不得重复注入）: %s", n, gotMsgsJSON)
+	}
+	if !strings.Contains(gotMsgsJSON, `"content":"mine"`) {
+		t.Errorf("客户端自带 system 内容应原样保留: %s", gotMsgsJSON)
 	}
 }
 

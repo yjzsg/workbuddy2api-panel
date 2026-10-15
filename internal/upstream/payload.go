@@ -345,9 +345,14 @@ func normalizeImageURL(obj map[string]any) {
 	}
 }
 
-// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
+// ensureConsoleSystem 兜底 system 注入（吸收 PR #45，防上游 code 11-128）：
 // 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+//
+// 2026-10-16：由「仅 global」扩为「两域都注入」。上游 11128 是会话格式校验
+// （必须以 system 开启），不区分域；原先 CN 无兜底导致聚合中转转发的请求落到
+// CN 号就 400 → 罚账号 + 白轮转 3 次。注入的是固定中性句，客户端已带 system
+// 时完全不触碰（零语义变化）。
+//
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {

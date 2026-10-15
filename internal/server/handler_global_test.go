@@ -126,7 +126,7 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 		t.Errorf("global chat messages=%d want 2 (system fallback)", gotMsgs)
 	}
 
-	// 裸名请求（CN 零回归）
+	// 裸名请求（CN 同样前置兜底 system：上游 11128 不分域，见 ensureConsoleSystem）
 	cf.mu.Lock()
 	cf.authz, cf.model, cf.path, cf.msgs = "", "", "", 0
 	cf.mu.Unlock()
@@ -148,8 +148,8 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	if gotPath != "/v2/chat/completions" {
 		t.Errorf("cn chat path=%q want /v2/chat/completions", gotPath)
 	}
-	if gotMsgs != 1 { // CN 不补 system
-		t.Errorf("cn chat messages=%d want 1 (no system fallback)", gotMsgs)
+	if gotMsgs != 2 { // CN 也补兜底 system（上游 11128 要求会话以 system 开启）
+		t.Errorf("cn chat messages=%d want 2 (system fallback)", gotMsgs)
 	}
 }
 

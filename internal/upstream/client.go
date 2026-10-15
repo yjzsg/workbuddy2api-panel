@@ -1365,13 +1365,18 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
-	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
-	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
+	// ensureConsoleSystem 在 prepareBody 后统一套用：首条消息非 system 时前置
+	// 兜底 system。
+	//
+	// 【2026-10-16】从 global-only 扩到**两域都注入**。依据：上游 code 11128 是
+	// 「会话必须以 system 开启」的格式校验（逆向实测矩阵：只有 user ❌ / user→system ❌
+	// / system→user ✅ / 连续两条 system ✅，msg 文案是 "conversation id missing"
+	// 这个通用措辞，与内容审核无关）。原实现只护 global，留下 CN 缺口：
+	// 聚合中转（New API 等）转发的请求若 messages[0] 不是 system，落到 CN 号
+	// 就撞 400 11128 → 网关判ErrClient 罚账号 + 轮转 3 次 → 对外 503 空文案。
+	// 兜底 system 内容为固定中性句，不改变客户端已有 system 的任何语义。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
-	}
+	prepared = ensureConsoleSystem(prepared)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
