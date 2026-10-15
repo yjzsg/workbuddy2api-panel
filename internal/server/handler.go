@@ -1308,33 +1308,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		// ⚠️ 已知与上游的结构性差异（2026-10-06 同步时记录）：上游把「成功判定 +
-		// 粘性绑定」**延后到这一跳真正成功之后**，理由是上游存在「200 已开流 + 一帧
-		// error」的真实形态（6004 限流 / 内容拦截 / 审核）——在此处就 NoteSuccess
-		// 会把被限流的号记成健康，粘性还会把会话钉死在它身上。
-		// 本仓暂未跟改：本仓的「行为判别」（blockedUIDs → NoteContentBlockEvidence）
-		// 依赖此处拿到本轮成功号的上下文，改动需要一并重构。**下次同步前优先处理。**
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// ⭐ 行为证据落地（2026-09-29）：本次请求成功 ⇒ 内容本身可过审 ⇒ 之前那些
-		// 回 content_blocked 的账号是**账号侧被上游拒**，不是内容问题。此时才喂证据：
-		// 未达阈值软冷却让位，达阈值 Disable（账号需重新登录）。
-		// 位置刻意放在 NoteSuccess 之后：先承认本次成功号可用，再清算被拦号。
-		for _, buid := range blockedUIDs {
-			if buid == acct.UID {
-				continue // 理论上不会（同号不会既被拦又成功），防御性跳过
+		// 「成功判定 + 粘性绑定」延后到这一跳真正成功之后（markTurnSuccess）。
+		// 理由：上游存在「200 已开流 + 一帧 error」的真实形态（6004 限流 / 内容拦截 /
+		// 审核）——在读到第一帧之前就 NoteSuccess 会把被限流的号记成健康，粘性还会把
+		// 会话钉死在它身上，后续每一轮都打同一个限流号。
+		// markTurnSuccess 同样承载本仓的「行为证据」逻辑（blockedUIDs）：
+		// 只有真成功才清算被拦号，语义与 NoteSuccess 严格同点。
+		markTurnSuccess := func(uid string) {
+			h.cfg.Pool.NoteSuccess(uid)
+			// ⭐ 行为证据落地（2026-09-29）：本次请求成功 ⇒ 内容本身可过审 ⇒ 之前那些
+			// 回 content_blocked 的账号是**账号侧被上游拒**，不是内容问题。此时才喂证据：
+			// 未达阈值软冷却让位，达阈值 Disable（账号需重新登录）。
+			// 位置刻意放在 NoteSuccess 之后：先承认本次成功号可用，再清算被拦号。
+			for _, buid := range blockedUIDs {
+				if buid == uid {
+					continue // 理论上不会（同号不会既被拦又成功），防御性跳过
+				}
+				if h.cfg.Pool.NoteContentBlockEvidence(buid) {
+					log.Printf("WARN: [server] content-block evidence: disabled acct=%s after %d account-side content rejections while other accounts served the same request",
+						logfmt.Label(buid, ""), pool.ContentBlockThreshold())
+				}
 			}
-			if h.cfg.Pool.NoteContentBlockEvidence(buid) {
-				log.Printf("WARN: [server] content-block evidence: disabled acct=%s after %d account-side content rejections while other accounts served the same request",
-					logfmt.Label(buid, ""), pool.ContentBlockThreshold())
+			// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+			// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+			h.cfg.Pool.BlockModelClear(uid, bareModel)
+			// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+			// 绑定键用 stickyKey（会话头族 → SessionIDFromHeader → StickyFallbackKey
+			// 三级回退），而非 sessKey——聚合层客户端（如 DSH）不带任何会话头时
+			// sessKey 恒空，此前判据 `sessKey != ""` 会让粘性静默失效、每轮纯轮转。
+			if stickyKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(stickyKey, uid)
 			}
-		}
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if stickyKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
@@ -1380,23 +1384,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
-				h.cfg.Pool.NoteSuccess(acct.UID)
-				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
+				markTurnSuccess(acct.UID)
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
-				h.cfg.Pool.NoteSuccess(acct.UID)
-				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
+				markTurnSuccess(acct.UID)
 			}
 			credit, hasCredit := stats.Credit()
 			if hit, miss, _, ok := stats.CacheTokens(); ok {
@@ -1484,11 +1476,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
+		markTurnSuccess(acct.UID)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
 			st.credit = credit
