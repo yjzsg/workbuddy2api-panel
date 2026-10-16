@@ -42,6 +42,7 @@ const (
 	ErrEdgeAuth                      // 401 + 非业务信封体（APISIX 鉴权层拒绝页/空体）→ **不罚账号**，仅轮转 + IP 级 fail-fast（2026-09-22 全池降权事故）
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrUpstreamRejected                // 上游「请求被拦截」（11-128 + displayMsg「请重新发送」）→ **请求级**拒绝：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -73,6 +74,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrUpstreamRejected:
+		return "upstream_rejected"
 	case ErrClient:
 		return "client"
 	default:
@@ -277,13 +280,15 @@ var contentSafetyRule = errorRule{kind: ErrContentBlocked, mode: matchFold, patt
 // 结构化判定不可靠；而「请求被拦截」/「Request blocked」两个 pattern 分别覆盖
 // zh 与 en，互为冗余。
 //
-// 归 ErrClient：只换号、不罚号。与 11-128 的另一形态 "conversation id missing"
-// （同样带此 displayMsg）的既有分类行为一致——本次改动不引入新的行为分支，
-// 只把被 accountFaultRule 误收的「请求 illegal + 请重新发送」纠正回 ErrClient。
+// 归 ErrUpstreamRejected：**请求级拒绝** —— 零账号惩罚（同 ErrBadParams /
+// ErrImageInvalid 待遇）、**不轮转**（同一 body 换任何账号都会被同样拒绝，
+// 轮转只白耗调用配额、并把确定失败伪装成"稍后再试"），由 handler fail-fast
+// 回 400 并透传上游原文。11-128 的另一形态 "conversation id missing"
+//（同样带此 displayMsg）同归此类。
 //
 // 分类顺序：必须判在 accountFaultRule **之前**（见 Classify 第 3.4 层）。
 // 真·账号封禁（code 11140）不带「请重新发送」类文案，仍会落到 accountFaultRule。
-var requestBlockedRule = errorRule{kind: ErrClient, mode: matchFold, patterns: []string{
+var requestBlockedRule = errorRule{kind: ErrUpstreamRejected, mode: matchFold, patterns: []string{
 	"请求被拦截",
 	"request blocked. please send it again",
 }}
@@ -731,7 +736,7 @@ func Classify(status int, body string) ErrKind {
 	// 只有 displayMsg 能分野；先落 accountFaultRule 会 Pool.Disable 永久禁用健康号
 	// （2026-10-16 实测误禁 12 个 global 号）。详见 requestBlockedRule 注释。
 	if requestBlockedRule.hit(body, lower) {
-		return ErrClient
+		return ErrUpstreamRejected
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault

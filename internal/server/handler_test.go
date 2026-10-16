@@ -539,8 +539,19 @@ func TestChatRequestBlockedDoesNotDisable(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	// fail-fast：请求级拒绝不轮转（bad 只打 1 次、good 0 次），直接回 400 + 上游原文。
+	// 此前归 ErrClient → 轮转 3 个号全被同因拒（白耗配额）→ 对外 503 no_healthy_account。
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400（请求级拒绝应 fail-fast，不再轮转）body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 0 {
+		t.Errorf("calls=%v want bad=1 good=0（fail-fast 终止轮转，不再白耗其他号）", calls)
+	}
+	if !strings.Contains(rec.Body.String(), "11-128") {
+		t.Errorf("应透传上游原文（含 code 11-128）: %s", rec.Body)
+	}
+	if !assertJSONErrorCode(t, rec.Body.String(), "upstream_rejected") {
+		return
 	}
 	st, _ := p.Status("bad")
 	if st.Disabled {

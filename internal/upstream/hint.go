@@ -47,6 +47,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "request context exceeds the model's limit; reduce history/message size"
 	case ErrImageInvalid:
 		return "image request was rejected by upstream; check image_url format and image data"
+	case ErrUpstreamRejected:
+		// 请求级拒绝：同一 body 换任何账号都会被同样拒绝（换号无意义），
+		// 与 ErrBadParams 同族。指向"改请求"而非"重试/换号"。
+		return "request was rejected by upstream request firewall; retrying the same request will fail again, adjust the request and retry"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。

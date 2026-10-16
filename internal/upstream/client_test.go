@@ -344,8 +344,8 @@ func TestClassifyRequestBlockedNotAccountFault(t *testing.T) {
 		`{"code":11-128,"msg":"conversation id missing","displayMsg":{"zh":"请求被拦截，请重新发送"}}`,
 	}
 	for _, body := range blocked {
-		if got := Classify(400, body); got == ErrAccountFault {
-			t.Errorf("Classify(400, %q)=ErrAccountFault（会 Disable 健康号）want 非账号故障", body)
+		if got := Classify(400, body); got != ErrUpstreamRejected {
+			t.Errorf("Classify(400, %q)=%v want ErrUpstreamRejected（请求级拒绝：不罚号、不轮转、透传原文）", body, got)
 		}
 	}
 	// 真·账号授权封禁（无「请重新发送」文案）必须**仍然**归 ErrAccountFault。

@@ -1315,6 +1315,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 上游「请求被拦截，请重新发送」（code 11-128）：**请求级**拒绝，与账号授权
+			// 状态无关（2026-10-16 实测：同一请求换任何号都被同样拒绝；被拒号的 token
+			// 直连上游返回同一错误，且该号同一分钟仍在服务其他请求）。
+			// 与 11115 / 图片无效 / 11101 同一哲学——确定与账号无关的错误直接终止轮转、
+			// 透传上游原文。此前归 ErrClient → 轮转 3 个号全被同因拒（白耗 3 次调用配额）
+			// → 对外 503 no_healthy_account：客户端看不到上游原文，还会对必然失败的
+			// 请求无限重试。
+			if kind == upstream.ErrUpstreamRejected {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "upstream_rejected", msg,
+					h.hintOf(upstream.ErrUpstreamRejected, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1581,6 +1601,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadRequest
 			code = "content_blocked"
 			msg = "content blocked by upstream content firewall"
+		case upstream.ErrUpstreamRejected:
+			// 兜底（正常走不到：chatCompletions 已 fail-fast 400 透传原文）。
+			// 万一从其他路径到达末端，仍按"请求级拒绝"给 400 + 可读 code，别退化成
+			// 503 no_healthy_account（那会误导客户端重试必然失败的请求）。
+			status = http.StatusBadRequest
+			code = "upstream_rejected"
+			msg = "request was rejected by upstream request firewall"
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
@@ -1911,6 +1938,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
+	case upstream.ErrUpstreamRejected:
+		// 上游「请求被拦截」（code 11-128）：**请求级**拒绝，与账号授权状态无关
+		// （2026-10-16 实测误禁 12 号的那批错误即此形态）。零动作（不冷却/不熔断/
+		// 不 NoteError，同 ErrBadParams 待遇）；chatCompletions 已 fail-fast 400
+		// 透传原文、终止轮转——该分支只为文档完备，不指望走到换号路径。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
