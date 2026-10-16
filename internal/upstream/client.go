@@ -253,6 +253,41 @@ var contentSafetyRule = errorRule{kind: ErrContentBlocked, mode: matchFold, patt
 //
 // ⚠️ 11140 还有第三种形态：**内容审核拒绝**（displayMsg 点明安全审核）——那种必须先被
 // 上方 contentSafetyRule 截走，绝不能落到这里（落到这里 = 永久禁用健康号）。
+// requestBlockedRule 上游「请求被拦截」通用拒绝（displayMsg 文案判据）。
+//
+// 定位（2026-10-16 实测）：上游对**请求级**拦截返回
+//
+//	{"code":11-128,"msg":"request illegal","requestId":"...",
+//	 "displayMsg":{"en":"Request blocked. Please send it again",
+//	               "zh":"请求被拦截，请重新发送","zh-hant":"請求已被攔截，請重新傳送"}}
+//
+// ⚠️ 这里的 msg 与**真·账号授权封禁**（code 11140）的 msg 是**同一字面** "request illegal"，
+// 但 displayMsg 是「请重新发送」——语义完全不同：前者是"这个请求被拒了，重发试试"，
+// 后者才是"这个账号被授权封禁了"。
+//
+// 若不加此层，accountFaultRule 会靠 "request illegal" 命中 → applyErrorPolicy 走
+// **Pool.Disable**（硬禁用，软冷却到期也不恢复）——把健康号永久踢出池。
+// **2026-10-16 已实测误禁 12 个 global 号**（20:34~21:38 逐个被禁）；同批号在同一分钟
+// 服务其他请求完全正常，且用这些号的 token 直连上游返回的也是同一个「请求被拦截」，
+// 证明与账号授权状态无关。与 2026-09-28 的 contentSafetyRule 事故同型（上游换文案
+// 绕过既有判据）。
+//
+// 判据用 displayMsg 的**文案**（不用 code 字面）：上游 body 的 code 写作 `11-128`
+// 是**非法 JSON 数字**（`{"code":11-128,...}`，json.Unmarshal 直接失败），
+// 结构化判定不可靠；而「请求被拦截」/「Request blocked」两个 pattern 分别覆盖
+// zh 与 en，互为冗余。
+//
+// 归 ErrClient：只换号、不罚号。与 11-128 的另一形态 "conversation id missing"
+// （同样带此 displayMsg）的既有分类行为一致——本次改动不引入新的行为分支，
+// 只把被 accountFaultRule 误收的「请求 illegal + 请重新发送」纠正回 ErrClient。
+//
+// 分类顺序：必须判在 accountFaultRule **之前**（见 Classify 第 3.4 层）。
+// 真·账号封禁（code 11140）不带「请重新发送」类文案，仍会落到 accountFaultRule。
+var requestBlockedRule = errorRule{kind: ErrClient, mode: matchFold, patterns: []string{
+	"请求被拦截",
+	"request blocked. please send it again",
+}}
+
 var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
 	"request illegal",
 	"trial not activated",
@@ -623,6 +658,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     applyErrorPolicy 判成账号授权封禁 → **Pool.Disable 永久禁用健康号**
 //     （2026-09-28 实测误禁 2 个号）。内容问题不是账号问题，归 ErrContentBlocked
 //     （零账号惩罚 + 首遇降级重试）。
+//     3.4 requestBlockedRule —— 请求级「请求被拦截，请重新发送」（code 11-128）。
+//     msg 与账号封禁同为 "request illegal"，**只能靠 displayMsg 分野**，故必须
+//     先于 accountFaultRule：否则命中 Pool.Disable，把健康号永久禁用
+//     （2026-10-16 实测误禁 12 个 global 号）。
 //  3.5 accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
@@ -686,6 +725,13 @@ func Classify(status int, body string) ErrKind {
 	// 详见 contentSafetyRule 注释。
 	if contentSafetyRule.hit(body, lower) {
 		return ErrContentBlocked
+	}
+	// 3.4 requestBlockedRule —— 「请求被拦截，请重新发送」（displayMsg 文案）。
+	// 必须判在 accountFaultRule **之前**：其 msg 与真·账号封禁同为 "request illegal"，
+	// 只有 displayMsg 能分野；先落 accountFaultRule 会 Pool.Disable 永久禁用健康号
+	// （2026-10-16 实测误禁 12 个 global 号）。详见 requestBlockedRule 注释。
+	if requestBlockedRule.hit(body, lower) {
+		return ErrClient
 	}
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault

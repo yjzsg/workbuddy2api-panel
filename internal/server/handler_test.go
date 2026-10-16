@@ -513,6 +513,41 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	}
 }
 
+// TestChatRequestBlockedDoesNotDisable ⭐ 事故回归（2026-10-16）：
+// 上游「请求被拦截」（code 11-128 + msg "request illegal" + displayMsg「请重新发送」）
+// 是**请求级**拒绝，与账号授权状态无关（同批号同一分钟服务其他请求完全正常）。
+// 修复前 Classify 靠 msg 的 "request illegal" 归 ErrAccountFault → Pool.Disable 硬禁用，
+// 实测误禁 12 个健康 global 号。修复后只换号、不罚号。
+func TestChatRequestBlockedDoesNotDisable(t *testing.T) {
+	const blockedBody = `{"code":11-128,"msg":"request illegal","requestId":"r-blocked",` +
+		`"displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請求已被攔截，請重新傳送"}}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 400, blockedBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 90 * time.Second})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Disabled {
+		t.Fatalf("「请求被拦截」不得硬禁用健康号（2026-10-16 误禁 12 号回归）: %+v", st)
+	}
+}
+
 // TestChatAccountFault11140Disables 账号级授权封禁（11140 request illegal，实测为
 // global 账号 auth_forbidden 风控）：软冷却到期也不会自动恢复（需重新 OAuth 登录），
 // 到期后重新选号只会再撞 403 浪费轮换——故**硬禁用**（不在池中参与选号），同一请求

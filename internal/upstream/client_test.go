@@ -332,6 +332,34 @@ func TestClassifyContentBlocked(t *testing.T) {
 	}
 }
 
+// TestClassifyRequestBlockedNotAccountFault ⭐ 事故回归（2026-10-16）：
+// 上游「请求被拦截」形态与真·账号授权封禁**同为 msg "request illegal"**，
+// 只能靠 displayMsg 分野。误归 ErrAccountFault 会让 applyErrorPolicy 走
+// Pool.Disable 硬禁用——实测误禁 12 个健康 global 号（20:34~21:38）。
+func TestClassifyRequestBlockedNotAccountFault(t *testing.T) {
+	// 请求级拦截（displayMsg「请重新发送」）→ 不得判成账号故障。
+	blocked := []string{
+		`{"code":11-128,"msg":"request illegal","requestId":"r1","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請求已被攔截，請重新傳送"}}`,
+		`{"code":"11-128","msg":"request illegal","displayMsg":{"zh":"请求被拦截，请重新发送"}}`,
+		`{"code":11-128,"msg":"conversation id missing","displayMsg":{"zh":"请求被拦截，请重新发送"}}`,
+	}
+	for _, body := range blocked {
+		if got := Classify(400, body); got == ErrAccountFault {
+			t.Errorf("Classify(400, %q)=ErrAccountFault（会 Disable 健康号）want 非账号故障", body)
+		}
+	}
+	// 真·账号授权封禁（无「请重新发送」文案）必须**仍然**归 ErrAccountFault。
+	fault := []string{
+		`{"error":{"data":{"code":11140,"msg":"request illegal"}}}`,
+		`{"code":11140,"msg":"request illegal"}`,
+	}
+	for _, body := range fault {
+		if got := Classify(403, body); got != ErrAccountFault {
+			t.Errorf("Classify(403, %q)=%v want ErrAccountFault", body, got)
+		}
+	}
+}
+
 // TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {
