@@ -406,6 +406,13 @@ func TestIsModelBlocked(t *testing.T) {
 		{404, `{"code":11103,"msg":"x"}`, false},
 		// 空 body 不算。
 		{404, ``, false},
+		// ---- 11158（2026-10-17 上游新增：用户类型不允许该模型）----
+		// 实测原文，必须认（否则归 ErrClient 罚账号冷却，整池被烧空）。
+		{400, `{"code":11158,"msg":"model [gpt-6-luna] is not allowed for user type [personal_free_user]","requestId":"9d50cf74","displayMsg":{"en":"Your account type does not support this model"}}`, true},
+		// 撞码保护：code 是 11158 但文案不符 → 不算（避免上游复用码误避让）。
+		{400, `{"code":11158,"msg":"something completely different"}`, false},
+		// 非 400/404 不算（与 11102 同口径）。
+		{429, `{"code":11158,"msg":"is not allowed for user type"}`, false},
 	}
 	for _, c := range cases {
 		if got := IsModelBlocked(c.status, c.body); got != c.want {

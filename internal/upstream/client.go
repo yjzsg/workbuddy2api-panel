@@ -410,6 +410,29 @@ func ParseQueueRetryAfter(body string) (time.Duration, bool) {
 // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
 const modelBlockCode = "11102"
 
+// modelNotAllowedCode 11158「当前用户类型不允许该模型」（2026-10-17 上游新增限制）。
+//
+// 实测原文（HTTP 400）：
+//
+//	{"code":11158,"msg":"model [gpt-6-luna] is not allowed for user type
+//	 [personal_free_user]","requestId":"...","displayMsg":{"en":"Your account
+//	 type does not support this model..."}}
+//
+// 与 11102 同族语义——对**当前账号 + 该模型**确定不可用：
+//   - 换号理论上可能有用（池里若有更高等级账号）；
+//   - 但**绝不该惩罚账号**：模型权限与账号健康无关，罚冷却会把整池打空。
+//
+// 2026-10-17 实测：归 ErrClient 时每请求烧 3 个 global 号的 10 分钟冷却
+// （面板 `cooling 3` 全部 reason=consecutive failures 即由此产生），
+// 与 2026-10-16 的 11-128 事故同型（模型/请求级错误误罚账号）。
+// 归 ErrModelBlocked 后走 (uid, model) 负缓存：不冷却、不 NoteError，
+// 只让该账号后续避开该模型（若真有企业号，它不受影响）。
+const modelNotAllowedCode = "11158"
+
+// modelNotAllowedMarker 11158 的确定性文案。与 code 做**与**判定：
+// 仅 code 相同但文案不符时不算，避免上游复用该码造成误避让。
+const modelNotAllowedMarker = "is not allowed for user type"
+
 // modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
 // 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的 not found 措辞
 // （reference maiphucgiang 报告提的「11102 撞在 ID 上」坑的同类问题：宁缺毋滥）。
@@ -432,8 +455,10 @@ func IsModelBlocked(status int, body string) bool {
 	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
 		return false
 	}
-	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
-	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
+	// 轻量预检：body 既无 "11102"/"11158" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, modelBlockCode) &&
+		!strings.Contains(body, modelNotAllowedCode) &&
+		!strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
 		return false
 	}
 	var root map[string]any
@@ -458,6 +483,10 @@ func IsModelBlocked(status int, body string) bool {
 		}
 	}
 	if code == modelBlockCode {
+		return true
+	}
+	// 11158：code 与文案**同时**命中才算（防止上游复用该码误避让模型）。
+	if code == modelNotAllowedCode && strings.Contains(strings.ToLower(msg), modelNotAllowedMarker) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
