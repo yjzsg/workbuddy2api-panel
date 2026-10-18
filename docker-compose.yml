@@ -30,6 +30,17 @@ services:
     entrypoint: ["/app/wb2api", "-config", "/app/data/config.json"]
     environment:
       - TZ=Asia/Shanghai
+    # [DNS 兜底 2026-10-18] 爱快(192.168.123.1)在切换节点/重载配置时会短暂
+    # 返回 SERVFAIL，容器内解析 copilot.tencent.com 直接失败：
+    #   lookup copilot.tencent.com on 127.0.0.11:53: server misbehaving
+    # 今日实测 285 次，全部集中在爱快配置变动时段（03:01 / 21:26 / 21:36 /
+    # 21:40 / 22:25），表现为 CN 域整批 503。
+    # 加公共 DNS 作备用：爱快正常时优先用它，抖动时自动退到公共 DNS
+    #（实测 223.5.5.5 解析 www.workbuddy.ai / copilot.tencent.com 与爱快一致）。
+    dns:
+      - 192.168.123.1
+      - 223.5.5.5
+      - 119.29.29.29
     ports:
       - "7863:7863"
     volumes:
