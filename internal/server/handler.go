@@ -1086,6 +1086,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	blockedUIDs := make([]string, 0, h.cfg.MaxRotate)
 	// siblingTried 14003 同号兄弟模型兜底只做一次（见下方 ErrSoftRate 分支）。
 	siblingTried := false
+	// servedSibling 本次请求实际由兄弟模型（如 flash-sg）服务时记录其名字，
+	// 供响应体把 model 字段改回客户端请求的名字（-sg 不外泄给 New API 等聚合层）。
+	servedSibling := ""
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
@@ -1367,6 +1370,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						// 客户端下一轮仍先试 flash，忙时再兜底。
 						rc, status, respBody, terr = sibRC, sibStatus, sibBody, sibErr
 						siblingServed = true
+						servedSibling = sib
 					} else {
 						recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 						if sibUErr == nil {
@@ -1460,7 +1464,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-				upstream.WithMarkupRepair(repair))
+				upstream.WithMarkupRepair(repair),
+				// 兄弟模型兜底成功时把帧里的 model 改回客户端请求的名字：
+				// -sg 是网关内部备胎，不外泄给 New API 等聚合层。
+				upstream.WithModelRewrite(servedSibling, bareModel))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1573,6 +1580,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
+		// 兄弟模型兜底成功：对外回显客户端请求的模型名（-sg 不外泄）。
+		if servedSibling != "" {
+			resp["model"] = bareModel
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK

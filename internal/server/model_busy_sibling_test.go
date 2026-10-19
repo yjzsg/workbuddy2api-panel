@@ -102,3 +102,62 @@ func TestModelBusySiblingAlsoBusyReturns429(t *testing.T) {
 		t.Fatalf("两个模型都应留下模型级避让，实际 %+v", st.RateLimitedModels)
 	}
 }
+
+const sseSiblingModel = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"deepseek-v4.1-flash-sg\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
+	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"deepseek-v4.1-flash-sg\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"credit\":0.001}}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestSiblingModelNameNotLeakedToStream：兄弟模型兜底成功时，SSE 帧里的 model
+// 必须改回客户端请求的 flash，-sg 不得出现在响应里（New API 会原样回显）。
+func TestSiblingModelNameNotLeakedToStream(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	cl, _ := recordingUpstream(t, func(m string) (int, string, bool) {
+		if m == "deepseek-v4.1-flash-sg" {
+			return 200, sseSiblingModel, true
+		}
+		return 429, modelBusy429Body, false
+	})
+
+	h := NewHandler(Config{Pool: p, MaxRotate: 3, Upstream: cl})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:`+model+`","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "-sg") {
+		t.Fatalf("响应里泄漏了兄弟模型名: %s", body)
+	}
+	if !strings.Contains(body, `"model":"`+model+`"`) {
+		t.Fatalf("响应 model 应为 %s: %s", model, body)
+	}
+}
+
+// TestSiblingModelNameNotLeakedNonStream：非流式同理。
+func TestSiblingModelNameNotLeakedNonStream(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	cl, _ := recordingUpstream(t, func(m string) (int, string, bool) {
+		if m == "deepseek-v4.1-flash-sg" {
+			// 非流式客户端也走「上游 SSE + 网关聚合」路径，故这里仍返回 SSE。
+			return 200, sseSiblingModel, true
+		}
+		return 429, modelBusy429Body, false
+	})
+
+	h := NewHandler(Config{Pool: p, MaxRotate: 3, Upstream: cl})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:`+model+`","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "-sg") {
+		t.Fatalf("响应里泄漏了兄弟模型名: %s", body)
+	}
+}

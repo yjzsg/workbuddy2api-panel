@@ -485,6 +485,8 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	modelFrom    string
+	modelTo      string
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -504,6 +506,32 @@ func WithMarkupRepair(r *MarkupRepair) StreamOption {
 // 第一帧之前就把账号记成功，限流号被当成健康号；有观察者后可在流尾按帧分类处置。
 func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
+}
+
+// WithModelRewrite 把透传帧里的 `"model":"<from>"` 改写成 `"model":"<to>"`。
+//
+// 用途：同族备用模型兜底（14003 时 flash → flash-sg 同号重试）。上游实际用 -sg
+// 服务，但客户端请求的是 flash；对外的 OpenAI 兼容响应里不应出现备用模型名
+// （聚合层 New API 会把 model 字段回显给终端用户）。
+//
+// from/to 任一为空或相等 → 零改写（逐字节透传，与未注册该选项时一致）。
+// 只替换顶层 model 字面量，不做 JSON 解析（热路径，每帧都要走）。
+func WithModelRewrite(from, to string) StreamOption {
+	return func(o *streamOptions) { o.modelFrom, o.modelTo = from, to }
+}
+
+// rewriteModelField 把 payload 里 model 的字面量从 from 换成 to。
+// 只在 from/to 非空且不同时生效；兼容上游两种排版（紧凑 / 冒号后带空格）。
+// 纯字符串替换而非 JSON 解析：热路径每帧都走，且锚定在 `"model":` 前缀上，
+// 不会误伤正文里恰好出现的模型名。
+func rewriteModelField(payload, from, to string) string {
+	if from == "" || to == "" || from == to {
+		return payload
+	}
+	for _, sep := range []string{`"model":"`, `"model": "`} {
+		payload = strings.ReplaceAll(payload, sep+from+`"`, sep+to+`"`)
+	}
+	return payload
 }
 
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
@@ -544,8 +572,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
-	// writeSSE 原样写出一帧并 flush。
+	// writeSSE 原样写出一帧并 flush（模型名改写见 WithModelRewrite）。
 	writeSSE := func(payload string) error {
+		payload = rewriteModelField(payload, o.modelFrom, o.modelTo)
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
