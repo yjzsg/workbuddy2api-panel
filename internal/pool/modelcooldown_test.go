@@ -91,13 +91,17 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelHonorsResetAt 6004 写 modelCooldowns：**有明确重置时间时
+// 直接采信**（不再截断到 soft_rate_max），reset_at 保留上游原始墙钟。
+//
+// 2026-10-19 语义变更：原来 min(resetAt, now+softRateMax) 会把上游给的 4h20m 截成 2h，
+// 网关比上游早解封、然后在解封到上游时间的区间里白撞 429。现在只保留 24h 安全上限
+// （见 resetUntilHardCap），防上游文案误报把号永久锁死。
+func TestCooldownSoftForModelHonorsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max → 仍按 reset 冷却
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -105,8 +109,9 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	// until 应贴近上游给的 reset，而不是 soft_rate_max(10m)。
+	if rem := mc.Until.Sub(time.Now()); rem < 119*time.Minute || rem > 121*time.Minute {
+		t.Errorf("Until 应 ≈ 上游 reset（2h），实际剩余 %v", rem)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)

@@ -946,20 +946,21 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 模型级冷却 until 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelHardCap24h(t *testing.T) {
+	// 有明确 reset 时不再用 soft_rate_max 截断，但保留 24h 安全上限，
+	// 防上游文案误报（如写成 2027 年）把号永久锁死。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
+	reset := time.Now().Add(30 * 24 * time.Hour) // 远超 24h 上限
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
 	}
-	if d := st.RateLimitedModels[0].Until.Sub(before); d > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	if d := st.RateLimitedModels[0].Until.Sub(before); d < 23*time.Hour || d > 25*time.Hour {
+		t.Errorf("model until=%v want ≈24h 硬上限", st.RateLimitedModels[0].Until)
 	}
 }
 
@@ -1211,9 +1212,10 @@ func TestRateLimitedModelsRetainsUncappedResetAt(t *testing.T) {
 		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
 	}
 	row := st.RateLimitedModels[0]
-	// row.Until = 该模型的冷却截止（被截断到封顶 ≤ 10m）。
-	if rem := row.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("row.until 应在 (0, 10m] 区间，实际剩余 %v", rem)
+	// row.Until = 该模型的冷却截止，有明确 reset 时**直接采信**（2026-10-19 起不再
+	// 截断到 soft_rate_max；只保留 24h 硬上限）。
+	if rem := row.Until.Sub(time.Now()); rem < 119*time.Minute || rem > 121*time.Minute {
+		t.Errorf("row.until 应 ≈ 上游 reset（2h），实际剩余 %v", rem)
 	}
 	// 6004 模型级冷却不写账号级 until：st.Until 为零值。
 	if !st.Until.IsZero() {

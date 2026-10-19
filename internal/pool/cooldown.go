@@ -161,12 +161,19 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+			// 有上游重置时间：**直接采信** resetAt（只保留 24h 安全上限，防上游文案误报
+			// 成 2027 年这类把号锁死的情况），不再截断到 softRateMax。
+			//
+			// 为什么改（2026-10-19）：上游对 6004 会给明确的重置墙钟（实测 4h20m 后），
+			// 而原来 min(resetAt, now+softRateMax) 把它截到 2h ⇒ 22:15 就解封，然后在
+			// 22:15~01:33 之间再撞一次 429（用户反馈："长的是上游给账号的，短的是网关加的"）。
+			// 有明确解封时间时提前探测是纯浪费——上游不会因为被多问一次就提前解封。
+			// 无明确时间的指数退避仍按 softRateMax 封顶（见下方 else 分支），语义不变。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
+				Until:   p.cappedResetUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
@@ -415,6 +422,27 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
 		p.dirty.Store(true)
 	}
+}
+
+// cappedResetUntilLocked 有**明确上游重置时间**时的冷却截止：直接采信 resetAt，
+// 只保留一个很宽的安全上限（resetUntilHardCap），防止上游文案误报（如写成 2027 年）
+// 把账号/模型永久锁死。
+//
+// 与 cappedSoftUntilLocked 的分工：
+//   - cappedSoftUntilLocked：封顶 softRateMax（默认 2h），用于**没有**明确时间的
+//     指数退避场景，防「越罚越久」；
+//   - 本函数：**有**明确时间时不再二次截断，避免网关比上游早解封、然后白撞一次 429。
+//
+// 调用方必须已持有 p.mu。
+func (p *Pool) cappedResetUntilLocked(now, resetAt time.Time) time.Time {
+	if cap := now.Add(resetUntilHardCap); resetAt.After(cap) {
+		return cap
+	}
+	if resetAt.After(now) {
+		return resetAt
+	}
+	// 上游墙钟已过期（时钟偏移/文案过期）：钳到时间零点附近，立即恢复。
+	return now.Add(time.Millisecond)
 }
 
 // cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
