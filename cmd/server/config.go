@@ -216,6 +216,16 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// 按 (模型, 域) 的动态权重（internal/pool/realmweight.go）：同一模型在两域
+		// 都有账号时，某域报限流就降它的权重，裸名请求下次选号优先用高权重域。
+		// 三者 0/缺省 = 用默认值（0.5 / 0.05 / 0.2）。
+		RealmWeightDecay   float64 `json:"realm_weight_decay"`           // 一次限流的乘数，默认 0.5
+		RealmWeightFloor   float64 `json:"realm_weight_floor"`           // 权重下限，默认 0.05
+		RealmWeightRecover float64 `json:"realm_weight_recover_per_min"` // 每分钟线性恢复量，默认 0.2
+		// RealmWeightMaxRatio 域间「每账号负载」倍率上限（默认 5）。账号数不同时
+		// （如 cn 6 / global 35），只按健康度会让小域吃掉过多流量；钳制后最高域
+		// 与最低域的每账号负载差不超过该倍数。
+		RealmWeightMaxRatio float64 `json:"realm_weight_max_ratio"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -321,6 +331,11 @@ func Default() *Config {
 	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
+	// 域权重默认：一次限流砍半、下限 5%（还留有探回的机会）、每分钟恢复 0.2（5 分钟回满）。
+	c.Pool.RealmWeightDecay = 0.5
+	c.Pool.RealmWeightFloor = 0.05
+	c.Pool.RealmWeightRecover = 0.2
+	c.Pool.RealmWeightMaxRatio = 5.0
 	c.Pool.PreferExpiring = true
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
@@ -590,6 +605,18 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
+	}
+	// 域权重（realmweight.go）：decay 必须落在 (0,1)，否则降权无意义或直接归零；
+	// floor/recover 必须为正。非法值回落默认，与 idle_weight 同口径（不 fail fast）。
+	if c.Pool.RealmWeightDecay <= 0 || c.Pool.RealmWeightDecay >= 1 {
+		c.Pool.RealmWeightDecay = 0.5
+	}
+	if c.Pool.RealmWeightFloor <= 0 {
+		c.Pool.RealmWeightFloor = 0.05
+	}
+	if c.Pool.RealmWeightRecover <= 0 {
+		c.Pool.RealmWeightRecover = 0.2
+		c.Pool.RealmWeightMaxRatio = 5.0
 	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停

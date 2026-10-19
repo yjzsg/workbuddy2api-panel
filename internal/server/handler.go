@@ -344,6 +344,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
 		},
+		// realm_weights 按 (模型, 域) 的动态权重（realmweight.go）：某域报限流就降权，
+		// 裸名请求下次选号优先用高权重域。只列低于满血（<1）的条目；全满时为 null。
+		// 与 realm_totals 对照即可判断「global 是不是正被限流拖累、cn 有没有余量」。
+		"realm_weights": h.cfg.Pool.RealmWeightView(),
 	})
 }
 
@@ -1825,6 +1829,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 域权重（realmweight.go）：本次限流记到该账号所属域上，裸名请求（realm=""）
+		// 下次选号会优先避开这个域。放在分支最前，让 14003 / 6004 / 6020 / 6021 /
+		// 普通 429 全部统一计入——它们都是「这个域此刻不好过」的信号。
+		// 2026-10-19 实测：cn 域 45 次请求 0 限流、global 域 86 次 21 限流（19.6%），
+		// 而裸名请求按账号数（35:6）灌向 global，权重能把这份差异反馈进选号。
+		h.cfg.Pool.NoteRealmRateLimited(uid, model)
 		// 排队类（6020 queue.waiting / 6021 queue.full）——上游**容量**信号，最先判。
 		//
 		// 为什么必须与普通 429 分流（2026-10-15 实测）：排队意味着"上游此刻接不下这个

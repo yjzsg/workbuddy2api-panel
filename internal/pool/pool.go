@@ -65,6 +65,15 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// realmWeights 按 (模型, 域) 记的动态权重（见 realmweight.go）。裸名请求
+	// （realm=""）把路由权重再乘上它，实现「哪一域此刻更挤就先避开哪一域」。
+	// 运行态，不持久化（重启归 1.0）。
+	realmWeights map[realmWeightKey]*realmWeight
+	// realmWeightDecay/Floor/RecoverPerMin/MaxRatio 域权重调参（SetRealmWeight 注入）。
+	realmWeightDecay         float64
+	realmWeightFloor         float64
+	realmWeightRecoverPerMin float64
+	realmWeightMaxRatio      float64
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -103,8 +112,13 @@ func New(stateFp string) *Pool {
 		degradeCooldownMax: defaultDegradeCooldownMax,
 		// 探索缺省 30m：tier 0 垄断下的 tier 1 探索窗口（issue #136）。用户经
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
-		costExploreInterval: defaultCostExploreInterval,
-		exploreLast:         map[string]time.Time{},
+		costExploreInterval:      defaultCostExploreInterval,
+		exploreLast:              map[string]time.Time{},
+		realmWeights:             map[realmWeightKey]*realmWeight{},
+		realmWeightDecay:         defaultRealmWeightDecay,
+		realmWeightFloor:         defaultRealmWeightFloor,
+		realmWeightRecoverPerMin: defaultRealmWeightRecoverPerMin,
+		realmWeightMaxRatio:      defaultRealmWeightMaxRatio,
 	}
 	if stateFp != "" {
 		p.load()

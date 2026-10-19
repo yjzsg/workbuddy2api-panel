@@ -116,7 +116,8 @@ func main() {
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
-	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetRealmWeight(cfg.Pool.RealmWeightDecay, cfg.Pool.RealmWeightFloor, cfg.Pool.RealmWeightRecover, cfg.Pool.RealmWeightMaxRatio) // (模型,域) 动态权重
+	p.SetCostExploreInterval(cfg.CostExploreIntervalDur)                                                                              // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 
 	// 会话粘性路由（可配关闭）。
@@ -592,6 +593,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	p.SetRealmWeight(newCfg.Pool.RealmWeightDecay, newCfg.Pool.RealmWeightFloor, newCfg.Pool.RealmWeightRecover, newCfg.Pool.RealmWeightMaxRatio) // 域权重热生效
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(

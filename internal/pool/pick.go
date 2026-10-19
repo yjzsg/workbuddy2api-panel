@@ -46,6 +46,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
 	}
+	p.pruneRealmWeightsLocked(now)
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -76,6 +77,28 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+	}
+	// 域优先（realmweight.go）：裸名请求跨域选号时，先按「域质量 = 该域候选数 ×
+	// 域权重」抽一个域，再在该域内走原 top5 加权随机。
+	//
+	// 为什么不直接把域权重乘到账号权重上：pick 是 top5 截断，6 个 cn 号(0.25)
+	// 会把 35 个 global 号(0.05)整体挤出短名单，域比例退化成「前 5 名全是 cn」——
+	// 实测 cn 占 82.5%，与「按账号数分配容量」的意图相反。先选域则域比例严格
+	// 等于 n_r × w_r，每账号负载钳制也才真正生效。
+	if realm == "" && reqModel != "" {
+		if mul := p.realmWeightMultipliersLocked(cands, reqModel, now); len(mul) > 1 {
+			if only := p.pickRealmByWeightLocked(cands, mul); only != "" {
+				kept := make([]*entry, 0, len(cands))
+				for _, e := range cands {
+					if e.a.Realm() == only {
+						kept = append(kept, e)
+					}
+				}
+				if len(kept) > 0 {
+					cands = kept
+				}
+			}
+		}
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
