@@ -284,7 +284,7 @@ var contentSafetyRule = errorRule{kind: ErrContentBlocked, mode: matchFold, patt
 // ErrImageInvalid 待遇）、**不轮转**（同一 body 换任何账号都会被同样拒绝，
 // 轮转只白耗调用配额、并把确定失败伪装成"稍后再试"），由 handler fail-fast
 // 回 400 并透传上游原文。11-128 的另一形态 "conversation id missing"
-//（同样带此 displayMsg）同归此类。
+// （同样带此 displayMsg）同归此类。
 //
 // 分类顺序：必须判在 accountFaultRule **之前**（见 Classify 第 3.4 层）。
 // 真·账号封禁（code 11140）不带「请重新发送」类文案，仍会落到 accountFaultRule。
@@ -309,7 +309,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 //
 // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
 // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
 // 上游原文可自行排查，代价可控。
 var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
 	`"code":11115`,
@@ -429,6 +429,27 @@ func IsModelBusyReason(reason string) bool {
 // 400 model_unavailable（客户端换模型）。
 func IsRetryableModelReason(reason string) bool {
 	return IsQueueBusyReason(reason) || IsModelBusyReason(reason)
+}
+
+// siblingModels 同族备用部署映射：同一模型在另一区域有独立部署时，用后者做 14003
+// 的同账号兜底。
+//
+// 2026-10-20 直连实测依据：
+//   - 14003 是**逐请求的模型容量准入**，不是账号级风控——同一账号 5~6 秒内
+//     429→200 反复出现，且同一时刻该账号的其他模型（glm-5.3-flash）稳定 200。
+//   - deepseek-v4.1-flash 与 deepseek-v4.1-flash-sg 是上游两个独立模型名，
+//     后者为另一区域部署；两者由同一批账号服务、同一 base URL。
+//
+// 只登记**确定等价**的映射。未登记的一律不兜底——把请求悄悄换到另一个模型上
+// 是语义变更，不能靠猜。
+var siblingModels = map[string]string{
+	"deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+// SiblingModel 返回 model 的同族备用模型名（无映射时 ok=false）。
+func SiblingModel(model string) (string, bool) {
+	s, ok := siblingModels[strings.TrimSpace(model)]
+	return s, ok
 }
 
 // ParseQueueRetryAfter 解析排队类响应里上游建议的等待时长（data.retry_after，秒）。
@@ -734,7 +755,7 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     msg 与账号封禁同为 "request illegal"，**只能靠 displayMsg 分野**，故必须
 //     先于 accountFaultRule：否则命中 Pool.Disable，把健康号永久禁用
 //     （2026-10-16 实测误禁 12 个 global 号）。
-//  3.5 accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
+//     3.5 accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
 //     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。

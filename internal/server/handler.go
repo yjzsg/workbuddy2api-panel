@@ -1084,6 +1084,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - 有号成功 ⇒ 前面被拦的是账号级坏号 ⇒ 在成功分支统一喂证据（升级惩罚）；
 	//   - 整轮都被拦 ⇒ 才是内容问题 ⇒ 末端回 400 content_blocked，**零惩罚**。
 	blockedUIDs := make([]string, 0, h.cfg.MaxRotate)
+	// siblingTried 14003 同号兄弟模型兜底只做一次（见下方 ErrSoftRate 分支）。
+	siblingTried := false
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
@@ -1339,28 +1341,75 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
-			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
-			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-			fail(acct.UID)
-			// 边缘层 IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
-			// 任务书设计纪律）：该次边缘层拒绝喂入 IP 级状态机，若激活（短窗多号命中，
-			// IP 被拦而非账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍
-			// 打同一出口 IP，加重风控。
-			// 两种形态共用同一状态机：WAF 403（账号级软冷却照常记账）与鉴权层 401
-			// （零账号惩罚，见 applyErrorPolicy 的 ErrEdgeAuth 分支）。IP 级状态只改变
-			// 「是否继续轮转」——协同不叠加。
-			if kind == upstream.ErrWafBlock && h.edgeGate.noteWaf(acct.UID) {
-				break
+			// 14003「模型繁忙」同号兄弟模型兜底（2026-10-20）：
+			// 14003 是**逐请求的模型容量准入**，不是账号级风控——直连实测同号
+			// 5~6 秒内 429→200 反复，且同一时刻该号的其他模型（glm-5.3-flash）稳定 200。
+			// 换号会同时丢掉粘性与前缀缓存；同号换兄弟模型（flash → flash-sg）
+			// 是代价最小的动作，故在换号之前先试一次。
+			// 只兜一次：兄弟模型也忙时按原逻辑换号，不引入新的重试放大。
+			siblingServed := false
+			if kind == upstream.ErrSoftRate && upstream.IsModelBusy(string(respBody)) && !siblingTried {
+				if sib, ok := upstream.SiblingModel(bareModel); ok {
+					siblingTried = true
+					// 原模型仍按既有语义记 60s 模型级避让，避免其他请求继续撞它。
+					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+					log.Printf("INFO: [server] model busy 14003 -> retry same acct with sibling model %s (was %s) acct=%s",
+						sib, bareModel, logfmt.Label(acct.UID, acct.Nickname))
+					attemptStarted = time.Now()
+					sibRC, sibStatus, sibBody, sibErr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rewriteModel(body, sib), clientIP, chatMeta)
+					var sibUErr *upstream.Error
+					if errors.As(sibErr, &sibUErr) {
+						sibStatus = sibUErr.Status
+					}
+					if sibErr == nil && sibStatus < 400 {
+						// 兄弟模型接住了：替换本次尝试结果，落到下方成功路径。
+						// st.model 保持客户端请求的原模型名；粘性仍按 bareModel 绑定，
+						// 客户端下一轮仍先试 flash，忙时再兜底。
+						rc, status, respBody, terr = sibRC, sibStatus, sibBody, sibErr
+						siblingServed = true
+					} else {
+						recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+						if sibUErr == nil {
+							// 传输层错误：与主路径同语义——只换号 + 连败计数，不罚模型。
+							lastErr = sibErr
+							h.cfg.Pool.NoteFailures(acct.UID)
+						} else {
+							// 兄弟模型也失败：同样记模型级避让，再换号。
+							lastErr = &upstream.Error{Kind: sibUErr.Kind, Status: sibStatus, Msg: string(sibBody), RetryAfter: sibUErr.RetryAfter}
+							h.applyErrorPolicy(acct.UID, sibUErr.Kind, string(sibBody), sib, sibUErr)
+						}
+						fail(acct.UID)
+						if !rotateBackoff(i, r.Context()) {
+							break
+						}
+						continue
+					}
+				}
 			}
-			if kind == upstream.ErrEdgeAuth && h.edgeGate.noteEdgeAuth(acct.UID) {
-				break
+			if !siblingServed {
+				// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+				// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				// 边缘层 IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
+				// 任务书设计纪律）：该次边缘层拒绝喂入 IP 级状态机，若激活（短窗多号命中，
+				// IP 被拦而非账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍
+				// 打同一出口 IP，加重风控。
+				// 两种形态共用同一状态机：WAF 403（账号级软冷却照常记账）与鉴权层 401
+				// （零账号惩罚，见 applyErrorPolicy 的 ErrEdgeAuth 分支）。IP 级状态只改变
+				// 「是否继续轮转」——协同不叠加。
+				if kind == upstream.ErrWafBlock && h.edgeGate.noteWaf(acct.UID) {
+					break
+				}
+				if kind == upstream.ErrEdgeAuth && h.edgeGate.noteEdgeAuth(acct.UID) {
+					break
+				}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
+				}
+				continue
 			}
-			if !rotateBackoff(i, r.Context()) {
-				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
-			}
-			continue
 		}
 		// 「成功判定 + 粘性绑定」延后到这一跳真正成功之后（markTurnSuccess）。
 		// 理由：上游存在「200 已开流 + 一帧 error」的真实形态（6004 限流 / 内容拦截 /
