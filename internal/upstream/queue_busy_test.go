@@ -35,6 +35,57 @@ func TestIsQueueBusy(t *testing.T) {
 	}
 }
 
+// TestIsModelBusy 判断 429 body 是否是上游「模型繁忙」（业务 code 14003）。
+//
+// 与 IsQueueBusy 同纪律：只比对 code 字段，不做整段文本匹配（requestId 里撞
+// "14003" 不能误判）。
+func TestIsModelBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"14003 实测原文（2026-10-19）", `{"code":14003,"msg":"too many requests","requestId":"10e3da9e3136f5c228ee83955f50819b","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`, true},
+		{"14003 带空格", `{"code": 14003, "msg": "too many requests"}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"6004 用量限流不是模型繁忙", `{"code":6004,"msg":"您的使用量已超出频率限制"}`, false},
+		{"6020 排队不是模型繁忙", `{"code":6020,"data":{"retry_after":40}}`, false},
+		{"6021 队列满不是模型繁忙", `{"code":6021,"msg":"queue.full.title"}`, false},
+		{"requestId 撞 14003 不误判", `{"code":10000,"msg":"invoke model error","requestId":"x14003x"}`, false},
+		{"空 body", ``, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsModelBusy(c.body); got != c.want {
+				t.Fatalf("IsModelBusy=%v want %v（body=%s）", got, c.want, c.body)
+			}
+		})
+	}
+}
+
+// TestIsRetryableModelReason 「等一会儿就好」家族 = 排队（6020/6021）+ 模型繁忙（14003）；
+// 6004/11102 属于「必须换模型」，不能被并进来，否则末端出口会对它们回 429 而不是 400。
+func TestIsRetryableModelReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		want   bool
+	}{
+		{"排队类", QueueBusyReason, true},
+		{"模型繁忙", ModelBusyReason, true},
+		{"6004 用量限流", "6004 model rate limit", false},
+		{"11102 模型不可用", "11102 model not available", false},
+		{"空 reason", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsRetryableModelReason(c.reason); got != c.want {
+				t.Fatalf("IsRetryableModelReason(%q)=%v want %v", c.reason, got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseQueueRetryAfter(t *testing.T) {
 	cases := []struct {
 		name string

@@ -28,22 +28,22 @@ import (
 type ErrKind int
 
 const (
-	ErrNone           ErrKind = iota // 成功
-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                        // 5xx 上游故障
-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
-	ErrEdgeAuth                      // 401 + 非业务信封体（APISIX 鉴权层拒绝页/空体）→ **不罚账号**，仅轮转 + IP 级 fail-fast（2026-09-22 全池降权事故）
-	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
-	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrNone             ErrKind = iota // 成功
+	ErrHardCredit                      // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                        // 429 软限流 → 短冷却
+	ErrSessionDead                     // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                        // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                          // 5xx 上游故障
+	ErrContentBlocked                  // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                       // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrAccountFault                    // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrModelBlocked                    // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrWafBlock                        // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+	ErrEdgeAuth                        // 401 + 非业务信封体（APISIX 鉴权层拒绝页/空体）→ **不罚账号**，仅轮转 + IP 级 fail-fast（2026-09-22 全池降权事故）
+	ErrPromptTooLong                   // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                    // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrUpstreamRejected                // 上游「请求被拦截」（11-128 + displayMsg「请重新发送」）→ **请求级**拒绝：不罚号、不轮转，末端透传原文
-	ErrClient                        // 其他 4xx / 业务错误
+	ErrClient                          // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -353,10 +353,25 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 const queueWaitingCode = "6020"
 const queueFullCode = "6021"
 
+// modelBusyCode 上游 429「模型繁忙」的业务 code（14003）。
+//
+// 实测原文：`{"code":14003,"msg":"too many requests","displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"}}`。
+// 与 6004（用量超限，切模型才解）、6020/6021（队列满，等几十秒）都不同：它是**模型级容量**
+// 信号，账号本身健康、额度也在，等一会儿或换模型都能过。
+//
+// 为什么必须单列（2026-10-19 生产实测）：41 个号的池子里，1 小时内 35 个号各吃一次 14003，
+// 成功请求也只用到 37 个号——几乎「用过就中」。此前它落账号级 600s 软冷却、
+// softStreak 指数翻倍封顶 2h，等于每小时把池子刷一遍，客户端全靠换号硬撑。
+const modelBusyCode = "14003"
+
 // QueueBusyReason 排队类冷却条目在 pool.modelCooldowns 里的 reason 前缀。
 // 与 6004（"6004 model rate limit"）、11102（"11102 model not available"）的
 // reason 前缀互不干扰，三者可共存于同一 map 键。
 const QueueBusyReason = "queue busy"
+
+// ModelBusyReason 模型繁忙（14003）冷却条目在 pool.modelCooldowns 里的 reason 前缀。
+// 与 QueueBusyReason 同属「等一会儿重试就好」家族，但保留独立前缀便于日志区分。
+const ModelBusyReason = "model busy 14003"
 
 var (
 	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
@@ -364,6 +379,7 @@ var (
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 	reQueueWaiting    = regexp.MustCompile(`"code"\s*:\s*"?` + queueWaitingCode + `"?`)
 	reQueueFull       = regexp.MustCompile(`"code"\s*:\s*"?` + queueFullCode + `"?`)
+	reModelBusy       = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
 	// reQueueRetryAfter 匹配排队响应 data 里的 retry_after（秒）。
 	// 形如 "data":{"queue_position":526,...,"retry_after":40,...}。
 	reQueueRetryAfter = regexp.MustCompile(`"retry_after"\s*:\s*([0-9]+)`)
@@ -391,6 +407,28 @@ func IsQueueBusy(body string) bool {
 // （handler 写 QueueBusyReason）。末端出口据此区分「等一会儿重试」与「换模型」。
 func IsQueueBusyReason(reason string) bool {
 	return strings.HasPrefix(strings.TrimSpace(reason), QueueBusyReason)
+}
+
+// IsModelBusy 报告 429 body 是否是上游「模型繁忙」答复（业务 code 14003）。
+//
+// 与 IsQueueBusy 同纪律：只比对业务 code 字段，不做整段文本子串匹配——
+// 错误体带 requestId，整段匹配会把 "14003" 撞在 ID 上。
+func IsModelBusy(body string) bool {
+	return reModelBusy.MatchString(body)
+}
+
+// IsModelBusyReason 报告 pool.modelCooldowns 条目的 reason 是否来自模型繁忙避让
+// （handler 写 ModelBusyReason）。
+func IsModelBusyReason(reason string) bool {
+	return strings.HasPrefix(strings.TrimSpace(reason), ModelBusyReason)
+}
+
+// IsRetryableModelReason 报告模型级冷却是否属于「等一会儿就好」家族
+// （排队 6020/6021、模型繁忙 14003），而非「必须换模型」（6004 用量超限、
+// 11102 模型不可用）。末端出口据此决定回 429（客户端退避重试）还是
+// 400 model_unavailable（客户端换模型）。
+func IsRetryableModelReason(reason string) bool {
+	return IsQueueBusyReason(reason) || IsModelBusyReason(reason)
 }
 
 // ParseQueueRetryAfter 解析排队类响应里上游建议的等待时长（data.retry_after，秒）。
@@ -1526,14 +1564,14 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
 // 实证，字段集与任务书 hy3 样本一致），故共用此结构；上游省略的字段保持零值，
 // /v1/models 侧按「空值省略」透出（不编造）。
 type ModelInfo struct {
-	ID             string
-	Name           string
-	ContextWindow  int64    // = maxInputTokens
-	MaxTokens      int64    // = maxOutputTokens
-	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
-	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
-	CanDisableThinking bool // reasoning.canDisableThinking：思考可关（off 档可用）[贴回]
-	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	ID                 string
+	Name               string
+	ContextWindow      int64    // = maxInputTokens
+	MaxTokens          int64    // = maxOutputTokens
+	Efforts            []string // reasoning.supportedEfforts（空=未知/固定档）
+	DefaultEffort      string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
+	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）[贴回]
+	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 
 	// 以下为模型目录全字段补齐（任务书 models-full-fields）：
 	Description       string   // descriptionZh 中文描述
@@ -1599,11 +1637,11 @@ type dynModelEntry struct {
 	SupportsTool    bool     `json:"supportsToolCall"`
 	OnlyReasoning   bool     `json:"onlyReasoning"`
 	Reasoning       struct {
-		Effort           string   `json:"effort"`
-		Summary          string   `json:"summary"`
-		CanDisableThinking bool `json:"canDisableThinking"`
-		DefaultEffort    string   `json:"defaultEffort"`
-		SupportedEfforts []string `json:"supportedEfforts"`
+		Effort             string   `json:"effort"`
+		Summary            string   `json:"summary"`
+		CanDisableThinking bool     `json:"canDisableThinking"`
+		DefaultEffort      string   `json:"defaultEffort"`
+		SupportedEfforts   []string `json:"supportedEfforts"`
 	} `json:"reasoning"`
 }
 
@@ -1611,25 +1649,25 @@ type dynModelEntry struct {
 // CN FetchModels 与 global 探测共用，杜绝两域映射漂移）。
 func (m dynModelEntry) modelInfo() ModelInfo {
 	return ModelInfo{
-		ID:                m.ID,
-		Name:              m.Name,
-		ContextWindow:     m.MaxInputTokens,
-		MaxTokens:         m.MaxOutputTokens,
-		Efforts:           m.Reasoning.SupportedEfforts,
-		DefaultEffort:     m.Reasoning.DefaultEffort,
+		ID:                 m.ID,
+		Name:               m.Name,
+		ContextWindow:      m.MaxInputTokens,
+		MaxTokens:          m.MaxOutputTokens,
+		Efforts:            m.Reasoning.SupportedEfforts,
+		DefaultEffort:      m.Reasoning.DefaultEffort,
 		CanDisableThinking: m.Reasoning.CanDisableThinking,
-		SupportsImages:    m.SupportsImages,
-		Description:       m.Description,
-		Credits:           m.Credits,
-		Tags:              m.Tags,
-		Vendor:            m.Vendor,
-		IsDefault:         m.IsDefault,
-		SupportsReasoning: m.SupportsReason,
-		SupportsToolCall:  m.SupportsTool,
-		OnlyReasoning:     m.OnlyReasoning,
-		MaxAllowedSize:    m.MaxAllowedSize,
-		ReasoningEffort:   m.Reasoning.Effort,
-		ReasoningSummary:  m.Reasoning.Summary,
+		SupportsImages:     m.SupportsImages,
+		Description:        m.Description,
+		Credits:            m.Credits,
+		Tags:               m.Tags,
+		Vendor:             m.Vendor,
+		IsDefault:          m.IsDefault,
+		SupportsReasoning:  m.SupportsReason,
+		SupportsToolCall:   m.SupportsTool,
+		OnlyReasoning:      m.OnlyReasoning,
+		MaxAllowedSize:     m.MaxAllowedSize,
+		ReasoningEffort:    m.Reasoning.Effort,
+		ReasoningSummary:   m.Reasoning.Summary,
 	}
 }
 
@@ -2600,6 +2638,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Size > out[j].Size })
 	return out, sumRemain, sumSize, nil
 }
+
 // enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的等价表示
 // （上游 limitNum == -1；桌面端同判为 unlimited）。
 //

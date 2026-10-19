@@ -1636,7 +1636,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 客户端该换模型」；排队正相反——等一会儿重试才是对的（上游队列几十秒就排空）。
 		// 若也报 400 model_unavailable，会把客户端推向"换模型"这个错误动作。
 		// 故保持 429 + 上游原文（客户端据此退避重试），本地调度信息进 hint。
-		if upstream.IsQueueBusyReason(modelBlock.Reason) {
+		//
+		// 模型繁忙（14003，2026-10-19）同属该家族：上游说的是「switch models or retry
+		// later」，两种动作都接受，等 60s 即可，不该被推成 model_unavailable。
+		if upstream.IsRetryableModelReason(modelBlock.Reason) {
 			code = "rate_limit_exceeded"
 			if !upstreamMsgPassed {
 				msg = "upstream queue is full for this model, please retry later"
@@ -1839,6 +1842,25 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				d = v
 			}
 			h.cfg.Pool.CooldownSoftForModel(uid, d, time.Now().Add(d), model, upstream.QueueBusyReason)
+			return
+		}
+		// 模型繁忙（14003）——**模型级容量**信号，与排队同类处理。
+		//
+		// 上游 displayMsg 原文就写着「Model busy. Please switch models or retry later」，
+		// 语义上与 6004（用量超限，必须切模型）、6020/6021（队列满，等几十秒）并列，
+		// 唯独不表示「这个账号在限流」。之前它落末尾账号级兜底 → 每次 600s、softStreak
+		// 指数翻倍封顶 2h，把这个号的所有模型一起停掉。
+		//
+		// 2026-10-19 生产实测：41 个号的池子，1 小时内 73 次 14003 打到 35 个号，
+		// 而成功请求也只用到 37 个号——几乎「用过就中」，等于每小时把池子刷一遍。
+		// 改走模型级 60s 避让后，只让该模型在这个号上歇一分钟，账号与其余模型照常。
+		if upstream.IsModelBusy(body) {
+			// 传非零 resetAt 是关键：CooldownSoftForModel 在 resetAt 为零值时走
+			// 「账号级有界退避」分支（写 e.until + softStreak++），那就又变回
+			// 600s×2^n 的账号冷却了。这里给 now+d，与排队类同一调用形态，
+			// 只写 modelCooldowns[model]、不动账号级 until。
+			d := queueCooldownDefault
+			h.cfg.Pool.CooldownSoftForModel(uid, d, time.Now().Add(d), model, upstream.ModelBusyReason)
 			return
 		}
 		// modelRateLimited 判定该 429 是否明确指向模型级限流（业务 code 6004）：

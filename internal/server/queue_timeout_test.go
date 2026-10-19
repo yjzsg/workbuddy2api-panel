@@ -90,14 +90,17 @@ func TestQueueWaitingHonoursRetryAfter(t *testing.T) {
 	}
 }
 
-// TestPlainSoftRateStillAccountLevel 对照：**不带排队码**的普通 429 仍走账号级
-// 软冷却（既有语义零变化）——否则本改动就把账号级限流也一起放过了。
+// TestPlainSoftRateStillAccountLevel 对照：**不带排队码/模型繁忙码**的普通 429 仍走
+// 账号级软冷却（既有语义零变化）——否则本改动就把账号级限流也一起放过了。
+//
+// 注意别拿 14003 当"普通 429"样本：2026-10-19 起它已归模型级（见
+// TestModelBusy14003IsModelLevel），body 里只留 msg、不带业务 code。
 func TestPlainSoftRateStillAccountLevel(t *testing.T) {
 	const model = "deepseek-v4.1-flash"
 	p := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at", ExpiresAt: 9999999999})
 	h := NewHandler(Config{
 		Pool:     p,
-		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 429, `{"code":14003,"msg":"too many requests"}`, false }),
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 429, `{"msg":"rate limit exceeded"}`, false }),
 	})
 
 	rec := httptest.NewRecorder()
@@ -109,6 +112,36 @@ func TestPlainSoftRateStillAccountLevel(t *testing.T) {
 
 	if got := p.AvailableUIDsForRealm("cn"); len(got) != 0 {
 		t.Fatalf("普通 429 仍应是账号级冷却：AvailableUIDsForRealm=%v", got)
+	}
+}
+
+// TestModelBusy14003IsModelLevel 端到端：上游 14003「模型繁忙」必须只避让该模型，
+// 账号仍可用（对比上一条：普通 429 会把账号踢出可用池）。
+//
+// 生产背景（2026-10-19）：41 个号的池子，1 小时内 73 次 14003 打到 35 个号，
+// 成功请求也只用到 37 个号——几乎「用过就中」。改前每次账号级 600s，
+// 等于每小时把池子刷一遍。
+func TestModelBusy14003IsModelLevel(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 429, modelBusyBody, false }),
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`)))
+	// 所有号都对该模型避让 → 末端 429（不是 400 model_unavailable：等 60s 就能重试）。
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429（模型繁忙属可重试家族）", rec.Code)
+	}
+
+	if st := p.ModelBlockedForRealm(model, "cn"); !st.Blocked {
+		t.Fatalf("应报该模型被挡：%+v", st)
+	}
+	if got := p.AvailableUIDsForRealm("cn"); len(got) != 1 {
+		t.Fatalf("账号不该被账号级冷却：AvailableUIDsForRealm=%v", got)
 	}
 }
 
