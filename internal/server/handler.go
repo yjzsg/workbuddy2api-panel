@@ -1371,6 +1371,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						rc, status, respBody, terr = sibRC, sibStatus, sibBody, sibErr
 						siblingServed = true
 						servedSibling = sib
+						st.upstreamModel = sib
 					} else {
 						recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 						if sibUErr == nil {

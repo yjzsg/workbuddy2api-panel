@@ -43,16 +43,18 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start            time.Time
-	model            string
-	mode             string // "stream" | "sync"
-	uid              string // 完整 uid，展示时只取前 8 位
-	nick             string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
-	ttfb             time.Duration
-	toks             int // <0 表示 usage 缺失 → 显示 "-"
-	status           int
-	requestID        string
-	outcome          string
+	start     time.Time
+	model     string
+	mode      string // "stream" | "sync"
+	uid       string // 完整 uid，展示时只取前 8 位
+	nick      string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	ttfb      time.Duration
+	toks      int // <0 表示 usage 缺失 → 显示 "-"
+	status    int
+	requestID string
+	outcome   string
+	// upstreamModel 实际服务本次请求的上游模型名；与 model 不同 = 走了备用部署兜底。
+	upstreamModel    string
 	attempts         int
 	credit           float64
 	hasCredit        bool
@@ -101,7 +103,7 @@ func (s *chatStat) done() {
 	s.logged = true
 	total := time.Since(s.start)
 	logChatRowEx(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.upstreamModel)
 	recordChatMetric(s, total)
 }
 
@@ -476,6 +478,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.UpstreamModel = s.upstreamModel
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -541,14 +544,14 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, upstreamModel string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -586,6 +589,11 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 			creditField = fmt.Sprintf("%.4f", credit)
 		}
 		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+	}
+	// 备用部署标记：实际服务模型与请求模型不同时在行尾追加 via=，
+	// 便于在 stdout 一眼看出「这条是 flash 忙时由 flash-sg 兜底成功的」。
+	if upstreamModel != "" {
+		extra += fmt.Sprintf(" via=%s |", upstreamModel)
 	}
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。

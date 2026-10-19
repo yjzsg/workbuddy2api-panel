@@ -62,22 +62,26 @@ type Config struct {
 // 归档里不会出现来源字段）——来源信息比 token 计数敏感，运营可自行决定是否落盘。
 // 仍然不写提示词、响应正文、Authorization 或其它凭证。
 type Event struct {
-	Time             time.Time `json:"time"`
-	RequestID        string    `json:"request_id"`
-	Path             string    `json:"path"`
-	Account          string    `json:"account,omitempty"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	OK               bool      `json:"ok"`
-	Outcome          string    `json:"outcome"`
-	DurationMs       int64     `json:"duration_ms"`
-	TTFBMs           int64     `json:"ttfb_ms,omitempty"`
-	Attempts         int       `json:"attempts,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	Credit           float64   `json:"credit,omitempty"`
-	HasCredit        bool      `json:"credit_known"`
+	Time      time.Time `json:"time"`
+	RequestID string    `json:"request_id"`
+	Path      string    `json:"path"`
+	Account   string    `json:"account,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	// UpstreamModel 实际服务本次请求的上游模型名。与 Model 不同 = 走了同族备用
+	// 部署兜底（14003 时 deepseek-v4.1-flash → deepseek-v4.1-flash-sg）。
+	// 对外响应仍回写 Model（-sg 不外泄），本字段只在网关本地日志/面板可见。
+	UpstreamModel    string  `json:"upstream_model,omitempty"`
+	Status           int     `json:"status"`
+	OK               bool    `json:"ok"`
+	Outcome          string  `json:"outcome"`
+	DurationMs       int64   `json:"duration_ms"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
+	Attempts         int     `json:"attempts,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
