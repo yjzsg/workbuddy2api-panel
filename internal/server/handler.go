@@ -129,6 +129,17 @@ const wafCooldownBase = 60 * time.Second
 // 故改为**模型级**短避让：只让该模型在这个号上歇一会儿，其他模型照常服务。
 const queueCooldownDefault = 60 * time.Second
 
+// 容量饱和（14003 模型繁忙）时的「同号重试」预算（2026-10-20）。
+//
+// 上游模型全局饱和时换号毫无收益（新号同样 14003），但前缀缓存按 uid 隔离，换一次
+// 就等于整段重算。实测一个 60k→100k 的会话 7 分钟内跳了 8 个号，每次命中率掉到 0–3.5%。
+// 改为先在原号等一会儿再试：14003 是逐请求准入，几秒内就可能放行。
+// 用 var 而非 const：测试需要把退避压到毫秒级，否则单测要等 3 秒。
+var (
+	maxCapacityRetries   = 2
+	capacityRetryBackoff = 1500 * time.Millisecond
+)
+
 // timeoutCooldown 上游超时（响应头迟迟不来）后该 (账号, 模型) 的短时避让时长。
 //
 // 为什么必须有它：超时路径是"不换号、不罚号"（handler 轮转循环内的
@@ -1115,6 +1126,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// servedSibling 本次请求实际由兄弟模型（如 flash-sg）服务时记录其名字，
 	// 供响应体把 model 字段改回客户端请求的名字（-sg 不外泄给 New API 等聚合层）。
 	servedSibling := ""
+	// capacityRetries 容量饱和（14003）时「留在原号等一会儿再试」的次数。
+	//
+	// 为什么不直接换号（2026-10-20 用户观测 + 日志实证）：上游模型全局饱和时，
+	// 换号没有任何收益——新号同样 14003，但前缀缓存按 uid 隔离，等于整段重算。
+	// 实测一个 60k→100k 的会话在 7 分钟内跳了 8 个号（quietotter920 → winternewt327
+	// → lunarcoyote675 → jiuzhouye99 → yarrowfalcon539 → winteryak293 → onyxgazelle966
+	// → xenonmarten603 → prismeagle198），每次换号命中率都掉到 0.0–3.5%。
+	capacityRetries := 0
+	// retryCapacitySameAccount 容量饱和时同号重试（不换号、不解绑粘性）。
+	// 返回 false 表示重试预算用尽或 ctx 已取消，调用方按原逻辑换号。
+	retryCapacitySameAccount := func() bool {
+		if capacityRetries >= maxCapacityRetries {
+			return false
+		}
+		capacityRetries++
+		log.Printf("INFO: [server] model saturated (14003) -> wait %s and retry same acct, no rotate (%d/%d)",
+			capacityRetryBackoff, capacityRetries, maxCapacityRetries)
+		return sleepCtx(r.Context(), capacityRetryBackoff)
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
@@ -1197,8 +1227,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
+		//
+		// 容量冷却预判（2026-10-20）：该号刚在这个模型上吃过 14003（容量类避让未过期），
+		// 且该模型有兄弟模型 → **直接发兄弟模型**，省掉每轮一次必然失败的往返。
+		// 此前表现为「请求在 flash / -sg 之间来回跳」：14003 后记 60s 容量避让，但粘性
+		// 绑定按设计保留，于是下一轮又先撞一次 flash（429）再回落 -sg，每轮多付一次往返。
+		sendBody := body
+		attemptSibling := ""
+		if sib, ok := upstream.SiblingModel(bareModel); ok && h.cfg.Pool.ModelCapacityCooled(acct.UID, bareModel) {
+			sendBody = rewriteModel(body, sib)
+			siblingTried = true // 兄弟模型已用掉：若它也 14003，14003 分支不再重试它
+			attemptSibling = sib
+		}
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, sendBody, clientIP, chatMeta)
+		// 预判成功才回写 servedSibling：失败（含兄弟也 14003）时要换号重试，
+		// 不能让下一跳的响应体被改写成 -sg。
+		if attemptSibling != "" && terr == nil && status < 400 {
+			servedSibling = attemptSibling
+			st.upstreamModel = attemptSibling
+		}
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
 		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
@@ -1409,6 +1457,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 							lastErr = &upstream.Error{Kind: sibUErr.Kind, Status: sibStatus, Msg: string(sibBody), RetryAfter: sibUErr.RetryAfter}
 							h.applyErrorPolicy(acct.UID, sibUErr.Kind, string(sibBody), sib, sibUErr)
 						}
+						// 两个模型都只是「容量饱和」→ 留在原号等一会儿再试，不换号。
+						// 换号在这时没有任何收益（上游全局饱和），只会丢掉整段前缀缓存。
+						if sibUErr != nil && upstream.IsModelBusy(string(sibBody)) && retryCapacitySameAccount() {
+							i-- // 容量重试不占用换号预算
+							continue
+						}
 						fail(acct.UID)
 						if !rotateBackoff(i, r.Context()) {
 							break
@@ -1421,7 +1475,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 				// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				// 记避让用的模型名取**实际发出**的那个：预判走兄弟模型时，冷却应记在 -sg 上
+				// （flash 的避让在预判那一刻已由上一轮记过）。
+				errModel := bareModel
+				if attemptSibling != "" {
+					errModel = attemptSibling
+				}
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), errModel, uerr)
+				// 容量饱和（14003）：先把避让记上（下一跳预判会自动走兄弟模型），
+				// 再留在原号等一会儿重试——不换号、不解绑粘性。
+				if kind == upstream.ErrSoftRate && upstream.IsModelBusy(string(respBody)) && retryCapacitySameAccount() {
+					i-- // 容量重试不占换号预算
+					continue
+				}
 				fail(acct.UID)
 				// 边缘层 IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义，
 				// 任务书设计纪律）：该次边缘层拒绝喂入 IP 级状态机，若激活（短窗多号命中，

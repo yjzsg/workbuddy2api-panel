@@ -60,3 +60,40 @@ func TestCapacityCooldownExpiresBackToNormal(t *testing.T) {
 		t.Fatalf("冷却到期后不应再报告阻塞: %+v", blk)
 	}
 }
+
+// TestModelCapacityCooled 只有「容量类」且未过期的条目才算冷却命中；
+// 6004/11102 与已过期条目一律 false（handler 据此决定是否直接走兄弟模型）。
+func TestModelCapacityCooled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	const flash = "deepseek-v4.1-flash"
+
+	if p.ModelCapacityCooled("u1", flash) {
+		t.Fatal("未冷却时应为 false")
+	}
+	p.CooldownCapacityForModel("u1", time.Minute, time.Now().Add(time.Minute), flash, "14003 model busy")
+	if !p.ModelCapacityCooled("u1", flash) {
+		t.Fatal("容量冷却未过期时应为 true")
+	}
+	if p.ModelCapacityCooled("u1", "glm-5.3") {
+		t.Fatal("其它模型不应受影响")
+	}
+	if p.ModelCapacityCooled("u1", "") || p.ModelCapacityCooled("", flash) {
+		t.Fatal("空参数应为 false")
+	}
+
+	// 6004 配额类不是容量冷却（换模型才有用，走既有分支）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Minute), "glm-5.3", "6004 quota")
+	if p.ModelCapacityCooled("u1", "glm-5.3") {
+		t.Fatal("6004 不应被当作容量冷却")
+	}
+
+	// 过期后恢复 false。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	p2.CooldownCapacityForModel("u2", time.Minute, time.Now().Add(20*time.Millisecond), flash, "14003")
+	time.Sleep(40 * time.Millisecond)
+	if p2.ModelCapacityCooled("u2", flash) {
+		t.Fatal("过期后应为 false")
+	}
+}

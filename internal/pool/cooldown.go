@@ -554,3 +554,30 @@ func nextDay4AM(now time.Time) time.Time {
 // 任务每 5 分钟到达这里，全清会把限流冷却实际寿命压到一个刷新周期内）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。
+
+// ModelCapacityCooled 报告 uid 在 model 上是否处于**容量类**冷却（14003 模型繁忙 /
+// 6020-6021 排队），且尚未到期。
+//
+// 用途（2026-10-20）：handler 在发请求前据此决定「是否直接走兄弟模型」。
+// 背景：14003 后我们会给该号该模型记 60s 容量避让，但粘性绑定仍然保留；于是下一轮
+// 请求会先撞一次必然失败的 flash，再回落到 -sg —— 面板上表现为「请求一直在 flash 和
+// -sg 之间来回跳」，每轮多付一次 429 往返（实测该模式在 DeepSeek harness 的会话上
+// 每轮都出现）。有了这个查询，命中冷却时可以直接用兄弟模型发出去，省掉那次白撞。
+//
+// 只认 Capacity 条目：6004/11102 是「换模型才有用」的另一类语义，由既有逻辑处理。
+func (p *Pool) ModelCapacityCooled(uid, model string) bool {
+	if uid == "" || model == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	mc, ok := e.modelCooldowns[model]
+	if !ok || mc.AuditOnly || !mc.Capacity {
+		return false
+	}
+	return !mc.Until.IsZero() && time.Now().Before(mc.Until)
+}

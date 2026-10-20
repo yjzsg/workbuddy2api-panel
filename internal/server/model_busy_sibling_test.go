@@ -8,8 +8,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -197,5 +199,96 @@ func TestSiblingFallbackCostAttributedToServedModel(t *testing.T) {
 	per1k, ok := p.ModelCost("g1", "deepseek-v4.1-flash-sg")
 	if !ok || per1k <= 0 {
 		t.Fatalf("-sg 应留下收费观测, got (%v, %v)", per1k, ok)
+	}
+}
+
+// TestCapacityCooledUsesSiblingDirectly 该号对 flash 正处于容量冷却（刚吃过 14003）时，
+// 请求应**直接**用兄弟模型发出，不再白撞一次 flash。
+//
+// 回归背景（2026-10-20 用户观测）：面板上请求在 flash / -sg 之间来回跳——14003 记 60s
+// 容量避让但粘性绑定保留，于是每轮都先撞一次必然失败的 flash，再回落 -sg。
+func TestCapacityCooledUsesSiblingDirectly(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	// 模拟上一轮刚吃过 14003：该号该模型进入 60s 容量冷却。
+	p.CooldownCapacityForModel("g1", time.Minute, time.Now().Add(time.Minute), model, "14003 model busy")
+
+	// 粘性命中路径才会选中「容量冷却中」的号（严格选号会避开它），故显式装配会话路由。
+	sess := session.New(session.Config{
+		TTL:               time.Minute,
+		Store:             newBindStore(),
+		Available:         func() []string { return []string{"g1"} },
+		AvailableForModel: func(string) []string { return []string{"g1"} },
+	})
+	sess.Bind("conv-1", "g1")
+
+	cl, seen := recordingUpstream(t, func(m string) (int, string, bool) {
+		return 200, sseSiblingModel, true
+	})
+	h := NewHandler(Config{Pool: p, MaxRotate: 3, Upstream: cl, Session: sess})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:`+model+`","stream":true,"metadata":{"conversation_id":"conv-1"},"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got := seen()
+	if len(got) != 1 || got[0] != "deepseek-v4.1-flash-sg" {
+		t.Fatalf("冷却期应直接走兄弟模型（只 1 次调用），实际序列=%v", got)
+	}
+	if strings.Contains(rec.Body.String(), "-sg") {
+		t.Fatalf("响应仍泄漏 -sg: %s", rec.Body.String())
+	}
+}
+
+// TestCapacitySaturationRetriesSameAccount 两个模型都 14003（上游全局饱和）时，
+// 应留在原号等待重试，而不是换号——换号在上游全局饱和时没有收益，却必定丢掉前缀缓存。
+//
+// 实测反例（2026-10-20）：一个 60k→100k 的会话 7 分钟跳了 8 个号，每次命中率 0–3.5%。
+func TestCapacitySaturationRetriesSameAccount(t *testing.T) {
+	oldBackoff, oldRetries := capacityRetryBackoff, maxCapacityRetries
+	capacityRetryBackoff, maxCapacityRetries = time.Millisecond, 2
+	t.Cleanup(func() { capacityRetryBackoff, maxCapacityRetries = oldBackoff, oldRetries })
+
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(
+		&auth.Auth{UID: "g1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "g2", AccessToken: "at2", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"},
+	)
+	// 粘性会话绑在 g1：同号重试必须留在 g1（非粘性请求本来就会换号，不是本用例的范围）。
+	sess := session.New(session.Config{
+		TTL:               time.Minute,
+		Store:             newBindStore(),
+		Available:         func() []string { return []string{"g1", "g2"} },
+		AvailableForModel: func(string) []string { return []string{"g1", "g2"} },
+	})
+	sess.Bind("conv-1", "g1")
+
+	// 上游恒定 14003（两个模型都饱和）。
+	cl, seen := recordingUpstream(t, func(m string) (int, string, bool) {
+		return 429, modelBusy429Body, false
+	})
+	h := NewHandler(Config{Pool: p, MaxRotate: 3, Upstream: cl, Session: sess})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:`+model+`","stream":true,"metadata":{"conversation_id":"conv-1"},"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("全饱和时应失败，body=%s", rec.Body.String())
+	}
+	got := seen()
+	// 前 4 次必须发生在同一个号上：flash → 兄弟 -sg → 2 次同号重试（预判直接走 -sg）。
+	// 之后预算用尽才允许换号（第 5 次是另一个号上的 flash），这不在本用例断言范围内。
+	if len(got) < 4 {
+		t.Fatalf("应至少 4 次调用（flash + 兄弟 + 2 次同号重试），实际 %d 次: %v", len(got), got)
+	}
+	if got[0] != model {
+		t.Fatalf("首次应发原模型，实际 %v", got)
+	}
+	for i := 1; i < 4; i++ {
+		if got[i] != "deepseek-v4.1-flash-sg" {
+			t.Fatalf("第 %d 次应走兄弟模型（同号重试），实际序列=%v", i+1, got)
+		}
 	}
 }
