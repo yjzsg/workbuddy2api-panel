@@ -10,6 +10,7 @@ package pool
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -32,7 +33,10 @@ func TestRealmWeightDecayAndIsolation(t *testing.T) {
 		t.Fatalf("初始权重应为 1，got %v", w)
 	}
 	p.NoteRealmRateLimited("g1", "m")
-	if w := p.RealmWeight("m", "global"); w != 0.5 {
+	// 用容差而非精确相等：权重是「读时按 elapsed 恢复」的，写入与读取之间哪怕
+	// 过了几微秒也会得到 0.50000000571 这种值。CI（Linux、时钟精度更高）上
+	// 曾因此稳定失败（go-binaries #29–#36 全部红）。
+	if w := p.RealmWeight("m", "global"); math.Abs(w-0.5) > 1e-6 {
 		t.Fatalf("一次限流应降到 0.5，got %v", w)
 	}
 	if w := p.RealmWeight("m", "cn"); w != 1 {
