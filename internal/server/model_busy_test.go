@@ -102,3 +102,24 @@ func TestApplyErrorPolicy6004StillModelLevel(t *testing.T) {
 		t.Fatalf("6004 必须保持「换模型」语义，不能被并入可重试家族: %q", blk.Reason)
 	}
 }
+
+// TestModelBusyCooldownKeepsStickyBinding 14003 写入的避让必须是「容量类」：
+// 严格可用集（新会话分配）里消失，松开集（粘性命中）里仍在。
+//
+// 直接对应用户可见症状（2026-10-20 13:57 生产日志）：某号吃 14003 后被 60s 避让，
+// 绑定在该模型上被判失效，384k 上下文的会话被迁到另一个号，缓存命中 99.7% → 0.8%。
+func TestModelBusyCooldownKeepsStickyBinding(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 10 * time.Minute})
+
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, modelBusyBody, "deepseek-v4.1-flash",
+		&upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, Msg: modelBusyBody})
+
+	if got := p.WeightedAvailableUIDsForModelRealm("deepseek-v4.1-flash", ""); len(got) != 0 {
+		t.Fatalf("新会话不应选中刚 14003 的号: %v", got)
+	}
+	if got := p.WeightedAvailableUIDsForModelRealmSticky("deepseek-v4.1-flash", ""); len(got) != 1 || got[0] != "u1" {
+		t.Fatalf("粘性命中应保留该号（否则整段前缀缓存重算）: %v", got)
+	}
+}

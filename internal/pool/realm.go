@@ -38,15 +38,35 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 // 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
+	return p.weightedAvailableLocked(model, realm, false)
+}
+
+// WeightedAvailableUIDsForModelRealmSticky 与 WeightedAvailableUIDsForModelRealm 同形，
+// 但把**容量类**模型冷却（14003 模型繁忙 / 6020-6021 排队）视为可用。
+//
+// 只供**会话粘性命中校验**使用（session.Config.AvailableForModelSticky），不参与新会话
+// 的分配：新会话仍走严格集合，避免把全新对话丢到一个正在饱和的号上。
+//
+// 动机见 entry.healthyForModelSticky：上游前缀缓存的键含 uid，一次 14003 就把会话踢到
+// 别的号，等于把整段上下文重算一遍。
+func (p *Pool) WeightedAvailableUIDsForModelRealmSticky(model, realm string) []string {
+	return p.weightedAvailableLocked(model, realm, true)
+}
+
+func (p *Pool) weightedAvailableLocked(model, realm string, sticky bool) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
+	ok := func(e *entry) bool { return e.healthyForModel(now, model) }
+	if sticky {
+		ok = func(e *entry) bool { return e.healthyForModelSticky(now, model) }
+	}
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		if !e.healthyForModel(now, model) {
+		if !ok(e) {
 			continue
 		}
 		if p.inFlightFull(e) {

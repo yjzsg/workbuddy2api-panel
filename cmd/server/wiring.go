@@ -22,3 +22,14 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
 }
+
+// realmAwareAvailableForModelSticky 是会话**命中校验**用的宽松闭包：与
+// realmAwareAvailableForModel 只差「容量类模型冷却（14003/排队）不解除绑定」。
+//
+// 不用于新会话分配——分配仍走严格闭包，避免把全新对话丢到正在饱和的号上。
+func realmAwareAvailableForModelSticky(p *pool.Pool) func(model string) []string {
+	return func(model string) []string {
+		realm, bare := server.ResolveModel(model)
+		return p.WeightedAvailableUIDsForModelRealmSticky(bare, realm)
+	}
+}

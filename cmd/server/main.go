@@ -135,6 +135,9 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			// 命中校验的宽松口径：容量类模型冷却（14003/排队）不解除绑定，
+			// 避免一次模型饱和就把会话踢到别的号、整段前缀缓存作废。
+			AvailableForModelSticky: realmAwareAvailableForModelSticky(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()

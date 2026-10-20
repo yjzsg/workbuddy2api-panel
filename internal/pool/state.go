@@ -3,9 +3,9 @@
 package pool
 
 import (
-	"strings"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -424,6 +424,10 @@ func (p *Pool) availableUIDsLocked(realm string, health func(e *entry, now time.
 // 绑定号在当前模型被 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换——
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+//
+// **容量类冷却（14003/排队）例外**：走 healthyForModelSticky 放行。理由见该方法注释——
+// 上游几秒就可能放行，而换号会让整段上下文的前缀缓存作废。放行后请求会照常撞 14003，
+// 由 handler 的同号 -sg 兄弟模型兜底接住（实测命中率 72.7%）。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -432,7 +436,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
+	if !e.healthyForModelSticky(now, model) {
 		return nil
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -598,12 +602,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
 		// 成本台账（P1-anti-monopoly）：每模型一行（modelCost 内 TTL 未过期的
 		// 条目），运维据此自查「为什么总选它」；只读遍历零风险，过期即消失。
-		ModelCosts: p.modelCostsStatusLocked(e, now),
-		Realm:             e.a.Realm(),
-		Enterprise:        e.a.IsEnterprise(),
-		Nickname:          e.a.Nickname,
-		Credits:           e.credits,
-		CreditsTotal:      e.creditsTotal,
+		ModelCosts:   p.modelCostsStatusLocked(e, now),
+		Realm:        e.a.Realm(),
+		Enterprise:   e.a.IsEnterprise(),
+		Nickname:     e.a.Nickname,
+		Credits:      e.credits,
+		CreditsTotal: e.creditsTotal,
 		// 到期压力快照（上游 dbd7c68..origin/main）：供面板展示与 prefer_expiring 观测。
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
@@ -612,22 +616,22 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CheckinDone: e.lastCheckinDay == time.Now().Format("2006-01-02"),
 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
-		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
-		Reason:            reason,
-		Disabled:          e.disabled,
-		ManualDisabled:    e.manualDisabled,
-		SuccessCount:      e.successCount,
-		ErrTotal:          e.errTotal,
-		LastSuccessTime:   e.lastSuccess,
-		LastErrTime:       e.lastErr,
-		TokenUsage:        e.tokenUsage,
-		ConsecutiveFails:  e.consecutiveFails,
-		DegradeUntil:      e.degradeUntil,
-		Until:             e.until,
-		SoftStreak:        e.softStreak,
-		InFlight:          int(e.inFlight.Load()),
-		BreakerFails:      e.fails,
-		BreakerUntil:      e.breakerUntil,
+		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
+		Reason:           reason,
+		Disabled:         e.disabled,
+		ManualDisabled:   e.manualDisabled,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		LastSuccessTime:  e.lastSuccess,
+		LastErrTime:      e.lastErr,
+		TokenUsage:       e.tokenUsage,
+		ConsecutiveFails: e.consecutiveFails,
+		DegradeUntil:     e.degradeUntil,
+		Until:            e.until,
+		SoftStreak:       e.softStreak,
+		InFlight:         int(e.inFlight.Load()),
+		BreakerFails:     e.fails,
+		BreakerUntil:     e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

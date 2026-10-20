@@ -44,6 +44,18 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// AvailableForModelSticky 按请求模型返回"允许继续沿用已有绑定"的账号集：与
+	// AvailableForModel 的唯一差别是把**容量类**模型冷却（14003 模型繁忙 / 排队）视为
+	// 可用（见 pool.WeightedAvailableUIDsForModelRealmSticky）。
+	//
+	// 它只参与**命中校验**，不参与新会话分配（分配仍用 AvailableForModel 的严格集合），
+	// 因此不会把全新对话丢到一个正在饱和的号上。
+	//
+	// 为什么需要（2026-10-20 实测）：上游前缀缓存的键含 uid，一次 14003 就让绑定被判
+	// 失效 → 换号 → 整个上下文重算。384k 上下文的命中率从 99.7% 掉到 0.8%，TTFB
+	// 5.2s → 7.0s；560k 级别单次全 miss 达 15.6s。
+	// nil 时回落 AvailableForModel（行为与引入前完全一致）。
+	AvailableForModelSticky func(model string) []string
 }
 
 // Router 会话粘性路由器。
@@ -144,13 +156,18 @@ func (r *Router) LoadFromStore() {
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
 	available := r.availableSet(model)
+	// 命中校验用「宽松集」：容量类模型冷却（14003/排队）不解除绑定。未注入时与严格集相同。
+	stickyOK := available
+	if r.cfg.AvailableForModelSticky != nil {
+		stickyOK = uidSet(r.cfg.AvailableForModelSticky(model))
+	}
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
+		if stickyOK[e.uid] {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
@@ -163,7 +180,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
+		if stickyOK[e2.uid] {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
@@ -265,7 +282,11 @@ func (r *Router) gcOnce(now time.Time) int {
 
 // availableSet 把可用账号列表转集合（快路径命中校验用）。
 func (r *Router) availableSet(model string) map[string]bool {
-	uids := r.availableSlice(model)
+	return uidSet(r.availableSlice(model))
+}
+
+// uidSet 把 uid 列表转为集合（nil 列表 → 空集，语义等同"无可用账号"）。
+func uidSet(uids []string) map[string]bool {
 	set := make(map[string]bool, len(uids))
 	for _, u := range uids {
 		set[u] = true

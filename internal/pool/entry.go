@@ -351,6 +351,36 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return true
 }
 
+// healthyForModelSticky 是**会话粘性命中**专用的可用判定：与 healthyForModel 的差别
+// 只有一条——容量类冷却（Capacity：14003 模型繁忙 / 6020-6021 排队）放行。
+//
+// 为什么必须区分（2026-10-20 生产实测）：粘性命中校验走的是同一套 healthyForModel，
+// 于是某个号吃了一次 14003 就被写进 60s 模型冷却，绑定随即被判失效 → 会话被重新分配到
+// 另一个号 → 上游前缀缓存按 uid 隔离，整个上下文重算。实测 13:57:07 那条 384,954
+// token 的请求：同一会话上一轮命中 99.7%，换号后只剩 0.8%，TTFB 5.2s → 7.0s；
+// 560k 级别（14:00:31）单次全 miss 的 TTFB 达 15.6s。
+//
+// 语义边界：
+//   - 账号级不可用（disabled / until / breakerUntil）→ 仍然不可用（绑定该解）；
+//   - 6004 / 11102（配额耗尽、后端无该模型）→ 仍然不可用（换模型才有效，钉在原号只会反复失败）；
+//   - 14003 / 排队 → 可用（上游几秒内就可能放行，且请求本身还有 -sg 兄弟模型兜底）。
+func (e *entry) healthyForModelSticky(now time.Time, reqModel string) bool {
+	if !e.healthy(now) {
+		return false
+	}
+	if reqModel == "" {
+		return true
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok || mc.AuditOnly {
+		return true
+	}
+	if mc.Capacity {
+		return true // 容量类：账号与绑定都健康，只是模型此刻接不下
+	}
+	return mc.Until.IsZero() || !now.Before(mc.Until)
+}
+
 // pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
 // pruneExpiredModelCooldowns 同形同调用点）。
 //
@@ -554,6 +584,18 @@ type modelCooldown struct {
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
 	AuditOnly bool
+	// Capacity 标记「容量类」冷却：14003 模型繁忙 / 6020-6021 排队。
+	//
+	// 与 6004（配额已耗尽，换模型才有用）的本质区别：容量类是**逐请求**的准入判定，
+	// 上游 displayTips 原文就是「not a network issue, switch model or wait a moment」；
+	// 2026-10-20 直连实测同一账号 5~6s 内 429↔200 反复，最长连 429 仅 20s。
+	//
+	// 语义差别只有一处：**不解除已建立的会话绑定**。其他会话照常避开这个号
+	// （healthyForModel 仍判 false），但已经绑在这个号上的会话允许回来重试——
+	// 因为上游前缀缓存的键含 uid，换号意味着整个上下文重算。
+	// 2026-10-20 实测：384k 上下文因一次 14003 触发换号，命中率从 99.7% 掉到 0.8%，
+	// TTFB 5.2s → 7.0s；560k 级别代价 4.1s → 12.0s。
+	Capacity bool
 }
 
 // stateFile 持久化格式。

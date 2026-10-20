@@ -1945,7 +1945,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			// 600s×2^n 的账号冷却了。这里给 now+d，与排队类同一调用形态，
 			// 只写 modelCooldowns[model]、不动账号级 until。
 			d := queueCooldownDefault
-			h.cfg.Pool.CooldownSoftForModel(uid, d, time.Now().Add(d), model, upstream.ModelBusyReason)
+			// Capacity 口径：14003 是逐请求的容量准入（2026-10-20 直连实测同一账号
+			// 5~6s 内 429↔200 反复），**不解除已有会话绑定**——否则一次饱和就把整个
+			// 会话踢到别的号，上游前缀缓存按 uid 隔离，几百 k 的上下文要重算。
+			// 其他会话照常避开这个号（healthyForModel 不看 Capacity）。
+			h.cfg.Pool.CooldownCapacityForModel(uid, d, time.Now().Add(d), model, upstream.ModelBusyReason)
 			return
 		}
 		// modelRateLimited 判定该 429 是否明确指向模型级限流（业务 code 6004）：

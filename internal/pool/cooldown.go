@@ -156,6 +156,21 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // 死逻辑，纯属库房麻痹）；无重置时间时，「冷却中兜底探测再 429」不再 softStreak++
 // 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
+	p.cooldownModel(uid, base, resetAt, model, reason, false)
+}
+
+// CooldownCapacityForModel 与 CooldownSoftForModel 完全同形，只是把条目标记为**容量类**
+// （见 modelCooldown.Capacity）：14003 模型繁忙、6020/6021 排队。
+//
+// 差别只在会话粘性命中校验（entry.healthyForModelSticky）：容量类冷却不会解除已建立的
+// 绑定，其他会话照常避开。6004 配额类**必须**继续走 CooldownSoftForModel——它换模型
+// 才有用，把会话钉在原号上只会反复 429。
+func (p *Pool) CooldownCapacityForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
+	p.cooldownModel(uid, base, resetAt, model, reason, true)
+}
+
+// cooldownModel CooldownSoftForModel / CooldownCapacityForModel 的共同实现。
+func (p *Pool) cooldownModel(uid string, base time.Duration, resetAt time.Time, model, reason string, capacity bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -173,9 +188,10 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedResetUntilLocked(now, resetAt),
-				ResetAt: resetAt,
-				Reason:  reason,
+				Until:    p.cappedResetUntilLocked(now, resetAt),
+				ResetAt:  resetAt,
+				Reason:   reason,
+				Capacity: capacity,
 			}
 		} else {
 			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
