@@ -695,6 +695,20 @@ func rewriteModel(body []byte, bare string) []byte {
 	return out
 }
 
+// costModelName 成本账本记账用的模型名：兄弟模型兜底成功时记**实际服务**的模型，
+// 否则记客户端请求的模型。
+//
+// 为什么必须区分（2026-10-20 实测）：-sg 是收费模型（x0.03），若把它的 credit
+// 记到请求模型 flash 名下，pool 会认为「flash 在这个号上不再免费」，把成本档位
+// 从 tier0（实测免费，选号最优先）翻成 tier2（实测收费，硬过滤垫底）。
+// 当天 3 小时内 24/42 个账号被这样误标，兜底越多池子越窄。
+func costModelName(bareModel, servedSibling string) string {
+	if servedSibling != "" {
+		return servedSibling
+	}
+	return bareModel
+}
+
 // fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，无静态表兜底），
 // 避免反复打上游。
@@ -1541,7 +1555,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
-				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
+				h.cfg.Pool.NoteModelCost(acct.UID, costModelName(bareModel, servedSibling), credit, stats.TotalTokens())
 			} else if hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -1596,7 +1610,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if hasCredit {
 			st.credit = credit
 			st.hasCredit = true
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			h.cfg.Pool.NoteModelCost(acct.UID, costModelName(bareModel, servedSibling), credit, total)
 		}
 		// metrics 采集（非流式）：与流式同口径，从同一份 usage 带出。
 		fillStatFromUsage(st, resp)

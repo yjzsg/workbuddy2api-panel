@@ -161,3 +161,41 @@ func TestSiblingModelNameNotLeakedNonStream(t *testing.T) {
 		t.Fatalf("响应里泄漏了兄弟模型名: %s", body)
 	}
 }
+
+func TestCostModelName(t *testing.T) {
+	if got := costModelName("deepseek-v4.1-flash", ""); got != "deepseek-v4.1-flash" {
+		t.Fatalf("无兜底时应记请求模型, got %q", got)
+	}
+	if got := costModelName("deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"); got != "deepseek-v4.1-flash-sg" {
+		t.Fatalf("兜底时应记实际服务模型, got %q", got)
+	}
+}
+
+// TestSiblingFallbackCostAttributedToServedModel：兜底成功时成本必须记在 -sg 名下，
+// 不能记到请求的 flash 上——否则 pool 会认为 flash「限免结束」，把账号从 tier0 降级。
+func TestSiblingFallbackCostAttributedToServedModel(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
+	cl, _ := recordingUpstream(t, func(m string) (int, string, bool) {
+		if m == "deepseek-v4.1-flash-sg" {
+			return 200, sseWithCredit, true
+		}
+		return 429, modelBusy429Body, false
+	})
+
+	h := NewHandler(Config{Pool: p, MaxRotate: 3, Upstream: cl})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:`+model+`","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok := p.ModelCost("g1", model); ok {
+		t.Fatalf("不应把 -sg 的收费观测记到 %s 名下（会让 costTier 误判限免结束）", model)
+	}
+	per1k, ok := p.ModelCost("g1", "deepseek-v4.1-flash-sg")
+	if !ok || per1k <= 0 {
+		t.Fatalf("-sg 应留下收费观测, got (%v, %v)", per1k, ok)
+	}
+}
