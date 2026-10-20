@@ -224,10 +224,11 @@ func TestGlobalE2ER9CreditIsomorphic(t *testing.T) {
 	if usage == nil {
 		t.Fatalf("R9 末帧无 usage 子对象（frames=%d lastFrame=%s）", frames, lastFrame)
 	}
-	if _, hasCredit := usage["credit"]; !hasCredit {
-		t.Errorf("R9 末帧 usage 缺少 credit 字段（global SSE 与 CN 非同构）: usage=%v", usage)
+	// 2026-10-20 起：积分字段只留在网关，不下发客户端。
+	if _, hasCredit := usage["credit"]; hasCredit {
+		t.Errorf("R9 末帧 usage 不应再带 credit（积分不外泄）: usage=%v", usage)
 	} else {
-		t.Logf("R9 末帧 usage.credit 存在（与 CN 同构 ✓）")
+		t.Logf("R9 末帧 usage.credit 已剥离（网关侧仍记账 ✓）")
 	}
 
 	// NoteModelCost 被调用：账本应记录该 (uid, model) 观测，且为 tier0 免费（credit=0）。

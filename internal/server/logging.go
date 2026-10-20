@@ -386,6 +386,16 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 	return c, int(pt) + int(ct), true
 }
 
+// stripUsageCreditField 删除聚合响应 usage 里的积分字段 `credit`（2026-10-20）。
+//
+// 积分消耗是网关的计费口径，只留在网关（reqlog / 成本账本 / 面板），不下发给客户端。
+// 调用点必须在 usageCreditTotal / fillStatFromUsage 之后——那两处要读同一个字段。
+func stripUsageCreditField(resp map[string]any) {
+	if u, ok := resp["usage"].(map[string]any); ok {
+		delete(u, "credit")
+	}
+}
+
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
 //
 // 保留本函数是因为 logging_test.go 直接断言它；实现委托 logfmt.UID8，避免

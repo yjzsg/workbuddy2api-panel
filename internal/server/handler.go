@@ -1612,6 +1612,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if servedSibling != "" {
 			resp["model"] = bareModel
 		}
+		// metrics 采集（非流式）：与流式同口径，从同一份 usage 带出。
+		// 必须在剥离 credit **之前**调用——它要读 usage.credit。
+		fillStatFromUsage(st, resp)
+		// 积分字段不外泄（2026-10-20）：credit 是网关计费口径，留在 reqlog/成本账本即可。
+		stripUsageCreditField(resp)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
@@ -1624,8 +1629,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.hasCredit = true
 			h.cfg.Pool.NoteModelCost(acct.UID, costModelName(bareModel, servedSibling), credit, total)
 		}
-		// metrics 采集（非流式）：与流式同口径，从同一份 usage 带出。
-		fillStatFromUsage(st, resp)
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。

@@ -534,6 +534,35 @@ func rewriteModelField(payload, from, to string) string {
 	return payload
 }
 
+// stripUsageCredit 从一帧 SSE 的 usage 对象里删掉积分字段 `credit`（2026-10-20）。
+//
+// 为什么：上游末帧 usage 带 `credit`（本次调用的积分消耗），属网关计费口径；下游客户端
+// （New API 等聚合层）不需要也不应看到。网关侧的成本账本走 stats.Credit()，在写出**之前**
+// 已从同一帧解析完，故此处剥离不影响记账。
+//
+// 只在帧里出现 `"credit"` 时才解析（正常只有末帧 usage 一次），热路径零额外开销；
+// 解析失败 / 没有 usage / 没有该键 → 原样返回，绝不改写。只动 usage.credit，正文与
+// error 帧不受影响。
+func stripUsageCredit(payload string) string {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		return payload
+	}
+	u, ok := obj["usage"].(map[string]any)
+	if !ok {
+		return payload
+	}
+	if _, has := u["credit"]; !has {
+		return payload
+	}
+	delete(u, "credit")
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return string(out)
+}
+
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
 // error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
 // 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
@@ -573,8 +602,14 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	toolFinishSent := false
 
 	// writeSSE 原样写出一帧并 flush（模型名改写见 WithModelRewrite）。
+	// 积分字段剥离（2026-10-20）：上游末帧 usage 里带 `credit`（本次调用的积分消耗），
+	// 这是网关的计费口径，不应透给下游客户端——网关自己已由 stats 读走并记入成本账本，
+	// 写出口剥掉不影响记账（stats 在 write 之前解析同一帧）。
 	writeSSE := func(payload string) error {
 		payload = rewriteModelField(payload, o.modelFrom, o.modelTo)
+		if strings.Contains(payload, "\"credit\"") {
+			payload = stripUsageCredit(payload)
+		}
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
