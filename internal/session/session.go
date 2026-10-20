@@ -408,6 +408,72 @@ func StickyFallbackKey(body []byte) string {
 	return "fb:" + hex.EncodeToString(sum[:16])
 }
 
+// WireConversationID 把网关内部的会话标识转成**线形**：上游 X-Conversation-ID 只接受
+// 官方客户端那种 UUID 形态（32 位小写 hex，或带横线的 8-4-4-4-12），而内部标识可能带
+// `fb:` 前缀、也可能是任意形状的中转层 ID。
+//
+// 为什么必须转（2026-10-20，上游 issue #197/#231 的共同结论）：上游把「请求形状不像官方
+// 客户端」当作独立信号——缺 X-Conversation-ID 会直接 400 11-128「渠道校验失败，可能不是
+// 从官方客户端发出的」。我们此前把 `fb:9f2c…` 原样塞进这个头：既不是 UUID，也一眼能看出
+// 是合成的，等于主动递上一个「非官方客户端」标记。
+//
+// 语义（保守口径，只改「我们自己造的」标识，不动客户端给的值）：
+//   - 已是合法 UUID 形态（32 位 hex / 8-4-4-4-12）→ 原样透传；
+//   - 带网关合成前缀（`fb:` = 首条 user 消息哈希、`d-` = 面板 deriveKey）→
+//     sha256("wb2api|"+in)[:16] 转 32 位 hex（同会话稳定、不同会话不碰撞）；
+//   - 其它（客户端自报的任意形状 ID）→ 原样透传，保持既有"透传客户端原值"契约；
+//   - 空 → 随机 32 位 hex（等价官方客户端为一次性会话生成新 ID）。
+//
+// 注意：该值同时是 prompt_cache_key 的会话段来源（handler → meta.ConversationID →
+// InjectPromptCacheKey），所以转换必须**确定性**——同一会话永远得到同一个值。
+func WireConversationID(in string) string {
+	if isUUID32(in) || isUUIDDashed(in) {
+		return in
+	}
+	if in == "" {
+		return NewMessageID()
+	}
+	if !strings.HasPrefix(in, "fb:") && !strings.HasPrefix(in, "d-") {
+		return in // 客户端自报的 ID：不篡改
+	}
+	sum := sha256.Sum256([]byte("wb2api|" + in))
+	return hex.EncodeToString(sum[:16])
+}
+
+// isUUID32 报告 s 是否是 32 位小写十六进制（官方客户端 conversationId 的无横线形态）。
+func isUUID32(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isUUIDDashed 报告 s 是否是带横线的 8-4-4-4-12 形态（大小写不敏感）。
+func isUUIDDashed(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if s[i] != '-' {
+				return false
+			}
+			continue
+		}
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // CacheKeySource 返回上游 prompt_cache_key 注入所用的会话标识源，逐级回退：
 //
 //  1. ResolveConversationID —— body 的 conversation_id / conversationId（含 metadata 形态）

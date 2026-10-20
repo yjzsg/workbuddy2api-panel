@@ -1068,7 +1068,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 「每账号一个常量」⇒ 同账号下所有会话挤一个前缀缓存槽、互相驱逐；实测该账号
 	// 首次大请求命中率仅 7.9~10.4%，换账号后缓存全丢。派生键让同会话稳定命中。
 	convID := session.CacheKeySource(body, r.Header)
-	chatMeta := upstream.ChatMeta{ConversationID: convID}
+	// 出站 X-Conversation-ID 用**线形**（UUID）值（2026-10-20 防御加固）：内部标识可能是
+	// `fb:<hex>` / `d-<hex>` 这类网关合成形态，原样发送等于自报「非官方客户端」——
+	// 上游 issue #197/#231 已实证这条头参与渠道校验。
+	// 与缓存键**分离**：ConversationID 保持原值供 prompt_cache_key 用，避免一次改动把
+	// 全池会话的前缀缓存槽整体平移。convID 为空（body 带 user_id）时退回粘性键派生。
+	wireSrc := convID
+	if wireSrc == "" {
+		wireSrc = stickyKey
+	}
+	chatMeta := upstream.ChatMeta{
+		ConversationID:     convID,
+		WireConversationID: session.WireConversationID(wireSrc),
+	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {

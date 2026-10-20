@@ -356,3 +356,61 @@ func TestChatImageTurnAggregation(t *testing.T) {
 		t.Errorf("下一轮（末条 user 换文本）应换聚合键: first=%q next=%q", first, next)
 	}
 }
+
+// TestOutboundConversationIDIsWireSafe 出站 X-Conversation-ID 必须是 UUID 形态：
+// 内部 `fb:<hex>` 合成键不得原样发出（上游 issue #197/#231：这条头参与渠道校验，
+// 拿合成值出去等于自报非官方客户端）。
+//
+// 同时守住分离设计：`prompt_cache_key` 的会话段仍由原 convID 决定——
+// 本用例只断言头部，不改变缓存槽位。
+func TestOutboundConversationIDIsWireSafe(t *testing.T) {
+	var got []http.Header
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			got = append(got, r.Header.Clone())
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseWithCredit)),
+			}, nil
+		})},
+		ChatHTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			got = append(got, r.Header.Clone())
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseWithCredit)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "a1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	// 带 user（无 conversation_id）→ CacheKeySource 退到 fb: 派生键。
+	body := `{"model":"glm-5.2","user":"u-123","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got) == 0 {
+		t.Fatal("未捕获上游请求")
+	}
+	conv := got[0].Get("X-Conversation-ID")
+	if conv == "" {
+		t.Fatal("X-Conversation-ID 缺失（上游会判渠道校验失败）")
+	}
+	if strings.HasPrefix(conv, "fb:") || strings.HasPrefix(conv, "d-") {
+		t.Fatalf("X-Conversation-ID=%q 仍是网关合成前缀，应转成 UUID 形态", conv)
+	}
+	if len(conv) != 32 {
+		t.Fatalf("X-Conversation-ID=%q 应为 32 位 hex", conv)
+	}
+	for _, c := range conv {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Fatalf("X-Conversation-ID=%q 含非小写 hex 字符 %q", conv, c)
+		}
+	}
+}

@@ -210,6 +210,14 @@ type ChatMeta struct {
 	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	// WireConversationID 是 X-Conversation-ID 的**线形**覆盖值（2026-10-20 防御加固）：
+	// 只用于出站头，**不参与 prompt_cache_key**（缓存仍用 ConversationID，避免一次改动
+	// 把全池会话的前缀缓存槽整体平移）。空则回落 ConversationID（既有行为）。
+	//
+	// 为什么要单独一个字段：内部会话标识可能是 `fb:<hex>` / `d-<hex>` 这类网关合成值，
+	// 直接当 X-Conversation-ID 发出去，等于主动标记「非官方客户端」（上游 issue #197/#231
+	// 已实证这条头是渠道校验的一部分）。而缓存键需要保持稳定，两者诉求不同，故拆开。
+	WireConversationID string
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -288,8 +296,14 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	// 线形优先：WireConversationID 非空时用它（网关已把 `fb:`/`d-` 这类合成标识转成
+	// UUID 形态，见 session.WireConversationID），否则回落入站原值（既有语义）。
+	convHeader := meta.WireConversationID
+	if convHeader == "" {
+		convHeader = meta.ConversationID
+	}
+	if convHeader != "" {
+		req.Header.Set("X-Conversation-ID", convHeader)
 	}
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
