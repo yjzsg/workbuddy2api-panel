@@ -49,6 +49,12 @@ func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
 
 	counts := map[string]int{}
 	for i := 0; i < 300; i++ {
+		// 探索闸门是 `now.Sub(exploreLast) >= interval`（本测试 interval=1ns）。
+		// Windows 的 time.Now 粒度约 0.5ms，而 300 次 pick 常在微秒级跑完——
+		// 全部落在同一个 tick 内时 Sub==0，闸门此后一次都不放行，表现为
+		// 「某号从未被选中」的假失败（Linux 1ns 精度下不出现，CI 因此一直是绿的）。
+		// 每轮睡 1µs 强制跨 tick，让探索按设计逐轮放行（总代价 <1s）。
+		time.Sleep(time.Microsecond)
 		a := p.PickExcludingForRealm(nil, "m", "")
 		if a == nil {
 			t.Fatalf("第 %d 次 pick 返回 nil", i)
