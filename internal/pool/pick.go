@@ -130,10 +130,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if !ok {
 			return 1, 0
 		}
-		if mc.CostPer1k <= 0 {
-			return 0, 0
-		}
-		return 2, mc.CostPer1k
+		// 分层判据在 modelCostEntry.tier()：优先最近一次原始观测（可双向翻转），
+		// 旧数据无该字段时回退 EMA（见 entry.go 的 tier 注释与 2026-10-21 实测）。
+		return mc.tier()
 	}
 	bestTier := 2
 	hasTier1 := false

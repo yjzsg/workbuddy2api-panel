@@ -308,19 +308,28 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	const alpha = 0.3
 	prev, seen := e.modelCost[model]
+	now := time.Now()
+	lp := per1k // 原始观测值取址保存：分层判据用它，不用 EMA（见 modelCostEntry.tier）
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastPer1k: &lp, LastSeen: now, Samples: 1}
 	} else {
-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束，
-		// EMA 混合后单价转正，下一轮选号即降 tier 2。打一条日志让运维看得见
-		// 「免费午餐结束」这一关键状态迁移。
-		if prev.CostPer1k <= 0 && per1k > 0 {
-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		// 分层迁移事件（判定在写入口，只看覆盖前的**有效分层**——与选号侧同一口径）：
+		//   tier0 → tier2：限免窗口结束，下一轮选号即降为收费层；
+		//   tier2 → tier0：免费回归。2026-10-21 起才可能发生——分层判据从 EMA 改成
+		//     最近一次原始观测后，旧的 EMA 残值（正数几何衰减，永不归零）不再把
+		//     已免费的号永久钉在收费层。两个方向都打日志，运维据此看出池子变宽/变窄。
+		if prevTier, _ := prev.tier(); per1k > 0 {
+			if prevTier == 0 {
+				log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+			}
+		} else if prevTier == 2 {
+			log.Printf("[pool] model %s on uid %s: back to free tier (last %.3g credits/1k, ema %.3g)",
+				model, logfmt.UID8(uid), per1k, prev.CostPer1k)
 		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
+			LastPer1k: &lp,
+			LastSeen:  now,
 			Samples:   prev.Samples + 1,
 		}
 	}
@@ -741,6 +750,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 		rows = append(rows, ModelCostStatus{
 			Model:     m,
 			CostPer1k: mc.CostPer1k,
+			LastPer1k: mc.LastPer1k,
 			LastSeen:  mc.LastSeen,
 			Samples:   mc.Samples,
 		})

@@ -147,6 +147,9 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
+	// legacyCost 统计「旧口径成本观测」条数（无 last_per_1k 字段），见下方 modelCosts
+	// 恢复段：判层依据改成原始观测后，旧条目一律不恢复（一次性迁移）。
+	legacyCost := 0
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -241,11 +244,23 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 {
 					continue // 结构破损/非法值：剔除条目
 				}
+				// 旧口径条目（2026-10-21 之前落盘，无 last_per_1k）一律丢弃：那批数据
+				// 同时受两个已知缺陷污染——① 2026-10-20 前 -sg 兄弟模型的扣费被记到
+				// 请求模型名下（当天 3 小时内 24/42 个号被误标收费）；② EMA 正数只
+				// 逼近 0 永不归零，判层单向门无法回退。留着重启即复现「单号垄断」。
+				// 丢弃后该 (账号,模型) 退回 tier 1 未知层，靠一次真实请求重新学习
+				// （tier 1 会被探索搭车选中，不会饿死）；代价是个别请求可能落在
+				// 实际收费的号上，换来池子重新变宽。
+				if smc.LastPer1k == nil {
+					legacyCost++
+					continue
+				}
 				if now.Sub(smc.LastSeen) > modelCostTTL {
 					continue // 过期：陈旧价格不复活（同落盘侧口径）
 				}
 				e.modelCost[m] = modelCostEntry{
 					CostPer1k: smc.CostPer1k,
+					LastPer1k: smc.LastPer1k,
 					LastSeen:  smc.LastSeen,
 					Samples:   smc.Samples,
 				}
@@ -255,6 +270,9 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		p.byUID[uid] = e
+	}
+	if legacyCost > 0 {
+		log.Printf("[pool] 丢弃 %d 条旧口径成本观测（无 last_per_1k）：判层改用最近一次原始观测，旧 EMA 值受 -sg 误记与「只逼近 0 不归零」双重污染，不恢复（该号/该模型退回 tier1 未知层，下次请求重新学习）", legacyCost)
 	}
 }
 
@@ -398,6 +416,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				}
 				mcosts[m] = stateModelCost{
 					CostPer1k: mc.CostPer1k,
+					LastPer1k: mc.LastPer1k,
 					LastSeen:  mc.LastSeen,
 					Samples:   mc.Samples,
 				}

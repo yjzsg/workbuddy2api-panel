@@ -421,8 +421,11 @@ function renderAccounts(list) {
       : (s.credits_total > 0
         ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
         : Math.round((s.credits || 0) / maxCred * 100));
-    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
-    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+    // 成本台账 tooltip（model_costs）：每模型实测单价，运维据此看「为什么总选它」
+    // ——免费号垄断 / 单价排序一眼可见。
+    // 分层判据是 last_per_1k（最近一次原始观测），cost_per_1k 是 EMA 平滑值：
+    // 两者不一致时（付费后长期免费，EMA 只剩衰减尾巴）以 last_per_1k 为准，
+    // 并把 EMA 作为旁证附上，避免面板显示"收费"而选号实际按"免费"处理。
     let credTip;
     if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
     else if (s.credits_total > 0) {
@@ -431,8 +434,13 @@ function renderAccounts(list) {
     } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
-      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
-        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+      credTip += '\n实测单价（credits/1K，判层取最近一次观测）：\n' + costs.map(c => {
+        const last = (c.last_per_1k === undefined || c.last_per_1k === null) ? null : c.last_per_1k;
+        const eff = last === null ? c.cost_per_1k : last;
+        const tail = (last !== null && last <= 0 && c.cost_per_1k > 0)
+          ? '（EMA ' + c.cost_per_1k + '）' : '';
+        return '  ' + c.model + '：' + (eff <= 0 ? '免费' : eff) + tail;
+      }).join('\n');
     }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};

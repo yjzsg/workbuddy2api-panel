@@ -143,12 +143,16 @@ type RateLimitedModel struct {
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
-// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
-// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+// tier 不单独落字段：分层由 last_per_1k（缺失时回退 cost_per_1k）推出——≤0 即
+// tier 0（免费），> 0 即 tier 2（收费），无观测即 tier 1——避免双表示漂移。
 type ModelCostStatus struct {
 	Model string `json:"model"`
-	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	// CostPer1k 实测每千 token 单价（EMA 平滑值，仅供排序/对照，**不用于分层**）。
 	CostPer1k float64 `json:"cost_per_1k"`
+	// LastPer1k 最近一次原始观测单价（**分层判定依据**，nil = 旧数据未记录）。
+	// 与 cost_per_1k 的差异是排查「为什么它被判收费」的关键证据：
+	// cost_per_1k 是衰减尾巴时，last_per_1k 才是最近一次真实扣费值。
+	LastPer1k *float64 `json:"last_per_1k,omitempty"`
 	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
 	LastSeen time.Time `json:"last_seen"`
 	// Samples 累计观测次数（EMA 收敛度参考）。
@@ -544,7 +548,10 @@ type stateModelCooldown struct {
 // 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
 // JSON 浮点原样保留，往返不引入漂移）。
 type stateModelCost struct {
-	CostPer1k float64   `json:"cost_per_1k"`
+	CostPer1k float64 `json:"cost_per_1k"`
+	// LastPer1k 最近一次原始观测单价（分层判定依据，见 modelCostEntry.LastPer1k）。
+	// 旧 state.json 无此字段 → nil → 恢复侧回退 EMA 判层，行为与升级前一致。
+	LastPer1k *float64  `json:"last_per_1k,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
 	Samples   int       `json:"samples,omitempty"`
 }
@@ -556,9 +563,35 @@ const modelCostTTL = 6 * time.Hour
 
 // modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
+	// CostPer1k EMA 平滑单价（历史加权，供层内排序与 /status 展示；**不用于分层判定**）。
 	CostPer1k float64
+	// LastPer1k 最近一次**原始**观测单价，分层判定以此为准；nil = 旧数据未记录该字段。
+	//
+	// 为什么不能只靠 EMA 判层（2026-10-21 生产实测）：EMA 是正数的几何衰减
+	// （prev×0.7 + per1k×0.3），只无限逼近 0 而永不等于 0；而分层判据是精确比较
+	// `CostPer1k <= 0`。于是「付过一次费 → 之后长期免费」的号会永久停在 tier 2
+	// （实测某号衰减到 3.66e-9 credits/1k 仍被判收费，且反向迁移在数学上不可能
+	// 发生，只能等 6h TTL 过期退回 tier 1）。原始观测是「上一次真实扣费」的无偏
+	// 证据，免费↔收费可双向翻转，正是分层需要的语义。
+	LastPer1k *float64
 	LastSeen  time.Time
 	Samples   int
+}
+
+// tier 成本分层：0 = 实测免费，2 = 实测收费，并返回层内排序用单价。
+// （tier 1「无观测」由 modelCostOf 的 ok=false 表达，不在此返回。）
+// 判据优先 LastPer1k；旧 state.json 无该字段时回退 EMA，使恢复前后的判定不变。
+func (mc modelCostEntry) tier() (int, float64) {
+	if mc.LastPer1k != nil {
+		if *mc.LastPer1k <= 0 {
+			return 0, 0
+		}
+		return 2, mc.CostPer1k
+	}
+	if mc.CostPer1k <= 0 {
+		return 0, 0
+	}
+	return 2, mc.CostPer1k
 }
 
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。**已持久化**（stateAccount.ModelCooldowns

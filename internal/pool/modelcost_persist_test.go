@@ -162,19 +162,24 @@ func TestModelCostFreeTierEndedLog(t *testing.T) {
 // TestModelCostRestoreDropsInvalid 恢复侧非法值剔除：负 per1k / 零 LastSeen
 // 的结构破损条目剔除不污染账本（手工脏 state.json 防御）；损坏更重的整个
 // 文件非法 JSON 已由 load() 静默跳过（既有行为，不崩溃）。
+//
+// 2026-10-21 起新增一类剔除：**旧口径条目**（无 last_per_1k，即判层依据改成
+// 原始观测之前落盘的）不恢复——那批数据同时受 -sg 误记与 EMA 单向门污染，
+// 留着会让「单号垄断」重启即复现。合法条目必须带 last_per_1k。
 func TestModelCostRestoreDropsInvalid(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
-	// 手工构造：合法条目 + 负单价 + 零 LastSeen（三种形态并存）。
+	// 手工构造：合法条目 + 负单价 + 零 LastSeen + 旧口径（无 last_per_1k）。
 	negative := -0.5
 	state := map[string]any{
 		"accounts": map[string]any{
 			"u1": map[string]any{
 				"credits": 100,
 				"model_costs": map[string]any{
-					"valid":   map[string]any{"cost_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 3},
-					"neg":     map[string]any{"cost_per_1k": negative, "last_seen": time.Now().Format(time.RFC3339Nano)},
-					"nolast":  map[string]any{"cost_per_1k": 2.0},
+					"valid":  map[string]any{"cost_per_1k": 1.5, "last_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 3},
+					"neg":    map[string]any{"cost_per_1k": negative, "last_per_1k": negative, "last_seen": time.Now().Format(time.RFC3339Nano)},
+					"nolast": map[string]any{"cost_per_1k": 2.0, "last_per_1k": 2.0},
+					"legacy": map[string]any{"cost_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 9},
 				},
 			},
 		},
@@ -193,6 +198,9 @@ func TestModelCostRestoreDropsInvalid(t *testing.T) {
 	}
 	if _, ok := modelCostSnapshot(p, "u1", "nolast"); ok {
 		t.Error("零 LastSeen 条目应剔除（结构破损）")
+	}
+	if _, ok := modelCostSnapshot(p, "u1", "legacy"); ok {
+		t.Error("旧口径条目（无 last_per_1k）应剔除（判层依据已变更，一次性迁移）")
 	}
 }
 
