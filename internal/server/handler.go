@@ -188,6 +188,15 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// MiniMax 原生路径兼容（2026-10-21）：New API 的「MiniMax」渠道类型不走 OpenAI 路径，
+	// 而是把上游 URL 拼成 <base>/v1/text/chatcompletion_v2（new-api relay/channel/minimax/
+	// relay-minimax.go:23）；其请求体是原样透传的 OpenAI 结构（ConvertOpenAIRequest 直接
+	// return request），响应也交给 openai.Adaptor.DoResponse 解析（adaptor.go:136）——
+	// 即除 URL 之外全是 OpenAI 语义。故这里只需认这个路径，行为与 /v1/chat/completions
+	// 完全一致，不需要任何格式转换。
+	// 不认这条路径时的现象：客户端在 New API 里选 MiniMax 类型/分组即 404 page not found，
+	// 选 OpenAI/DeepSeek 类型则正常。
+	h.mux.HandleFunc("POST /v1/text/chatcompletion_v2", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
@@ -211,7 +220,7 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isChatCompletionPath(r.URL.Path) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -231,6 +240,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// isChatCompletionPath 判断是否为「对话补全」入口路径。
+//
+// 两条路径等价（见 NewHandler 里 MiniMax 原生路径的注释）。请求日志钩子必须一视同仁，
+// 否则从 New API 的 MiniMax 渠道进来的流量在 request-logs 里完全不可见，排障时会被
+// 误判成「上游根本没打过来」。
+func isChatCompletionPath(p string) bool {
+	return p == "/v1/chat/completions" || p == "/v1/text/chatcompletion_v2"
 }
 
 // keyCtxKey context 中承载"本次请求命中的密钥"的键。
