@@ -531,7 +531,19 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
 
 // CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
 // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
+//
+// 配了 cooldown.credit_exhausted（分钟级时长）时不走这里：改用**软冷却**只退出
+// 那一段，到期即回到候选池（issue #78「不要薅完积分就冷却一整天」）。软冷却时长就是
+// 配置值、不做指数堆加（见 Cooldown 的说明），所以它**不会**被连续触发拉长。
+// [移植自根上游 c5fc618]
 func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
+	p.mu.RLock()
+	short := p.creditExhausted
+	p.mu.RUnlock()
+	if short > 0 {
+		p.Cooldown(uid, CoolSoft, short, reason)
+		return
+	}
 	now := time.Now()
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }

@@ -436,6 +436,11 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `cooldown.credit_exhausted` | 空 | **积分耗尽后的冷却时长**（如 `10m`）。空 = 旧行为：402 / 余额耗尽硬冷却到次日 04:00（等签到回血）；配了就改走**软冷却**只退出这一段，到期回池（用户可能期间充值、上游可能刷新额度，挂一整天是浪费）。负值 / 不可解析启动报错 |
+| `schedule.jitter_minutes` | `0` | **触发时刻抖动窗口**（分钟，`0` = 精确整点）。各类任务缺省都精确落在整点，于是所有部署在同一秒打上游；设正值后每类任务在该窗口内取一个**确定性**偏移（同一任务/同天/同小时永远同一偏移，重启不会重复派发），把负载摊开。上限 1440 |
+| `schedule.jitter_salt` | 空 | 抖动散列的实例盐：让**同配置的不同部署**错开；空 = 与引入前逐字一致 |
+| `schedule.account_delay_min_seconds` / `_max_seconds` | `0` / `0` | 排程遍历时给账号间最小间隔（原固定 800ms）追加的随机秒数，需 `0 ≤ min ≤ max ≤ 600`；`max=0` 关闭。只作用于排程遍历，手动补跑不受影响 |
+| `schedule.random_delay_minutes` | `0` | 把每个每日档位在其小时窗口内摊开（`0–60`）。与 `jitter_minutes` 语义不同：后者是「整点后偏移」，这里是「在小时内取时刻」（sha256 确定性派生，重启稳定） |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
@@ -486,7 +491,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_CREDIT_EXHAUSTED`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
 

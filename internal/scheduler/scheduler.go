@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,29 @@ type Config struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
+
+	// JitterMinutes 触发时刻抖动窗口（分钟，0 = 关闭 = 精确整点）。
+	//
+	// 各类任务的触发时刻默认精确落在整点（迁移自系统 crontab 的 `0 9 * * *` 语义），
+	// 于是所有部署都在同一秒打上游，形成对齐的突发——对 WAF 不友好。设为正值后，
+	// 每类任务的触发时刻在该窗口内取一个**确定性**偏移（同一任务、同一天、同一小时
+	// 永远得到同一个偏移，见 jitterOffset），把负载摊开。
+	JitterMinutes int
+	// JitterSalt 实例盐（参与抖动偏移散列）：上游默认散列种子只有「任务类 + 名义
+	// 时点」，不含实例身份，同配置的不同部署会算出同一个偏移。留空 = 与引入前逐字
+	// 一致（零行为变化）。[移植自根上游 29b5d0d]
+	JitterSalt string
+	// AccountDelayMinSeconds / AccountDelayMaxSeconds 排程遍历时给账号间最小间隔追加的
+	// 随机秒数（0 ≤ min ≤ max ≤ 600；max=0 = 关闭，逐字保持原固定间隔）。只作用于
+	// 排程遍历，手动补跑（RunXxxNow）不受影响。[移植自根上游 c5fc618]
+	AccountDelayMinSeconds int
+	AccountDelayMaxSeconds int
+	// RandomDelayMinutes 把每个每日档位在其小时窗口内摊开（0–60；0 = 保持整点）。
+	// 与 JitterMinutes 语义不同：后者是「整点后偏移」，这里是「在小时内取时刻」。
+	RandomDelayMinutes int
+	// RandomDelaySeed 部署私有盐：参与 scheduledSlot 的 sha256 派生，让重启后同一
+	// slot 时刻稳定、且不同部署错开。**绝不打印**（main 用 api_key 或 auth_dir 兜底）。
+	RandomDelaySeed string
 
 	// ExpiringSoonWindow 快过期积分窗口：签到查余额时，把到期时间 <= now+window 的
 	// 套餐余额标记为"快过期"（pool 据此优先消耗，见 entry.creditsExpiring）。
@@ -179,16 +203,52 @@ type CheckinOutcome struct {
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
 var ErrBusy = errors.New("checkin already running")
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
-func nextFire(now time.Time, hours []int) time.Time {
+// jitterOffset 返回「任务类 + 名义时点」的**确定性**偏移，落在 [0, jitterMinutes) 分钟。
+//
+// 为什么必须确定性（而不是每次现摇一个随机数）：Run 主循环每一轮都重新调用 nextWake。
+// 若偏移每次不同，某个槽位触发完再重算时，新摇出的偏移仍可能落在"现在之后"——于是同一
+// 个小时被反复派发，任务重复执行。用「任务名 | 日期 | 小时」派生后，同一槽位每次算出的
+// 偏移完全一致：触发过的时点不再 After(now)，自然顺延到次日。[移植自根上游 84e367e]
+//
+// 散列用 FNV-1a：标准库自带、无状态、不引 math/rand 全局种子（那会让结果依赖调用顺序）。
+func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int, salt string) time.Duration {
+	if jitterMinutes <= 0 {
+		return 0 // 0/负数 = 不加偏移（旧行为）
+	}
+	span := time.Duration(jitterMinutes) * time.Minute
+	secs := int64(span / time.Second)
+	if secs <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	if salt != "" { // 留空时散列输入与引入盐之前逐字一致，保证零行为变化
+		_, _ = fmt.Fprintf(h, "%s|", salt)
+	}
+	// 名义时点用「日期 + 小时」参与散列：同一天同一小时的偏移固定，换一天则变。
+	_, _ = fmt.Fprintf(h, "%s|%s", kind, nominal.Format("2006-01-02T15"))
+	return time.Duration(int64(h.Sum32())%secs) * time.Second
+}
+
+// nextFire 返回 now 之后最近的一个触发时刻；hours 为本地小时（0-23）。
+//
+// jitterMinutes > 0 时给每个候选时点加上 jitterOffset 的确定性偏移（按 kind 与名义
+// 时点派生），用于把整点齐发的负载摊开。偏移只在**定下日期之后**施加：先算今天的名义
+// 时点、加偏移、若已过则改用明天的名义时点重新算偏移——否则跨日时偏移会串到错误的日期上。
+func nextFire(now time.Time, hours []int, kind taskKind, jitterMinutes int, salt string) time.Time {
 	var earliest time.Time
 	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		// 先试今天，过了再试明天（最多两天足够：明天同一小时必然在 now 之后）。
+		for d := 0; d < 2; d++ {
+			nominal := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()).
+				AddDate(0, 0, d)
+			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes, salt))
+			if !t.After(now) {
+				continue
+			}
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			break
 		}
 	}
 	return earliest
@@ -208,6 +268,66 @@ const (
 	taskDailyChat
 )
 
+// String 返回任务类的稳定名字，用作抖动/随机排程散列的种子（不要用 iota 数值：
+// 数值会随枚举顺序调整而变，名字不会，且日志里可读）。
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return "checkin"
+	case taskTravel:
+		return "travel"
+	case taskActivity:
+		return "activity"
+	case taskKeepalive:
+		return "keepalive"
+	case taskGrowth:
+		return "growth"
+	case taskCat:
+		return "cat"
+	case taskCNInvite:
+		return "cn_invite"
+	case taskDailyChat:
+		return "daily_chat"
+	}
+	return "unknown"
+}
+
+// schedParams 排程随机化参数快照：nextWake 在 schedMu 下取一份再算，避免与
+// Reconfigure 的并发写竞争。纯值传参，不持有锁。
+type schedParams struct {
+	jitterMinutes int
+	jitterSalt    string
+	randomDelay   int
+	randomSeed    string
+}
+
+// fireAt 返回某类任务在 now 之后的最近触发时刻，按配置选择随机化模式：
+//   - randomDelay > 0：scheduledSlot 在小时窗口内取确定性时刻（sha256 派生）
+//   - 否则：nextFire 的 jitterOffset（整点后偏移，fnv 派生）
+//
+// 两种都是确定性派生，重启后同一 slot 时刻稳定（理由见 jitterOffset 注释）。
+func (p schedParams) fireAt(now time.Time, hours []int, kind taskKind) time.Time {
+	if p.randomDelay > 0 {
+		var earliest time.Time
+		for _, h := range hours {
+			for d := 0; d < 2; d++ {
+				day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).
+					AddDate(0, 0, d)
+				at := scheduledSlot(day, h, kind, p.randomDelay, p.randomSeed)
+				if !at.After(now) {
+					continue
+				}
+				if earliest.IsZero() || at.Before(earliest) {
+					earliest = at
+				}
+				break
+			}
+		}
+		return earliest
+	}
+	return nextFire(now, hours, kind, p.jitterMinutes, p.jitterSalt)
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -223,6 +343,12 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	cnInviteCode, cnInviteHours, cnInviteUntil := s.cfg.CNInviteCode, s.cfg.CNInviteHours, s.cfg.CNInviteUntil
 	cnInviteOff := s.cfg.CNInviteDisabled
 	dailyChatHours, dailyChatOff := s.cfg.DailyChatHours, s.cfg.DailyChatDisabled
+	sp := schedParams{
+		jitterMinutes: s.cfg.JitterMinutes,
+		jitterSalt:    s.cfg.JitterSalt,
+		randomDelay:   s.cfg.RandomDelayMinutes,
+		randomSeed:    s.cfg.RandomDelaySeed,
+	}
 	s.schedMu.Unlock()
 
 	type slot struct {
@@ -231,28 +357,28 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	var slots []slot
 	if !checkinOff {
-		slots = append(slots, slot{nextFire(now, checkinHours), taskCheckin})
+		slots = append(slots, slot{sp.fireAt(now, checkinHours, taskCheckin), taskCheckin})
 	}
 	if !travelOff {
-		slots = append(slots, slot{nextFire(now, travelHours), taskTravel})
+		slots = append(slots, slot{sp.fireAt(now, travelHours, taskTravel), taskTravel})
 	}
 	if !activityOff {
-		slots = append(slots, slot{nextFire(now, activityHours), taskActivity})
+		slots = append(slots, slot{sp.fireAt(now, activityHours, taskActivity), taskActivity})
 	}
 	if !keepaliveOff {
-		slots = append(slots, slot{nextFire(now, keepaliveHours), taskKeepalive})
+		slots = append(slots, slot{sp.fireAt(now, keepaliveHours, taskKeepalive), taskKeepalive})
 	}
 	if !growthOff {
-		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
+		slots = append(slots, slot{sp.fireAt(now, growthHours, taskGrowth), taskGrowth})
 	}
 	if !catOff {
-		slots = append(slots, slot{nextFire(now, catHours), taskCat})
+		slots = append(slots, slot{sp.fireAt(now, catHours, taskCat), taskCat})
 	}
 	if !cnInviteOff && cnInviteCode != "" && cnInviteInWindow(now, cnInviteUntil) {
-		slots = append(slots, slot{nextFire(now, cnInviteHours), taskCNInvite})
+		slots = append(slots, slot{sp.fireAt(now, cnInviteHours, taskCNInvite), taskCNInvite})
 	}
 	if !dailyChatOff {
-		slots = append(slots, slot{nextFire(now, dailyChatHours), taskDailyChat})
+		slots = append(slots, slot{sp.fireAt(now, dailyChatHours, taskDailyChat), taskDailyChat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -381,6 +507,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
 // 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	// 排程遍历标记：accountGap 只对本 ctx 派生的调用加账号间随机抖动；
+	// 手动入口（RunXxxNow，走 context.Background()）不带此标记、保持原固定节奏。
+	ctx = context.WithValue(ctx, scheduledAccountKey{}, true)
 	var wg sync.WaitGroup
 	for _, k := range kinds {
 		wg.Add(1)
@@ -607,7 +736,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
-			if !sleepCtx(ctx, activityAccountDelay) {
+			if !sleepCtx(ctx, s.accountGap(ctx, activityAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
 		}

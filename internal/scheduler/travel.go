@@ -90,7 +90,7 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			continue // 企业版门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 		if !first {
-			if !sleepCtx(ctx, travelAccountDelay) {
+			if !sleepCtx(ctx, s.accountGap(ctx, travelAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再巡
 			}
 		}

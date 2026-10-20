@@ -66,6 +66,11 @@ type Config struct {
 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		// CreditExhausted 积分耗尽后的冷却时长（如 "10m"）。空 = 旧行为：硬冷却到
+		// 次日 04:00（等签到恢复）；配了就只退出这一小段，到期回到候选池
+		// （issue #78）。负值/不可解析在启动期报错，不静默放行。
+		// [移植自根上游 c5fc618 / 上游 ef292ddd]
+		CreditExhausted string `json:"credit_exhausted"`
 	} `json:"cooldown"`
 
 	Schedule struct {
@@ -128,6 +133,26 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// JitterMinutes 触发时刻抖动窗口（分钟，0 = 关闭 = 精确整点）。
+		//
+		// 各类任务的触发时刻默认精确落在整点（迁移自系统 crontab 的 `0 9 * * *` 语义），
+		// 于是所有部署都在同一秒打上游。设为正值后，每类任务的触发时刻在该窗口内取一个
+		// **确定性**偏移（同一任务/同一天/同一小时永远同一偏移，重启不重复派发），
+		// 把负载摊开、对 WAF 更友好。[移植自根上游 84e367e]
+		JitterMinutes int `json:"jitter_minutes"`
+		// JitterSalt 实例盐：参与抖动散列，让**同配置的不同部署**错开。空 = 与上游
+		// 逐字一致（零行为变化）。[移植自根上游 29b5d0d]
+		JitterSalt string `json:"jitter_salt"`
+		// AccountDelayMinSeconds / AccountDelayMaxSeconds 排程遍历时给账号间最小间隔
+		// 追加的随机秒数（0 ≤ min ≤ max ≤ 600；max=0 = 关闭）。只作用于排程遍历，
+		// 手动补跑不受影响。[移植自根上游 c5fc618]
+		AccountDelayMinSeconds int `json:"account_delay_min_seconds"`
+		AccountDelayMaxSeconds int `json:"account_delay_max_seconds"`
+		// RandomDelayMinutes 把每个每日档位在其小时窗口内摊开（0–60；0 = 保持整点）。
+		// 与 jitter_minutes 的「整点后偏移」是两种语义，可各自开关。
+		// [移植自根上游 c5fc618]
+		RandomDelayMinutes int `json:"random_delay_minutes"`
 	} `json:"schedule"`
 
 	// Admin 运维管理端点开关（issue #138/#118）。默认**关闭**：管理能力默认不暴露，
@@ -265,6 +290,9 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// CreditExhaustedDur 解析后的积分耗尽冷却时长（issue #78）；0 = 不启用
+	// （保持「硬冷却到次日 04:00」的旧行为）。
+	CreditExhaustedDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -494,6 +522,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_CREDIT_EXHAUSTED"); v != "" {
+		c.Cooldown.CreditExhausted = v
+	}
 	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Admin.Enabled = b
@@ -578,6 +609,20 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 积分耗尽后的冷却时长（issue #78）：空 = 保持「硬冷却到次日 04:00」的旧行为；
+	// 填了必须是正时长（负值会让冷却立即到期，等于没冷却——与其静默放行，不如报错）。
+	if v := strings.TrimSpace(c.Cooldown.CreditExhausted); v == "" {
+		c.CreditExhaustedDur = 0
+	} else {
+		d, perr := time.ParseDuration(v)
+		if perr != nil {
+			return fmt.Errorf("cooldown.credit_exhausted: %w", perr)
+		}
+		if d <= 0 {
+			return fmt.Errorf("cooldown.credit_exhausted: must be a positive duration, got %q", v)
+		}
+		c.CreditExhaustedDur = d
 	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
@@ -681,6 +726,27 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.GrowthHours) == 0 {
 		c.Schedule.GrowthHours = []int{1}
+	}
+	// 排程随机化（移植自根上游 84e367e / 29b5d0d / c5fc618）：0 一律是「关闭」这一
+	// 合法哨兵，**不做缺省回落**（回落会把显式关闭悄悄打开）；非法值启动期报错。
+	//   - jitter_minutes：整点后确定性偏移；负值无合理语义，>1440 会把当天那次推到次日。
+	//   - account_delay_*：账号间随机抖动秒，须 0 ≤ min ≤ max ≤ 600（十分钟足够摊开，
+	//     再长会把一趟遍历拖成小时级）。
+	//   - random_delay_minutes：档位在小时内摊开，0–60（>60 会跨进下一档，与下一小时撞车）。
+	if c.Schedule.JitterMinutes < 0 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 不得为负；0 = 关闭抖动（精确整点）", c.Schedule.JitterMinutes)
+	}
+	if c.Schedule.JitterMinutes > 1440 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 过大（上限 1440 分钟 = 一天）；"+
+			"抖动窗口必须小于 24h，否则当天那次任务会被整体推到次日", c.Schedule.JitterMinutes)
+	}
+	if c.Schedule.AccountDelayMinSeconds < 0 || c.Schedule.AccountDelayMaxSeconds > 600 ||
+		c.Schedule.AccountDelayMaxSeconds < c.Schedule.AccountDelayMinSeconds {
+		return fmt.Errorf("schedule.account_delay_min_seconds/account_delay_max_seconds: 需满足 0 <= min <= max <= 600，got min=%d max=%d",
+			c.Schedule.AccountDelayMinSeconds, c.Schedule.AccountDelayMaxSeconds)
+	}
+	if c.Schedule.RandomDelayMinutes < 0 || c.Schedule.RandomDelayMinutes > 60 {
+		return fmt.Errorf("schedule.random_delay_minutes: %d 越界（0-60；0 = 保持整点）", c.Schedule.RandomDelayMinutes)
 	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {

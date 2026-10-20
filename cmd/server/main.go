@@ -126,6 +126,8 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	// 积分耗尽短冷却（issue #78）：0 = 保持「硬冷却到次日 04:00」的旧行为。
+	p.SetCreditExhausted(cfg.CreditExhaustedDur) // cooldown.credit_exhausted
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetRealmWeight(cfg.Pool.RealmWeightDecay, cfg.Pool.RealmWeightFloor, cfg.Pool.RealmWeightRecover, cfg.Pool.RealmWeightMaxRatio) // (模型,域) 动态权重
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur)                                                                              // costTier 探索窗口（issue #136，默认 30m；0 关停）
@@ -201,6 +203,13 @@ func main() {
 	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
 
+	// 排程随机化散列种子：用 APIKey（部署间天然唯一），退回 auths 目录名；都空则空串
+	// ——种子为空仍确定（同一部署重启节奏不变），只是不同部署会算到同一偏移。
+	schedSeed := cfg.APIKey
+	if schedSeed == "" {
+		schedSeed = cfg.AuthDir
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -223,6 +232,14 @@ func main() {
 		GrowthHours:         cfg.Schedule.GrowthHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
+		// 排程随机化（移植自根上游 84e367e / 29b5d0d / c5fc618）。0 一律 = 关闭，
+		// 与既有「精确整点」行为逐字一致；配置侧的校验在 config.normalize 里做。
+		JitterMinutes:          cfg.Schedule.JitterMinutes,
+		JitterSalt:             cfg.Schedule.JitterSalt,
+		AccountDelayMinSeconds: cfg.Schedule.AccountDelayMinSeconds,
+		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
+		RandomDelayMinutes:     cfg.Schedule.RandomDelayMinutes,
+		RandomDelaySeed:        schedSeed,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
