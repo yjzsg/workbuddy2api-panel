@@ -26,13 +26,20 @@ func cooled(t *testing.T, p *Pool, uid string) (CoolKind, time.Time) {
 func TestCreditExhaustedDefaultHard(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
+	// Cooldown 内部再取一次 time.Now() 算 until，故到期时刻带亚秒漂移；
+	// 只比到秒，并同时给出调用前后两个下界，跨 04:00 边界也不会误报。
+	before := time.Now()
 	p.CooldownUntilTomorrow4AM("u1", "credit exhausted")
+	after := time.Now()
 	kind, until := cooled(t, p, "u1")
 	if kind != CoolHard {
 		t.Errorf("kind=%v want CoolHard（未配置 credit_exhausted 时行为不变）", kind)
 	}
-	if want := nextDay4AM(time.Now()); !until.Equal(want) {
-		t.Errorf("until=%v want %v", until, want)
+	got := until.Truncate(time.Second)
+	wantBefore := nextDay4AM(before).Truncate(time.Second)
+	wantAfter := nextDay4AM(after).Truncate(time.Second)
+	if !got.Equal(wantBefore) && !got.Equal(wantAfter) {
+		t.Errorf("until=%v want %v（±1s 容差）", got, wantBefore)
 	}
 }
 
