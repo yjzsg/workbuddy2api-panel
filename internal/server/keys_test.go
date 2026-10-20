@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -440,5 +442,52 @@ func TestKeyThinkingOverride(t *testing.T) {
 	obj = <-captured
 	if _, has := obj["thinking"]; has {
 		t.Errorf("非 deepseek 模型不应被塞 thinking 字段，实际 %v", obj["thinking"])
+	}
+}
+
+// TestModelWhitelistRejectionIsLogged 白名单拒绝必须自己打一行 WARN。
+//
+// 这条判定在 newChatStat 之前就 return（不消耗上游、不产流水行），所以日志里
+// 本来完全没有痕迹——2026-10-20 实案：New API 渠道填错密钥，minimax 一律 403，
+// 网关日志 grep 不到任何相关记录，误判成「请求没到网关」。
+//
+// 同时守住边界：日志只能带密钥名，不能带 secret。
+func TestModelWhitelistRejectionIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	called := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		called++
+		return 200, tinySSE, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Keys:     keysStore(t, "pixel-ds", "sk-ds-secret", []string{"deepseek-v4.1-flash"}),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"minimax-m3.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-ds-secret")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("白名单外 code=%d want 403, body=%s", rec.Code, rec.Body)
+	}
+	if called != 0 {
+		t.Fatalf("拒绝的请求不应触达上游，实际 %d 次", called)
+	}
+	out := buf.String()
+	for _, want := range []string{"request rejected before dispatch", "minimax-m3.1-flash", "pixel-ds", "model_not_allowed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("拒绝日志缺少 %q:/n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "sk-ds-secret") {
+		t.Fatalf("日志泄漏了密钥 secret:/n%s", out)
 	}
 }

@@ -251,6 +251,26 @@ func keyFromReq(r *http.Request) *apikeys.Key {
 	return nil
 }
 
+// keyLogLabel 日志里的密钥标识：名称(完整 ID)，缺一项就用另一项，都缺为 "?"。
+//
+// 刻意不带 secret：日志会落到容器 stdout、也可能被面板/归档读走，
+// 密钥本身在 keys.json 里是明文，绝不能再复制一份到日志。
+func keyLogLabel(k *apikeys.Key) string {
+	if k == nil {
+		return "?"
+	}
+	name := strings.TrimSpace(k.Name)
+	switch {
+	case name != "" && k.ID != "":
+		return name + "(" + k.ID + ")"
+	case name != "":
+		return name
+	case k.ID != "":
+		return k.ID
+	}
+	return "?"
+}
+
 // keyIDOf 取本次请求命中的密钥 ID；无密钥上下文时返回空串。
 //
 // 空串在 usage 侧是合法的"未标记"维度：引入多密钥之前的旧记录也是空串，
@@ -814,6 +834,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 刻意放在 modelRate 查询之前：被白名单拒绝的请求不该产生任何上游/池副作用。
 	// 注意白名单比对的是**别名改写后**的名字（面板勾的也是真实模型名）。
 	if apiKey != nil && !apiKey.AllowsModel(realm, bareModel) {
+		// 这条拒绝发生在 newChatStat 之前（不消耗上游、不进流水行），所以必须在这里
+		// 自己打一行——否则日志里**完全看不到**这类请求。
+		// 2026-10-20 实案：New API 渠道填错密钥，minimax 一律 403 静默，
+		// grep 日志只有别处的 200，误判成「请求根本没到网关」，多绕了一圈。
+		// 只打模型/密钥名/IP，绝不打 secret。
+		src := "-"
+		if tr := requestTraceFrom(r); tr != nil && tr.clientIP != "" {
+			src = tr.clientIP
+		}
+		log.Printf("WARN: [server] request rejected before dispatch: model=%s key=%s reason=model_not_allowed src=%s",
+			peek.Model, keyLogLabel(apiKey), src)
 		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
 			"model "+peek.Model+" is not allowed for this API key")
 		return
