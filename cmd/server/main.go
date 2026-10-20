@@ -420,6 +420,11 @@ func main() {
 	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
 	go warmModelRates(ctx, up, p)
 
+	// 被封账号自动探测恢复：上游 11140「账号存在异常行为」是账号级、有时限的限制
+	// （token 未失效、账务接口照常，官方客户端同样不可用），重登无效，只能等解除。
+	// 这里每 30 分钟对这类账号发一次 1-token 探测，200 即自动回池。
+	go startBannedReviveProbe(ctx, p, up)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
