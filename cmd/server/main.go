@@ -89,8 +89,19 @@ func main() {
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
-	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
-	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	// 粘性会话存储：配了 Upstash 走 Redis；否则落本地文件。
+	//
+	// 为什么不再退化为纯内存（2026-10-20）：每次重启都丢光粘性绑定 → 会话重新哈希到
+	// 别的账号 → 上游前缀缓存按 uid 隔离 → 活跃的大上下文全部重算。实测一次重启让
+	// 3 条 400k+ 请求命中率掉到 0.4~2.8%、TTFB 9.8~10.9s（正常 99.8% / 3.3s）。
+	// 文件版语义与 Redis 版一致（LoadBinds 启动恢复），只是介质换成本地盘。
+	var store redisstore.Store
+	if cfg.Upstash.URL != "" {
+		store = redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	} else {
+		bindFile := filepath.Join(filepath.Dir(cfg.StateFile), "session_binds.json")
+		store = redisstore.NewFileStore(bindFile)
+	}
 
 	p := pool.New(cfg.StateFile)
 	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（消除 goroutine 泄漏）
