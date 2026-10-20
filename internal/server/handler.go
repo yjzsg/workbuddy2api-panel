@@ -551,6 +551,39 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
+// addListingCompat 补上第三方模型目录客户端要读的能力字段（上游 issue #156：Magpie）。
+// [移植自根上游 b262660 / 上游 68c08d13]
+//
+// 它们不看我们自己的 supports_images / reasoning_supported_efforts，只看
+// `modalities.input` 里有没有 "image"、以及 `supported_reasoning_levels` 里每项的
+// `effort`。我们的字段是既有约定（面板与别的客户端在用），所以这里**只增不改**：
+// 两边同时输出，谁都能读。模型 ID 上的 cn:/global: 前缀保持不变——它区分版本，
+// 不能为了目录兜底而抹掉。
+func addListingCompat(entry map[string]any) map[string]any {
+	if entry["supports_images"] == true {
+		entry["modalities"] = map[string]any{"input": []string{"text", "image"}}
+	}
+	var efforts []string
+	switch raw := entry["reasoning_supported_efforts"].(type) {
+	case []string:
+		efforts = raw
+	case []any:
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				efforts = append(efforts, s)
+			}
+		}
+	}
+	if len(efforts) > 0 {
+		levels := make([]map[string]any, 0, len(efforts))
+		for _, e := range efforts {
+			levels = append(levels, map[string]any{"effort": e})
+		}
+		entry["supported_reasoning_levels"] = levels
+	}
+	return entry
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
@@ -603,7 +636,7 @@ func (h *Handler) modelList() []map[string]any {
 				entry["reasoning_default_effort"] = def
 			}
 		}
-		out = append(out, entry)
+		out = append(out, addListingCompat(entry))
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 探测结果（fetchGlobalModels 纯动态，失败/无号 → 空）；无 global 账号时
@@ -654,7 +687,7 @@ func (h *Handler) modelList() []map[string]any {
 					entry["reasoning_default_effort"] = def
 				}
 			}
-			out = append(out, entry)
+			out = append(out, addListingCompat(entry))
 		}
 	}
 	return out
