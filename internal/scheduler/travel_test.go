@@ -492,3 +492,78 @@ func TestTravelDayAlignsCST(t *testing.T) {
 		}
 	}
 }
+
+// newGlobalAuth 造一个 global 域账号（Realm() == "global"）。
+func newGlobalAuth(t *testing.T, uid string) *auth.Auth {
+	t.Helper()
+	a := &auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor(global): %v", err)
+	}
+	if a.Realm() != "global" {
+		t.Fatalf("realm=%q want global（globalEnabled 可能被关）", a.Realm())
+	}
+	return a
+}
+
+// TestTravelOneSkipsGlobalRealm global 域任务目录无 first_buddy 任务（buddy/first 恒 400），
+// 旅行状态机整体跳过：连 buddy/info 都不发，省掉每号每天两次无效上游调用。
+func TestTravelOneSkipsGlobalRealm(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	s.travelOne(newGlobalAuth(t, "g1"))
+
+	if n := stub.infoCalls.Load(); n != 0 {
+		t.Errorf("buddy/info calls=%d want 0（global 域跳过旅行）", n)
+	}
+	if n := stub.firstCalls.Load(); n != 0 {
+		t.Errorf("buddy/first calls=%d want 0（global 域不领养）", n)
+	}
+	if n := stub.agreeCalls.Load(); n != 0 {
+		t.Errorf("buddy/agreement calls=%d want 0（global 域不领养）", n)
+	}
+}
+
+// TestTravelAdoptForceSkipsGlobalRealm 活跃上报后的强制领养对 global 域同样跳过。
+func TestTravelAdoptForceSkipsGlobalRealm(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	s.travelAdoptForce(newGlobalAuth(t, "g1"))
+
+	if n := stub.infoCalls.Load(); n != 0 {
+		t.Errorf("buddy/info calls=%d want 0（global 域连 buddy-info 都不查）", n)
+	}
+	if n := stub.firstCalls.Load(); n != 0 {
+		t.Errorf("buddy/first calls=%d want 0", n)
+	}
+}
+
+// TestTravelOneStillAdoptsCNRealm 对照组：cn 域行为不变（无猫 → 同意协议 + 领养）。
+func TestTravelOneStillAdoptsCNRealm(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1")
+	a := &auth.Auth{UID: "c1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	if a.Realm() != "cn" {
+		t.Fatalf("realm=%q want cn", a.Realm())
+	}
+	s.travelOne(a)
+
+	if n := stub.infoCalls.Load(); n != 1 {
+		t.Errorf("buddy/info calls=%d want 1", n)
+	}
+	if n := stub.firstCalls.Load(); n != 1 {
+		t.Errorf("buddy/first calls=%d want 1", n)
+	}
+}

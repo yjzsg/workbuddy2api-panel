@@ -99,8 +99,25 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 	}
 }
 
+// travelSupported 该账号所在域是否支持养猫 / 旅行。
+//
+// 2026-10-21 实证：global 域（www.workbuddy.ai）任务目录里**没有** first_buddy
+// 任务（只有 first_chat / skill_installed / wechat_linked / expert_summoned /
+// template_used 五个 onboarding 任务，accept 返回 task not found），而 buddy/first
+// 恒返回 400 `first_buddy task not completed yet (need at least one conversation)`。
+// 全量核对：cn 6/6 有猫（如 红花 的「摸鱼喵」），global 0/35 有猫。故 global 域
+// 整体不做旅行与领养，省掉每号每天两次无效上游调用与 35 条日志噪音。
+// 若上游日后对 global 放开（任务目录出现 first_buddy 且门槛能过），删掉本函数
+// 与两处调用即可恢复。
+func travelSupported(a *auth.Auth) bool {
+	return a.Realm() != "global"
+}
+
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
 func (s *Scheduler) travelOne(a *auth.Auth) {
+	if !travelSupported(a) {
+		return
+	}
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
@@ -164,6 +181,9 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 // 对话量补满——此时是「门槛刚达成」的新状态，不算对上游重试轰炸，放行重试。
 // 有猫账号 BuddyInfo 非空时直接跳过（不重复领养）。
 func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
+	if !travelSupported(a) {
+		return // global 域无 first_buddy 任务，连 buddy-info 都不必查
+	}
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("activity %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
@@ -179,6 +199,9 @@ func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
 // conversation 门槛未达标（HTTP 400 first_buddy task not completed yet）属预期行为，
 // 记一次当日已试后静默跳过，不再重试。force=true 时豁免当日防抖（活跃上报补满对话量后重试）。
 func (s *Scheduler) adoptBuddy(a *auth.Auth, force bool) {
+	if !travelSupported(a) {
+		return // global 域无 first_buddy 任务，领养必然 400（见 travelSupported）
+	}
 	if !force && s.adoptTriedToday(a.UID) {
 		return
 	}
