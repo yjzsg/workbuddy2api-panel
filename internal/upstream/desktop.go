@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -457,7 +458,6 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string, requireID boo
 	if err != nil {
 		return "", "", err
 	}
-	h := req.Header
 	// 客户端身份（沿用激活账号 / 常规 chat 出站的口径）：上游的判据是
 	// 「通过 WorkBuddy / CodeBuddy 客户端发起」，出站必须像真实客户端——
 	// 只带 UA + X-Domain 是不够的。CommonHeaders 注入 Origin / Referer /
@@ -466,18 +466,25 @@ func (c *Client) desktopChat(a *auth.Auth, model, expertID string, requireID boo
 	// 再叠 X-Device-Token（每号 auth > 全局 config > 文件，缺省不注入）与
 	// global 域的 X-No-Enterprise-Id 声明。桌面实测 UA / X-Domain / X-Product
 	// 在最后覆盖（CommonHeaders 的 UA 按 realm 切品牌段，这里统一用桌面值）。
-	c.CommonHeaders(req, a)
-	c.injectDeviceToken(req, a)
-	c.injectGlobalChatHeaders(req, a)
-	h.Set("Authorization", "Bearer "+a.AccessToken)
+	//
+	// 必须走 ChatHeaders 而非手工拼头（2026-10-21 A/B 实证）：global 上游对
+	// /v2/chat/completions 校验**整族**会话头——X-Conversation-Request-ID /
+	// X-Conversation-Message-ID / X-Root-Request-ID / X-Trace-ID / X-B3-* 缺任一
+	// 子集即 400 code=11-128「请求被拦截，请重新发送」。此前本函数手工拼头，
+	// 绕过了 injectConversationHeaders，导致 global 账号的每日对话保底任务长期
+	// 34/35 失败（cn 侧上游宽松，一直未暴露）。实测：只把 conv id 换成 UUID、
+	// 或只补单个头，仍 400；补齐整族后 200。conv id 仍用本函数生成的合成值
+	// （与头族共存实测 200），语义不变，专家链路的事件关联不受影响。
+	c.ChatHeaders(req, a, "", ChatMeta{
+		ConversationID:        conversationID,
+		ConversationRequestID: session.NewMessageID(),
+	})
+	h := req.Header
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	h.Set("User-Agent", desktopUA)
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
