@@ -14,8 +14,13 @@ import (
 
 func fmtMs(v int64) string { return strconv.FormatInt(v, 10) }
 
-// billingData 包一层 data.Response.Data 信封（doJSON 只剥最外层 code/data）。
+// billingData 真实国际版形状：业务字段直接在 data 下（2026-10-23 抓包核对）。
 func billingData(inner string) string {
+	return `{"code":0,"data":` + inner + `}`
+}
+
+// billingDataLegacy CN 风格信封（data.Response.Data）：兼容层仍需能解。
+func billingDataLegacy(inner string) string {
 	return `{"code":0,"data":{"Response":{"Data":` + inner + `}}}`
 }
 
@@ -123,7 +128,8 @@ func TestGlobalBillingFallsBackToCNPath(t *testing.T) {
 		if strings.HasSuffix(r.URL.Path, billingSummaryPath) {
 			return jsonResp(500, `{"code":10000,"msg":"no summary"}`), nil
 		}
-		return jsonResp(200, billingData(`{"Accounts":[
+		// CN 分页路径仍用 data.Response.Data 老信封，故这里必须用 Legacy 构造。
+		return jsonResp(200, billingDataLegacy(`{"Accounts":[
 			{"PackageName":"p","CycleCapacitySize":500,"CycleCapacityRemain":321,"CycleCapacityUsed":179}
 		]}`)), nil
 	})
@@ -137,6 +143,84 @@ func TestGlobalBillingFallsBackToCNPath(t *testing.T) {
 	}
 	if len(paths) < 2 || !strings.HasSuffix(paths[0], billingSummaryPath) {
 		t.Errorf("paths=%v want summary 先试再回落", paths)
+	}
+}
+
+// TestSummaryRealShape 用 2026-10-23 抓包的真实响应形状（业务字段直接在 data 下）：
+// 上一版只认 data.Response.Data，导致 Packages 恒空 ⇒ 全池 global 号 credits 被写成 0。
+func TestSummaryRealShape(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, billingSummaryPath) {
+			return jsonResp(200, billingData(`{"Packages":[
+				{"PackageCode":"TCACA_code_007","CycleTotalCapacity":"1000","CycleRemainCapacity":"1000","CapacityUnit":"credit"},
+				{"PackageCode":"TCACA_code_035","CycleTotalCapacity":"100","CycleRemainCapacity":"100","CapacityUnit":"credits"}
+			],"TotalCredits":"1100","SubscriptionPackageName":"Free","IsPaidUser":false}`)), nil
+		}
+		return jsonResp(200, billingData(`{"Accounts":[],"TotalCount":0}`)), nil
+	})
+	remain, total, _, _, _, err := c.globalUserResource(a, 0)
+	if err != nil {
+		t.Fatalf("globalUserResource: %v", err)
+	}
+	if remain != 1100 || total != 1100 {
+		t.Errorf("remain/total=%d/%d want 1100/1100（真实形状）", remain, total)
+	}
+}
+
+// TestSummaryTotalCreditsFallback Packages 为空但给了 TotalCredits 时用总账兜底。
+func TestSummaryTotalCreditsFallback(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, billingSummaryPath) {
+			return jsonResp(200, billingData(`{"Packages":[],"TotalCredits":"88"}`)), nil
+		}
+		return jsonResp(200, billingData(`{"Accounts":[],"TotalCount":0}`)), nil
+	})
+	remain, total, _, _, _, err := c.globalUserResource(a, 0)
+	if err != nil {
+		t.Fatalf("globalUserResource: %v", err)
+	}
+	if remain != 88 || total != 88 {
+		t.Errorf("remain/total=%d/%d want 88/88", remain, total)
+	}
+}
+
+// TestSummaryEmptyIsUnknown 空额度必须报错（让上层回落），不能当成「已知为 0」。
+func TestSummaryEmptyIsUnknown(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, billingSummaryPath) {
+			return jsonResp(200, billingData(`{"Packages":[],"TotalCredits":"0"}`)), nil
+		}
+		return jsonResp(200, billingData(`{"Accounts":[],"TotalCount":0}`)), nil
+	})
+	if _, _, _, _, _, err := c.globalUserResource(a, 0); err == nil {
+		t.Fatal("空额度应返回错误（未知 ≠ 0）")
+	}
+}
+
+// TestSummaryLegacyEnvelope CN 风格信封仍可解（兼容层不丢）。
+func TestSummaryLegacyEnvelope(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, billingSummaryPath) {
+			return jsonResp(200, billingDataLegacy(`{"Packages":[
+				{"PackageCode":"P","CycleTotalCapacity":"10","CycleRemainCapacity":"7"}
+			]}`)), nil
+		}
+		return jsonResp(200, billingData(`{"Accounts":[],"TotalCount":0}`)), nil
+	})
+	remain, total, _, _, _, err := c.globalUserResource(a, 0)
+	if err != nil {
+		t.Fatalf("globalUserResource: %v", err)
+	}
+	if remain != 7 || total != 10 {
+		t.Errorf("remain/total=%d/%d want 7/10（旧信封）", remain, total)
 	}
 }
 

@@ -93,25 +93,56 @@ type packageDetail struct {
 	CycleCapacityRemainPrecise flexFloat `json:"CycleCapacityRemainPrecise"`
 }
 
-// summaryReply / packagesReply 沿用 data.Response.Data 信封（doJSON 只剥掉最外层
-// code/data，业务字段在 Response.Data 下，与 CN 的 userResourceResp 同构）。
+// summaryData / packagesData 是 `data` 内层（doJSON 已剥掉 {code,msg,data} 外壳）。
+//
+// 国际版真实响应（2026-10-23 抓包核对）：
+//
+//	{"code":0,"msg":"OK","data":{"Packages":[{"PackageCode":…,"CycleRemainCapacity":"1000",…}],
+//	  "TotalCredits":"1100","SubscriptionPackageName":"Free","IsPaidUser":false}}
+//
+// 注意**没有** `Response` 那层——`Response.Data` 是 CN 老路径（userResourceResp）的形状。
+// 兼容层：两个 Reply 同时内嵌 data 与 `Response.Data`，取值先看顶层、为空再回落。
+// 上一版只认 `Response.Data` ⇒ 真实响应解出空 Packages（不报错）⇒ 全池 global 号
+// credits 被写成 0 ⇒ 积分保底把可用号当耗尽号挡出选号。
+type summaryData struct {
+	Packages                []summaryPackage `json:"Packages"`
+	TotalCredits            flexFloat        `json:"TotalCredits"`
+	SubscriptionPackageName string           `json:"SubscriptionPackageName"`
+	IsPaidUser              bool             `json:"IsPaidUser"`
+}
+
+type packagesData struct {
+	Accounts   []packageDetail `json:"Accounts"`
+	TotalCount int             `json:"TotalCount"`
+}
+
 type summaryReply struct {
 	Response struct {
-		Data struct {
-			Packages                []summaryPackage `json:"Packages"`
-			SubscriptionPackageName string           `json:"SubscriptionPackageName"`
-			IsPaidUser              bool             `json:"IsPaidUser"`
-		} `json:"Data"`
+		Data summaryData `json:"Data"`
 	} `json:"Response"`
+	summaryData
+}
+
+// pick 顶层优先，空则回落到 Response.Data（CN 风格信封）。
+func (r summaryReply) pick() summaryData {
+	if len(r.Packages) > 0 || r.TotalCredits > 0 {
+		return r.summaryData
+	}
+	return r.Response.Data
 }
 
 type packagesReply struct {
 	Response struct {
-		Data struct {
-			Accounts   []packageDetail `json:"Accounts"`
-			TotalCount int             `json:"TotalCount"`
-		} `json:"Data"`
+		Data packagesData `json:"Data"`
 	} `json:"Response"`
+	packagesData
+}
+
+func (r packagesReply) pick() packagesData {
+	if len(r.Accounts) > 0 {
+		return r.packagesData
+	}
+	return r.Response.Data
 }
 
 // globalUserResource 国际版额度查询：summary 给总额，paid/free 明细补到期批次。
@@ -130,7 +161,8 @@ func (c *Client) globalUserResource(a *auth.Auth, soon time.Duration) (remain, t
 	}
 	now := time.Now()
 	// summary 的 Packages 是「当前周期的权威用量」：remain/total 以它为准。
-	pkgs := sum.Response.Data.Packages
+	data := sum.pick()
+	pkgs := data.Packages
 	remainByCode := make(map[string]int64, len(pkgs))
 	for _, p := range pkgs {
 		r := int64(p.CycleRemainCapacity)
@@ -146,6 +178,17 @@ func (c *Client) globalUserResource(a *auth.Auth, soon time.Duration) (remain, t
 		if p.PackageCode != "" {
 			remainByCode[p.PackageCode] = r
 		}
+	}
+	// 兜底：Packages 为空但给了 TotalCredits（极少数账号只有总账没有分包），
+	// 用总账当 remain/total，避免把「有额度但没分包」解成 0。
+	if total == 0 && data.TotalCredits > 0 {
+		total = int64(data.TotalCredits)
+		remain = total
+	}
+	// 两者都为 0 ⇒ 这次没有观测到任何额度。按「未知」处理（返回错误让上层回落），
+	// 绝不写成「已知为 0」——否则一次接口形状变动就会把整池号判成耗尽号。
+	if total == 0 && remain == 0 {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("billing summary 未返回任何额度（Packages/TotalCredits 皆空）")
 	}
 
 	// 明细只为「到期批次」服务：失败不影响总额（降级为无到期提醒）。
@@ -228,7 +271,7 @@ func (c *Client) globalPackageDetails(a *auth.Auth, codes []string) []packageDet
 		if json.Unmarshal(raw, &rep) != nil {
 			continue
 		}
-		out = append(out, rep.Response.Data.Accounts...)
+		out = append(out, rep.pick().Accounts...)
 	}
 	return out
 }
