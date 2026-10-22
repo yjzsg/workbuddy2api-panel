@@ -1,5 +1,5 @@
 # [local patch] 原第1行为 # syntax=docker/dockerfile:1，已移除：NAS 镜像站 docker.fnnas.com 对该镜像返回 401；本 Dockerfile 未使用 BuildKit 专有语法
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.10-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 # [local patch] 国内网络：proxy.golang.org 不可达，改用国内模块代理（可用 --build-arg 覆盖）
