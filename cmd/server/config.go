@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Config 顶层配置。
@@ -385,7 +386,9 @@ func Load(path string) (*Config, error) {
 				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
 				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
 		}
-		raw, err := os.ReadFile(path)
+		// safefile.Read：正文坏（掉电留全 0、被截断）时回退 config.json.bak，
+		// 两边都坏才报错——单文件损坏不该让服务直接起不来。
+		raw, err := safefile.Read(path, nil)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}

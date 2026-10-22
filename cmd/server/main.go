@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -582,7 +583,16 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	// 保留上一份有效内容为 .bak：config.json 被写坏/掉电截断时，Load 的
+	// safefile.Read 能据此回退，服务不至于直接起不来。
+	if prev, rerr := os.ReadFile(path); rerr == nil && json.Valid(prev) {
+		if bakErr := safefile.Write(safefile.Bak(path), prev, 0o600); bakErr != nil {
+			log.Printf("WARN: config 备份 %s 失败: %v", safefile.Bak(path), bakErr)
+		}
+	}
+	// 先 fsync 再 rename：rename 只保证读者看到完整文件，不保证内容已落盘
+	// （掉电可能留下长度正确、内容全 0 的 config.json，下次启动直接起不来）。
+	if err := writeFileSync(tmp, out, 0o600); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -645,6 +655,24 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// writeFileSync 写文件并 fsync 后关闭。给「写临时文件 → rename」的落盘路径用：
+// rename 只保证原子可见性，不保证数据已刷盘，掉电可能留下长度正确、内容全 0 的文件。
+func writeFileSync(path string, b []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。

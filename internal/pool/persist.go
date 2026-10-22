@@ -4,7 +4,9 @@ package pool
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 var flushInterval = 5 * time.Second
@@ -129,11 +132,15 @@ func (p *Pool) Flush() {
 	p.mu.Unlock()
 }
 
-// load 从本地 state.json 读回持久化状态（无文件/解析失败静默跳过，零状态启动）。
+// load 从本地 state.json 读回持久化状态（无文件静默跳过，零状态启动）。
+// 正文坏（掉电留全 0、被截断）时 safefile 回退 state.json.bak，两边都坏才放弃。
 // New 构造时调用；恢复用 placeholder 凭证，Add/SyncToDir 时换全。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
+	raw, err := safefile.Read(p.stateFp, nil)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("pool: state.json 不可用（%v），跳过本地状态恢复: %s", err, p.stateFp)
+		}
 		return
 	}
 	var sf stateFile
@@ -291,8 +298,9 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.applyAccountsLocked(s.Accounts)
 }
 
-// saveLocked 把内存状态原子落盘（tmp + rename），并 fire-and-forget 镜像一份快照
-// 到 Redis（择新恢复备份）。失败走 notePersistFail 节流日志。调用方必须已持 p.mu。
+// saveLocked 把内存状态原子落盘（safefile：fsync 后 rename，并留 .bak），并
+// fire-and-forget 镜像一份快照到 Redis（择新恢复备份）。失败走 notePersistFail
+// 节流日志。调用方必须已持 p.mu。
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
@@ -306,12 +314,9 @@ func (p *Pool) saveLocked() {
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	// fsync 后 rename：掉电不会留下长度正确但全 0 的 state.json；替换前的有效内容
+	// 留成 state.json.bak，读到坏文件时由 safefile.Read 兜底（冷却/停牌不至于一次掉电全丢）。
+	if err := safefile.WriteKeep(p.stateFp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
 		return
 	}
