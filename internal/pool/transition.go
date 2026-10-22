@@ -86,6 +86,7 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
+	e.creditsKnown = true // 上游真实读数（含 0）
 	if e.coolKind == CoolHard {
 		e.until = time.Time{}
 		e.coolKind = 0

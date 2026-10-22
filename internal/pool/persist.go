@@ -180,6 +180,9 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
 			creditsTotal: s.CreditsTotal,
+			// 余额「已知」判定：新文件看显式标记；旧文件没有该字段，但非零余额本身
+			// 就是观测证据（credits=0 + 无标记才是真未知，此时不能当成耗尽号）。
+			creditsKnown: s.CreditsKnown || s.Credits > 0,
 			disabled:     s.Disabled,
 			// 注：本仓用 manualDisabled/manual_reason（上游用 paused/Paused）——
 			// 上游的 paused 回填在本仓无对应字段，见 transition.go 的语义说明。
@@ -456,6 +459,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		sf.Accounts[uid] = stateAccount{
 			Credits:                  e.credits,
 			CreditsTotal:             e.creditsTotal,
+			CreditsKnown:             e.creditsKnown,
 			Disabled:                 e.disabled,
 			Reason:                   reason,
 			ManualDisabled:           e.manualDisabled,

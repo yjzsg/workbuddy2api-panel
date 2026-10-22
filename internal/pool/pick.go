@@ -289,6 +289,14 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
 	}
+	// 余额从未被上游观测过（fresh entry / state.json 丢失）：credits 的 0 是「不知道」，
+	// 不是「耗尽」。按耗尽处理会让全池账号在重启后的第一个刷新周期内被挡在收费模型外
+	// （2026-10-22 旁挂 A/B 实测：global:minimax-m3.1-flash 全 503，最长持续 5m）。
+	// 未知 = 放行，与「未知倍率放行」同一保守方向：宁可让一次可能的 402 走硬冷却兜底，
+	// 也不要让整池静默失联。
+	if !e.creditsKnown {
+		return false
+	}
 	// 1) 本地实测台账：最权威（真实扣费证据）。
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k > 0

@@ -162,6 +162,11 @@ type ModelCostStatus struct {
 type entry struct {
 	a       *auth.Auth
 	credits int64
+	// creditsKnown 是否从上游真实观测过余额。fresh entry（新建、state.json 丢失或
+	// 首次加载）credits 的零值是「不知道」而不是「余额为 0」——积分保底必须区分
+	// 这两者，否则 2026-10-22 旁挂 A/B 的事故会重演：state.json 一丢，全池 credits=0
+	// 被 floor 判成耗尽号，所有收费模型 503 长达一个余额刷新周期（5m）。
+	creditsKnown bool
 	// creditsTotal 积分总额度（UserResource 聚合；0 = 未知）。上游 dbd7c68..origin/main 引入。
 	creditsTotal int64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
@@ -463,6 +468,9 @@ func (e *entry) fallbackKind(now time.Time) string {
 type stateAccount struct {
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（上游 dbd7c68..origin/main 新增）
+	// CreditsKnown 余额是否已被上游实测确认（2026-10-23 新增）。缺省（旧文件）= false，
+	// 但加载时若 Credits>0 视为已知（非零余额本身即观测证据），见 persist.loadLocked。
+	CreditsKnown bool `json:"credits_known,omitempty"`
 	Disabled     bool   `json:"disabled"`
 	Reason       string `json:"reason,omitempty"`
 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，

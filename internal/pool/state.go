@@ -196,6 +196,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		e.creditsKnown = true // 上游真实读数（含 0）：从此刻起 0 就是「真为 0」
 		if remain > 0 && !e.disabled {
 			p.reviveCoolingLocked(e, remain, total)
 		} else {
