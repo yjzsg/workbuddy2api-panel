@@ -4,7 +4,9 @@ package upstream
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -101,6 +103,14 @@ func (c *Client) userAgent(a *auth.Auth) string {
 func (c *Client) billingUA(a *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
+	}
+	// global 域的真机计费请求 UA 是 axios 默认串（2026-10-20 真机抓包：5.8.4 国际版
+	// `/billing/meter/get-user-resource*` 与 `-summary` 全部 `axios/1.16.1`），
+	// 与客户端自身 UA 不同——billing 层的 RestOperations 用的是 axios。
+	// CN 保持既有单段 `WorkBuddy/<ver>`（线上可用，不动）。
+	// [移植自 misakano7545 bde6da114]
+	if a != nil && a.IsGlobal() {
+		return "axios/1.16.1"
 	}
 	return "WorkBuddy/" + c.clientVersionFor(a)
 }
@@ -274,6 +284,13 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 默认（ClientName 空）即伪造 WorkBuddy 桌面端头组（见 injectAttribution）；
 	// 显式 ClientName="SaaS" 还原旧行为（仅 X-Product="SaaS"）。
 	c.injectAttribution(req, a)
+	// X-Private-Data: true —— 官方 chat 出站恒带（真机 applyGatewayHeaders 实测），
+	// 语义是「请求含私有数据」，客户端无条件声明，故这里也常发。
+	// [移植自 misakano7545 bde6da114]
+	req.Header.Set("X-Private-Data", "true")
+	// 身份头族（X-Auth-Method / X-Userinfo）：按账号形态条件注入——个人号三头全不发
+	// 才是官方形态，补空值反而更像伪造（见 injectIdentityHeaders）。
+	c.injectIdentityHeaders(req, a)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
 	c.injectClientIP(req, clientIP)
@@ -346,6 +363,40 @@ func validTraceID(s string) bool {
 		}
 	}
 	return true
+}
+
+// injectIdentityHeaders 注入官方客户端的身份头族（X-Auth-Method / X-Userinfo）。
+// 两个头都是**按账号形态条件发送**，不是常量——官方客户端 runIdentityHeaders()
+// （cli 5.8.4 反编译）等价于：
+//
+//	有 uid          → X-User-Id = uid（已在 ChatHeaders 里发）
+//	有 auth.method  → X-Auth-Method = method（= JWT 的 token_source 声明）
+//	有 uid 且 method → X-Userinfo = base64(JSON{uin, owner_uin?, token_source?})
+//
+// X-Userinfo 各段是**条件拼接**：缺哪个字段就不出现在 JSON 里，而不是写空串。
+// 个人号通常没有 token_source——实测国际版个人账号出站头里该头族都不存在，
+// 故本函数对纯个人号零注入。这不是省略，而是与客户端一致：凭「个人号也该有
+// X-Userinfo」去补空值是伪造指纹，比不发更容易被识别。
+// [移植自 misakano7545 bde6da114，按本仓 auth 字段裁剪：无 idSource]
+func (c *Client) injectIdentityHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
+	method := a.TokenSource()
+	if method == "" {
+		// 个人号且 token 无 token_source：与官方客户端同样整族不发。
+		return
+	}
+	req.Header.Set("X-Auth-Method", method)
+	payload := map[string]any{"uin": a.UID, "token_source": method}
+	if enterprise := strings.TrimSpace(a.EnterpriseID); enterprise != "" {
+		payload["owner_uin"] = enterprise
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Userinfo", base64.StdEncoding.EncodeToString(raw))
 }
 
 // attributionClientName 生效的用量归属名：ClientName 非空取之；

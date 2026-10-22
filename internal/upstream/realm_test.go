@@ -123,13 +123,54 @@ func TestGlobalChatNoFallbackOn404(t *testing.T) {
 	}
 }
 
-// TestGlobalBillingUsesBillingMeterThenV2Fallback 断言 global billing 先打 /billing/meter/*
-// 404 时 fallback /v2/billing/meter/*；CN billing 直接 /v2/billing/meter/*（现状逐字）。
-func TestGlobalBillingUsesBillingMeterThenV2Fallback(t *testing.T) {
+// TestGlobalBillingUsesSummaryEndpoints 断言 global 余额查询走 5.8.4 国际版新口径三件套
+// （summary + paid + free），不再打 CN 的 get-user-resource 分页路径。
+// [口径来源：misakano7545 bde6da114 真机抓包 2026-10-20]
+func TestGlobalBillingUsesSummaryEndpoints(t *testing.T) {
 	var billingCalls []string
 	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		billingCalls = append(billingCalls, r.URL.Path)
-		if r.URL.Path == "/billing/meter/get-user-resource" {
+		switch r.URL.Path {
+		case "/billing/meter/get-user-resource-summary":
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Packages":[
+				{"PackageCode":"P1","CycleTotalCapacity":"500","CycleRemainCapacity":"123"}
+			]}}}}`))
+		default:
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`))
+		}
+	}))
+	defer billSrv.Close()
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer chatSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	remain, err := c.UserResource(globalAcct())
+	if err != nil {
+		t.Fatalf("global billing: %v", err)
+	}
+	if remain != 123 {
+		t.Errorf("remain=%d want 123（summary 的 CycleRemainCapacity）", remain)
+	}
+	if len(billingCalls) != 3 ||
+		billingCalls[0] != "/billing/meter/get-user-resource-summary" ||
+		billingCalls[1] != "/billing/meter/get-user-resource-paid-packages" ||
+		billingCalls[2] != "/billing/meter/get-user-resource-free-packages" {
+		t.Errorf("global billing calls=%v want [summary paid free]", billingCalls)
+	}
+}
+
+// TestGlobalBillingFallsBackWhenSummaryMissing 断言 summary 不可用（旧版上游 / 尚未
+// 开通）时仍能回落 CN 分页路径，且保留 /billing/meter → /v2 的 404 fallback。
+func TestGlobalBillingFallsBackWhenSummaryMissing(t *testing.T) {
+	var billingCalls []string
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		billingCalls = append(billingCalls, r.URL.Path)
+		if r.URL.Path == "/billing/meter/get-user-resource-summary" || r.URL.Path == "/billing/meter/get-user-resource" {
 			w.WriteHeader(404)
 			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
 			return
@@ -147,15 +188,16 @@ func TestGlobalBillingUsesBillingMeterThenV2Fallback(t *testing.T) {
 	c := globalTestClient(t, chatSrv, billSrv)
 	remain, err := c.UserResource(globalAcct())
 	if err != nil {
-		t.Fatalf("global billing: %v", err)
+		t.Fatalf("global billing fallback: %v", err)
 	}
 	if remain != 0 {
 		t.Errorf("remain=%d want 0", remain)
 	}
-	if len(billingCalls) != 2 ||
-		billingCalls[0] != "/billing/meter/get-user-resource" ||
-		billingCalls[1] != "/v2/billing/meter/get-user-resource" {
-		t.Errorf("global billing fallback calls=%v want [/billing/meter/get-user-resource, /v2/billing/meter/get-user-resource]", billingCalls)
+	if len(billingCalls) != 3 ||
+		billingCalls[0] != "/billing/meter/get-user-resource-summary" ||
+		billingCalls[1] != "/billing/meter/get-user-resource" ||
+		billingCalls[2] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("global billing fallback calls=%v want [summary, /billing/meter/get-user-resource, /v2/billing/meter/get-user-resource]", billingCalls)
 	}
 }
 
