@@ -25,7 +25,8 @@ func TestEffortListingStaticFallback(t *testing.T) {
 		wantDefault  string
 	}{
 		{"cn", "deepseek-v4.1-flash", []string{"low", "high", "max"}, "high"},
-		{"cn", "deepseek-v4-pro", []string{"low", "high", "xhigh"}, "high"},
+		{"cn", "deepseek-v4-flash", []string{"high", "xhigh"}, "high"},
+		{"cn", "deepseek-v4-pro", []string{"high", "xhigh"}, "high"},
 		{"cn", "glm-5.3", []string{"low", "high", "max"}, "high"},
 		{"cn", "glm-5.2", []string{"high", "xhigh"}, "high"},
 		{"cn", "hy4-preview", []string{"high"}, "high"},

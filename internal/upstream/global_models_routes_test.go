@@ -148,7 +148,7 @@ func TestDesktopUAForGlobalAccount(t *testing.T) {
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
 	ua := c.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy AI"; !contains(ua, want) {
+	if want := "workbuddy-ai"; !contains(ua, want) {
 		t.Errorf("global desktop UA = %q, want it to contain %q", ua, want)
 	}
 	if !contains(ua, "CLI/") {
@@ -157,7 +157,7 @@ func TestDesktopUAForGlobalAccount(t *testing.T) {
 	// CN 账号保持 WorkBuddy（零回归）。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "WorkBuddy AI") {
+	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "workbuddy-ai") {
 		t.Errorf("cn desktop UA = %q, must not contain 'WorkBuddy AI'", ua)
 	}
 }
