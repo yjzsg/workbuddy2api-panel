@@ -1516,6 +1516,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 兜底 system 内容为固定中性句，不改变客户端已有 system 的任何语义。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	prepared = ensureConsoleSystem(prepared)
+	// body 侧会话字段（issue #51）：把本轮 ID 同时写进消息体，与出站头保持头体一致
+	// （官方桌面端头与体都带 conversationRequestId）。见 conv_fields.go。
+	prepared = injectConversationFields(prepared, meta.ConversationRequestID)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。

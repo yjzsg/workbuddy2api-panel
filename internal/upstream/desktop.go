@@ -438,7 +438,9 @@ func (c *Client) DesktopDailyChat(a *auth.Auth, model string) error {
 //	      对话）。实测并发跑 29 号时偶有 1 号解析不到 id，且**失败账号每轮不同**
 //	      （单号复测恒 200），属流形态差异，对「当天是否发生过对话」无影响。
 func (c *Client) desktopChat(a *auth.Auth, model, expertID string, requireID bool) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	// 网关自建会话：用官方形态 v4 UUID（旧值 `wb2api-conv-<纳秒>` 把项目缩写写进
+	// 上报体，issue #51）。
+	conversationID = session.NewConversationID()
 	body := map[string]any{
 		"model": model,
 		"messages": []any{

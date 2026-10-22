@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -13,6 +12,9 @@ import (
 
 // hex32 断言用：32 位小写 hex（会话头族的形状要求，B3 规范亦只认 16/32 hex）。
 var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// uuidV4 断言用：官方 X-Conversation-ID 的实测形态（36 字符、带横线、v4 + RFC4122 variant）。
+var uuidV4 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // TestDesktopChatInjectsConversationHeaderFamily 回归 2026-10-21 的生产故障：
 // global 账号的每日对话保底任务全部 400 code=11-128「请求被拦截，请重新发送」。
@@ -64,8 +66,10 @@ func TestDesktopChatInjectsConversationHeaderFamily(t *testing.T) {
 			if err != nil {
 				t.Fatalf("desktopChat: %v", err)
 			}
-			if !strings.HasPrefix(convID, "wb2api-conv-") {
-				t.Fatalf("conversationID 形态变了：%q（专家链路按它关联事件，勿改）", convID)
+			// 形态对齐官方：v4 UUID 带横线（issue #51）。旧实现是 `wb2api-conv-<纳秒>`，
+			// 项目缩写进上报体本身就是指纹；专家链路只按值关联，不依赖前缀。
+			if !uuidV4.MatchString(convID) {
+				t.Fatalf("conversationID 形态应为 v4 UUID：%q（专家链路按值关联，勿改回前缀形态）", convID)
 			}
 
 			// 会话头族：四层各自到位，且同一轮的标识互相自洽。

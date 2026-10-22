@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -133,9 +134,11 @@ func (s *Scheduler) cnInviteOne(a *auth.Auth, code string) CNInviteItem {
 		}
 	}
 	// 当天一次"使用"：桌面端六事件链（网关对话不算，见文件头注释）。
-	conv := fmt.Sprintf("wb2api-cninv-%d-%s", time.Now().Unix(), shortUID(a.UID))
+	conv := session.NewConversationID()
+	req := session.NewMessageID()
+	msg := session.NewMessageID()
 	if err := s.cfg.Upstream.ReportDesktopEvent(a,
-		upstream.DesktopChatSequence(conv, conv+"-req", conv+"-msg", "fast-model", "fast-model")...); err != nil {
+		upstream.DesktopChatSequence(conv, req, msg, "fast-model", "fast-model")...); err != nil {
 		it.Activate = "error:" + shortErr(err)
 	} else {
 		it.Activate = "ok"

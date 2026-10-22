@@ -15,6 +15,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -742,10 +743,12 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		first = false
 		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
+		// 会话 ID 用官方形态（v4 UUID）。旧值是 `wb2api-<毫秒>`——项目缩写直接进上报体
+		// （issue #51）；ReportChatActivity 把它写进 conversationId / parentConversationId。
+		cid := session.NewConversationID()
 		ok := 0
 		for i := 1; i <= count; i++ {
-			rid := fmt.Sprintf("%s-r%d", cid, i)
+			rid := session.NewMessageID()
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
 				log.Printf("activity %s: report %d/%d: %v", logfmt.Label(a.UID, a.Nickname), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
