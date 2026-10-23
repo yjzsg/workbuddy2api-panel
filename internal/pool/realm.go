@@ -84,6 +84,20 @@ func (p *Pool) weightedAvailableLocked(model, realm string, sticky bool) []strin
 				slots = expiringVirtualSlots
 			}
 		}
+		// 静态域偏好（pool.realm_bias）：裸名请求（realm==""）的账号分配实际走
+		// 会话层——Router 对这份加权名单做 FNV 哈希取模，**不经过 pool.pick 的域抽签**。
+		// 因此偏好必须在这里体现：按倍率复制该域的账号槽位，概率自然按槽位数分摊。
+		// 实测（2026-10-23）：只在 pick 的域抽签里乘 bias 对线上流量完全无效，
+		// 因为几乎所有请求都带会话标识、走 Router 分配而非 pick。
+		if realm == "" && len(p.realmBias) > 0 {
+			if b := p.realmBias[p.byUID[uid].a.Realm()]; b > 0 && b != 1 {
+				n := int(float64(slots)*b + 0.5)
+				if n < 1 {
+					n = 1
+				}
+				slots = n
+			}
+		}
 		for i := 0; i < slots; i++ {
 			out = append(out, uid)
 		}

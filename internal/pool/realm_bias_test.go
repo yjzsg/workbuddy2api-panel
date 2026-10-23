@@ -12,6 +12,7 @@ package pool
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,5 +220,59 @@ func TestRealmBiasMultipliesDynamicWeight(t *testing.T) {
 	}
 	if math.Abs(mul["global"]-p.realmWeightFloor) > 1e-9 {
 		t.Fatalf("global 应在 floor %.4f，got %.4f", p.realmWeightFloor, mul["global"])
+	}
+}
+
+// TestRealmBiasExpandsAvailableUIDs 会话层分配路径（线上真正生效的那条）：
+// Router 对 WeightedAvailableUIDsForModelRealm 返回的名单做哈希取模，
+// 所以偏好必须体现为「该域账号的槽位数量」。
+//
+// 4 cn + 35 global、bias cn=4 → cn 槽位 16、global 35（合计 51 → cn 31.4%）。
+func TestRealmBiasExpandsAvailableUIDs(t *testing.T) {
+	p := newMixedPool(4, 35)
+
+	count := func(realm string) (cn, gl int) {
+		for _, uid := range p.WeightedAvailableUIDsForModelRealm("m", realm) {
+			if strings.HasPrefix(uid, "c") {
+				cn++
+			} else {
+				gl++
+			}
+		}
+		return
+	}
+
+	cn, gl := count("")
+	if cn != 4 || gl != 35 {
+		t.Fatalf("未配 bias 时槽位应 4/35，got %d/%d", cn, gl)
+	}
+
+	p.SetRealmBias(map[string]float64{"cn": 4})
+	cn, gl = count("")
+	if cn != 16 || gl != 35 {
+		t.Fatalf("bias cn=4 时槽位应 16/35，got %d/%d", cn, gl)
+	}
+	if share := float64(cn) / float64(cn+gl); math.Abs(share-16.0/51.0) > 1e-9 {
+		t.Fatalf("cn 份额应 %.4f，got %.4f", 16.0/51.0, share)
+	}
+
+	// 显式域请求不受影响（realm 非空时不做偏好扩张）。
+	cn, gl = count("global")
+	if cn != 0 || gl != 35 {
+		t.Fatalf("显式 global 请求应只含 35 个 global 槽位，got %d/%d", cn, gl)
+	}
+	cn, gl = count("cn")
+	if cn != 4 || gl != 0 {
+		t.Fatalf("显式 cn 请求应只含 4 个 cn 槽位，got %d/%d", cn, gl)
+	}
+
+	// 倍率 1 不扩张；清空后回到基线。
+	p.SetRealmBias(map[string]float64{"cn": 1})
+	if cn, _ := count(""); cn != 4 {
+		t.Fatalf("bias=1 不应扩张，got %d", cn)
+	}
+	p.SetRealmBias(nil)
+	if cn, _ := count(""); cn != 4 {
+		t.Fatalf("清空 bias 后应回到 4，got %d", cn)
 	}
 }

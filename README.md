@@ -473,7 +473,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
 | `pool.prefer_expiring` | `true` | 快过期积分加权：窗口内仍有有效快过期批次的账号，选号权重 ×3（虚拟实例）；不按到期时间排序、与批次金额无关；是软偏好，弱于会话粘性与模型成本分层（#101） |
 | `pool.expiring_soon` | `168h` | 快过期加权窗口：仅窗口内仍有有效批次的账号命中上述 ×3；窗口开大 → 命中账号变多、偏好被稀释；留空或 `0` 关闭 |
-| `pool.realm_bias` | `{}` | 静态域偏好倍率，如 `{"cn": 4}`：与 `realm_weight_*` 的**动态**衰减相乘后再参与**裸名**（`realm=""`）请求的跨域抽签。份额 ≈ `n_cn×b_cn / (n_cn×b_cn + n_global×b_global)`（`n` = 该域健康账号数）。只影响裸名请求，显式 `cn:`/`global:` 无选择权、不受影响；结果仍受 `realm_weight_max_ratio` 的每账号负载钳制（`{"cn": 5}` 已接近上限） |
+| `pool.realm_bias` | `{}` | 静态域偏好倍率，如 `{"cn": 4}`：与 `realm_weight_*` 的**动态**衰减相乘后参与**裸名**（`realm=""`）请求的跨域分配。份额 ≈ `n_cn×b_cn / (n_cn×b_cn + n_global×b_global)`（`n` = 该域健康账号数）。**生效点有两处**：①会话层名单（`WeightedAvailableUIDsForModelRealm`，按倍率复制该域账号槽位——线上带会话标识的请求全走这条，是主路径）；②`pool.pick` 的跨域抽签（无会话键时的兜底路径）。只影响裸名请求，显式 `cn:`/`global:` 无选择权、不受影响；抽签路径的结果仍受 `realm_weight_max_ratio` 的每账号负载钳制 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
