@@ -1987,11 +1987,47 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案。
 var errUpstreamTimeout = errors.New("upstream timeout")
 
+// isConnEstablishErr 判断这一跳是否**在建连阶段**就失败了（DNS / TCP dial /
+// TLS 握手），即请求还没送达上游、更没进入模型计算。
+//
+// 这类失败与「上游算得慢」是两件事，必须区别对待：
+//   - 建连失败是网络抖动/节点抽风，换一个号往往立刻成功。2026-10-23 13:40–13:42
+//     实证：4 次 `net/http: TLS handshake timeout` 全被当成上游超时停转，客户端
+//     收到 503，而同一分钟内其他号打同一模型全是 200。
+//   - 上游停滞（`timeout awaiting response headers` / 流中卡住）换号大概率白换，
+//     仍按超时处理（停转 + 模型级冷却）。
+//
+// 因此建连失败要走「换号重试」分支：不锁模型、不给模型级冷却。
+func isConnEstablishErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, p := range []string{
+		"TLS handshake timeout", // net/http 建连超时
+		"dial tcp",              // TCP 连接阶段：refused / unreachable / i/o timeout
+		"connection refused",
+		"no such host", // DNS 解析失败
+		"network is unreachable",
+	} {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // isUpstreamTimeout 判断这一跳的失败是否属于「上游超时 / 停滞」。超时不是账号的
 // 问题，换号注定白换（同一份请求撞同一个慢上游），必须止损：不轮转、不罚号。
 // 三态判定见传输层错误分支的注释。
+//
+// 例外：建连阶段失败（见 isConnEstablishErr）不算上游超时——虽然它也满足
+// net.Error.Timeout()，但换号能解决，必须落到抖动分支去轮转。
 func isUpstreamTimeout(err error, clientGone bool) bool {
 	if err == nil {
+		return false
+	}
+	if isConnEstablishErr(err) {
 		return false
 	}
 	var ne net.Error
