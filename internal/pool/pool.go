@@ -79,6 +79,10 @@ type Pool struct {
 	realmWeightFloor         float64
 	realmWeightRecoverPerMin float64
 	realmWeightMaxRatio      float64
+	// realmBias 静态域偏好倍率（SetRealmBias 注入）：key = "cn"/"global"，缺省 1.0。
+	// 与 realmWeights 的动态权重相乘：动态权重管「此刻哪一域更挤」，bias 管
+	// 「就是想往这一域多派」。>1 = 多吃流量，<1 = 少吃；缺省 1.0 时行为与此前逐位一致。
+	realmBias map[string]float64
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -124,6 +128,7 @@ func New(stateFp string) *Pool {
 		realmWeightFloor:         defaultRealmWeightFloor,
 		realmWeightRecoverPerMin: defaultRealmWeightRecoverPerMin,
 		realmWeightMaxRatio:      defaultRealmWeightMaxRatio,
+		realmBias:                map[string]float64{},
 	}
 	if stateFp != "" {
 		p.load()

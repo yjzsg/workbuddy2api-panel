@@ -397,6 +397,9 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 裸名请求下次选号优先用高权重域。只列低于满血（<1）的条目；全满时为 null。
 		// 与 realm_totals 对照即可判断「global 是不是正被限流拖累、cn 有没有余量」。
 		"realm_weights": h.cfg.Pool.RealmWeightView(),
+		// realm_bias 静态域偏好倍率（pool.realm_bias）：与上面的动态权重相乘后
+		// 参与跨域抽签。<1 或 >1 都是运维显式设的，未配置时为 null。
+		"realm_bias": h.cfg.Pool.RealmBias(),
 	})
 }
 

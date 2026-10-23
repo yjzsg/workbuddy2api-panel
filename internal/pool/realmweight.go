@@ -72,6 +72,45 @@ func (p *Pool) SetRealmWeight(decay, floor, recoverPerMin, maxRatio float64) {
 	}
 }
 
+// maxRealmBias 静态域偏好倍率上限：再大也只是把一个域压死，
+// 而「压死」应该用 global.enabled=false 那种显式开关表达，不该藏在倍率里。
+const maxRealmBias = 20.0
+
+// SetRealmBias 注入静态域偏好倍率（key = "cn"/"global"，缺省 1.0）。
+//
+// 与 realm_weight_* 的关系：后者是**动态**的（哪一域报限流就降权、随时间恢复），
+// 本项是**策略**（运维就是想让某一域多吃/少吃）。两者相乘后再参与跨域抽签。
+// 非法值（<=0、NaN）被丢弃（等价 1.0），过大值钳到 maxRealmBias。
+func (p *Pool) SetRealmBias(bias map[string]float64) {
+	clean := make(map[string]float64, len(bias))
+	for k, v := range bias {
+		if k == "" || v <= 0 || v != v { // v != v 判 NaN，省掉 math 依赖
+			continue
+		}
+		if v > maxRealmBias {
+			v = maxRealmBias
+		}
+		clean[k] = v
+	}
+	p.mu.Lock()
+	p.realmBias = clean
+	p.mu.Unlock()
+}
+
+// RealmBias 返回当前静态域偏好倍率副本（供 /status 与测试观察）。
+func (p *Pool) RealmBias() map[string]float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.realmBias) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(p.realmBias))
+	for k, v := range p.realmBias {
+		out[k] = v
+	}
+	return out
+}
+
 // realmWeightLocked 取 (模型, 域) 的当前权重，顺带按 elapsed 做时间恢复。
 // 调用方必须持 p.mu（pick 路径已在写锁内）。
 func (p *Pool) realmWeightLocked(model, realm string, now time.Time) float64 {
@@ -136,6 +175,30 @@ func (p *Pool) realmWeightMultipliersLocked(cands []*entry, model string, now ti
 	for r, w := range health {
 		if w > capW {
 			health[r] = capW
+		}
+	}
+	// 静态偏好（pool.realm_bias）：在动态健康因子与容量钳制**之后**叠加。
+	// 顺序不能反：钳制管的是「每账号负载别把某域压垮」，bias 管的是「运维就想让
+	// 这一域多吃」。反过来先乘 bias 会被 capW(=1) 吃掉，等于没配。
+	if len(p.realmBias) > 0 {
+		for r, w := range health {
+			if b, ok := p.realmBias[r]; ok && b > 0 {
+				health[r] = w * b
+			}
+		}
+		// 偏好同样受「每账号负载」上限约束：否则 bias 配大了会把另一域彻底饿死，
+		// 相当于绕过 global.enabled 那种显式开关做了硬隔离。只在比较对象不止一个时钳。
+		minW = 1.0
+		for _, w := range health {
+			if w < minW {
+				minW = w
+			}
+		}
+		capW = minW * p.realmWeightMaxRatio
+		for r, w := range health {
+			if w > capW {
+				health[r] = capW
+			}
 		}
 	}
 	// 权重全等时返回 nil：跨域抽签是多余的（比例本来就等于账号数），

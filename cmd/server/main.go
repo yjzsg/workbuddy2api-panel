@@ -131,6 +131,7 @@ func main() {
 	p.SetCreditExhausted(cfg.CreditExhaustedDur) // cooldown.credit_exhausted
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetRealmWeight(cfg.Pool.RealmWeightDecay, cfg.Pool.RealmWeightFloor, cfg.Pool.RealmWeightRecover, cfg.Pool.RealmWeightMaxRatio) // (模型,域) 动态权重
+	p.SetRealmBias(cfg.Pool.RealmBias)                                                                                                // 静态域偏好倍率（pool.realm_bias）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur)                                                                              // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 
@@ -241,13 +242,13 @@ func main() {
 		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
 		RandomDelayMinutes:     cfg.Schedule.RandomDelayMinutes,
 		RandomDelaySeed:        schedSeed,
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		CatDisabled:        !cfg.Schedule.BlackcatEnabled,
-		DailyChatDisabled:  !cfg.Schedule.DailyChatEnabled,
-		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		CheckinDisabled:        !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:         !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:       !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
+		CatDisabled:            !cfg.Schedule.BlackcatEnabled,
+		DailyChatDisabled:      !cfg.Schedule.DailyChatEnabled,
+		GrowthDisabled:         !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
@@ -640,6 +641,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetRealmWeight(newCfg.Pool.RealmWeightDecay, newCfg.Pool.RealmWeightFloor, newCfg.Pool.RealmWeightRecover, newCfg.Pool.RealmWeightMaxRatio) // 域权重热生效
+	p.SetRealmBias(newCfg.Pool.RealmBias)                                                                                                         // 静态域偏好热生效
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(

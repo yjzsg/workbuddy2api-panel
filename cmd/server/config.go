@@ -252,6 +252,11 @@ type Config struct {
 		// （如 cn 6 / global 35），只按健康度会让小域吃掉过多流量；钳制后最高域
 		// 与最低域的每账号负载差不超过该倍数。
 		RealmWeightMaxRatio float64 `json:"realm_weight_max_ratio"`
+		// RealmBias 静态域偏好倍率（key = "cn"/"global"，缺省 1.0，上限 20）。
+		// 与上面的动态权重相乘：动态权重管「此刻哪一域更挤」，本项管「就想让这一域
+		// 多吃流量」。例：{"cn": 2} 让裸名请求里 cn 的每账号权重翻倍。
+		// 只影响裸名（realm=""）请求；显式 cn:/global: 请求没有选择权，不受影响。
+		RealmBias map[string]float64 `json:"realm_bias"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -664,7 +669,24 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.RealmWeightRecover <= 0 {
 		c.Pool.RealmWeightRecover = 0.2
+	}
+	// RealmWeightMaxRatio 的兜底原先嵌在上面 recover 分支里（recover 合法时不会被
+	// 修正），这里独立出来按「<1 无意义」处理。
+	if c.Pool.RealmWeightMaxRatio < 1 {
 		c.Pool.RealmWeightMaxRatio = 5.0
+	}
+	// 静态域偏好（pool.realm_bias）：<=0 / NaN / 空 key 一律丢弃（等价 1.0），
+	// 上限由 pool.SetRealmBias 统一钳到 maxRealmBias(=20)。空 map = 不启用。
+	if len(c.Pool.RealmBias) > 0 {
+		clean := make(map[string]float64, len(c.Pool.RealmBias))
+		for k, v := range c.Pool.RealmBias {
+			k = strings.TrimSpace(k)
+			if k == "" || v <= 0 || v != v {
+				continue
+			}
+			clean[k] = v
+		}
+		c.Pool.RealmBias = clean
 	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停
