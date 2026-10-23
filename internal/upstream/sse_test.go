@@ -1141,9 +1141,9 @@ func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 	soon := now.Add(24 * time.Hour).Truncate(time.Second)
 	later := now.Add(10 * 24 * time.Hour).Truncate(time.Second)
 	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
-		`{"PackageName":"soon-a","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.Format(packageEndLayout) + `"},` +
-		`{"PackageName":"soon-b","CycleCapacitySize":15,"CycleCapacityRemain":15,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.Format(packageEndLayout) + `"},` +
-		`{"PackageName":"later","CycleCapacitySize":20,"CycleCapacityRemain":20,"CycleCapacityUsed":0,"CycleEndTime":"` + later.Format(packageEndLayout) + `"},` +
+		`{"PackageName":"soon-a","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.In(softRateResetLoc).Format(packageEndLayout) + `"},` +
+		`{"PackageName":"soon-b","CycleCapacitySize":15,"CycleCapacityRemain":15,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.In(softRateResetLoc).Format(packageEndLayout) + `"},` +
+		`{"PackageName":"later","CycleCapacitySize":20,"CycleCapacityRemain":20,"CycleCapacityUsed":0,"CycleEndTime":"` + later.In(softRateResetLoc).Format(packageEndLayout) + `"},` +
 		`{"PackageName":"unknown","CycleCapacitySize":5,"CycleCapacityRemain":5,"CycleCapacityUsed":0}` +
 		`]}}}}`
 	c := testClient(func(r *http.Request) (*http.Response, error) {
@@ -1174,7 +1174,7 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 		}
 		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
 			`{"PackageName":"gift","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20,"CycleEndTime":"`+
-			end.Format(packageEndLayout)+`"},`+
+			end.In(softRateResetLoc).Format(packageEndLayout)+`"},`+
 			`{"PackageName":"unknown","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0}`+
 			`]}}}}`), nil
 	})

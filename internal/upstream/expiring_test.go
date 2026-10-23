@@ -23,8 +23,8 @@ func mkDetailedResp(accounts string) *http.Response {
 
 func TestUserResourceDetailedSplitsExpiring(t *testing.T) {
 	now := time.Now()
-	in3d := now.Add(3 * 24 * time.Hour).Format(packageEndLayout)
-	in30d := now.Add(30 * 24 * time.Hour).Format(packageEndLayout)
+	in3d := now.Add(3 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
+	in30d := now.Add(30 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return mkDetailedResp(
 			`{"PackageName":"奖励包","CycleEndTime":"` + in3d + `","CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300},` +
@@ -50,7 +50,7 @@ func TestUserResourceDetailedSplitsExpiring(t *testing.T) {
 }
 
 func TestUserResourceDetailedNoWindowAllStable(t *testing.T) {
-	in3d := time.Now().Add(3 * 24 * time.Hour).Format(packageEndLayout)
+	in3d := time.Now().Add(3 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return mkDetailedResp(
 			`{"PackageName":"p","CycleEndTime":"` + in3d + `","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`), nil
@@ -98,8 +98,8 @@ func TestUserResourceBackwardCompat(t *testing.T) {
 // （global Bonus Pack 实测 14 天赠送积分到期时刻即此字段）。
 func TestUserResourceDetailedExpiringBucketFromCycleEndTime(t *testing.T) {
 	now := time.Now()
-	in3d := now.Add(3 * 24 * time.Hour).Format(packageEndLayout)
-	in30d := now.Add(30 * 24 * time.Hour).Format(packageEndLayout)
+	in3d := now.Add(3 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
+	in30d := now.Add(30 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return mkDetailedResp(
 			`{"PackageName":"奖励包","CycleEndTime":"`+in3d+`","CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300},`+

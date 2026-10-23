@@ -64,7 +64,7 @@ func TestGlobalUserResourceSummaryMerge(t *testing.T) {
 			]}`)), nil
 		case strings.HasSuffix(r.URL.Path, billingFreePath):
 			return jsonResp(200, billingData(`{"Accounts":[
-				{"PackageCode":"P2","CycleEndTime":"`+p2End.Format(packageEndLayout)+`","CycleCapacityRemain":40}
+				{"PackageCode":"P2","CycleEndTime":"`+p2End.In(softRateResetLoc).Format(packageEndLayout)+`","CycleCapacityRemain":40}
 			]}`)), nil
 		}
 		return nil, errors.New("unexpected path " + r.URL.Path)

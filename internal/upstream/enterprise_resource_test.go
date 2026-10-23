@@ -13,7 +13,7 @@ import (
 // TestEnterpriseResourceMapsAllocatedQuota 企业版额度走 get-enterprise-user-usage：
 // credit 是**已用**（与个人口径相反），故 remain = limitNum - credit、total = limitNum。
 func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
-	end := time.Now().Add(10 * 24 * time.Hour).Format(packageEndLayout)
+	end := time.Now().Add(10 * 24 * time.Hour).In(softRateResetLoc).Format(packageEndLayout)
 	var gotPath, gotEnt string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
