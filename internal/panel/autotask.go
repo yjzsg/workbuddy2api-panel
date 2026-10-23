@@ -130,6 +130,31 @@ var autoActions = []autoAction{
 		run:      runExpertLighthouse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "无畏契约拼豆专家召唤+使用链（判据同 Expert_lighthouse；活动截止 2026-11-15）",
+		run:      runValorantExpert,
+	},
+	{
+		TaskCode: "expert_use_maidehao",
+		Desc:     "中国电商运营专家召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_maidehao"),
+	},
+	{
+		TaskCode: "expert_use_douyinyin",
+		Desc:     "抖音策略师召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_douyinyin"),
+	},
+	{
+		TaskCode: "expert_use_shangjia_xuanchuan",
+		Desc:     "商家宣传页与海报设计师召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_shangjia_xuanchuan"),
+	},
+	{
+		TaskCode: "expert_use_bowangwang",
+		Desc:     "直播电商教练召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_bowangwang"),
+	},
+	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
 		Attempt:  true,
@@ -980,6 +1005,128 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 		return "", fmt.Errorf("使用事件: %w", err)
 	}
 	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+}
+
+// expertExperienceTasks 「在专家页搜索并召唤「X」，完成一次对话」类活动的固定参数
+// （2026-10-23 新增四条，各 +50 分 +5 能，截止 11-20）。
+//
+// 专家 id 取自任务自身的 jump_url（PC deeplink `experts?expertId=ex_…`），与专家市场
+// 真实条目一一对应（2026-10-23 用 CN 账号实测核对过：expert_use_maidehao →
+// ex_GDl31WahyIH0、douyinyin → ex_FbY5nlWTqDod、shangjia_xuanchuan → ex_Weo3x2EZuSDm、
+// bowangwang → ex_WZY136wV5aMt）。DisplayNameZH 是专家**昵称**（卖得好/斗音音/播旺旺），
+// ProfessionZH 才是任务标题里的职业名——判据事件里 name 取昵称、expertTitle 取职业名，
+// 两者都参与服务端校验，不能互换。
+var expertExperienceTasks = map[string]upstream.MarketExpert{
+	"expert_use_maidehao": {
+		ExpertID: "ex_GDl31WahyIH0", ExpertType: "agent",
+		DisplayNameZH: "卖得好", ProfessionZH: "中国电商运营专家", Version: "1.0.1",
+	},
+	"expert_use_douyinyin": {
+		ExpertID: "ex_FbY5nlWTqDod", ExpertType: "agent",
+		DisplayNameZH: "斗音音", ProfessionZH: "抖音策略师", Version: "1.0.2",
+	},
+	"expert_use_shangjia_xuanchuan": {
+		ExpertID: "ex_Weo3x2EZuSDm", ExpertType: "agent",
+		DisplayNameZH: "商家宣传设计师", ProfessionZH: "商家宣传页与海报设计师", Version: "1.6.0",
+	},
+	"expert_use_bowangwang": {
+		ExpertID: "ex_WZY136wV5aMt", ExpertType: "agent",
+		DisplayNameZH: "播旺旺", ProfessionZH: "直播电商教练", Version: "1.0.2",
+	},
+}
+
+// expertSpecFor 取任务码对应的专家参数（未登记返回 false，调用方应报错而不是静默成功）。
+func expertSpecFor(code string) (upstream.MarketExpert, bool) {
+	spec, ok := expertExperienceTasks[code]
+	return spec, ok
+}
+
+// runExpertExperienceFor 把任务码绑进 autoAction.run 的函数签名（run 只收 Panel/Auth）。
+func runExpertExperienceFor(code string) func(*Panel, *auth.Auth) (string, error) {
+	return func(p *Panel, a *auth.Auth) (string, error) {
+		return p.runExpertExperience(a, code)
+	}
+}
+
+// runExpertExperience 完成「体验「X」专家」类任务：专家页搜索 → 召唤链 → 真实对话
+// （服务端 requestId）→ expert_actual_use(mode=LOCAL)。
+//
+// 判据与 Expert_lighthouse / WorkBuddy_Valorant 同源（同一句任务文案、同一份 jump_url
+// 形态），差异只在专家本身，故复用 runExpertSummonChain。
+func (p *Panel) runExpertExperience(a *auth.Auth, code string) (string, error) {
+	spec, ok := expertSpecFor(code)
+	if !ok {
+		return "", fmt.Errorf("未登记的专家体验任务: %s", code)
+	}
+	return p.runExpertSummonChain(a, spec, true)
+}
+
+// runValorantExpert 完成 WorkBuddy_Valorant「体验「无畏契约拼豆专家」」（+100c+5e，
+// 截止 2026-11-15）。判据口径同 Expert_lighthouse：召唤链 + 真实对话 +
+// expert_actual_use(mode=LOCAL)。专家 id ex_xQHHD1u5Jkua（version 1.2.1）。
+func runValorantExpert(p *Panel, a *auth.Auth) (string, error) {
+	return p.runExpertSummonChain(a, upstream.MarketExpert{
+		ExpertID: "ex_xQHHD1u5Jkua", ExpertType: "agent",
+		DisplayNameZH: "无畏契约拼豆专家", ProfessionZH: "无畏契约拼豆专家", Version: "1.2.1",
+	}, false)
+}
+
+// runExpertSummonChain 「召唤专家 + 真实对话 + expert_actual_use」的公共实现。
+//
+// useSearch=true 时先用专家市场 keyword 搜索校正 version/名称（任务页口径）；false 时退回
+// 市场列表首屏匹配。两条路径都只用于校正参数——搜索/列表失败不影响召唤链本身。
+// 市场搜索必须按 expert_id 精确落位：同一关键词会命中多个同名专家（display_name_zh 与
+// profession_zh 都参与匹配），取首条会打错专家、服务端不计数。
+func (p *Panel) runExpertSummonChain(a *auth.Auth, spec upstream.MarketExpert, useSearch bool) (string, error) {
+	e := spec
+	if e.ExpertType == "" {
+		e.ExpertType = "agent"
+	}
+	if useSearch {
+		if list, err := p.cfg.Upstream.MarketExpertSearch(a, spec.ProfessionZH); err == nil {
+			for _, m := range list {
+				if m.ExpertID == spec.ExpertID {
+					e = m
+					break
+				}
+			}
+		}
+	} else if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+		for _, m := range experts {
+			if m.ExpertID == spec.ExpertID {
+				e = m
+				break
+			}
+		}
+	}
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return "", fmt.Errorf("召唤链: %w", err)
+	}
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return "", fmt.Errorf("真实对话: %w", err)
+	}
+	msgID := "msg-" + req
+	if len(req) > 8 {
+		msgID = "msg-" + req[len(req)-8:]
+	}
+	events := upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model")
+	for _, ev := range events {
+		if ev["eventCode"] == "agent_task_created" {
+			ev["has_expert"] = true
+			ev["expert_id"] = e.ExpertID
+			ev["expert_name"] = e.DisplayNameZH
+			ev["expert_industry_id"] = ""
+		}
+	}
+	events = append(events, upstream.DesktopExpertActualUseLocal(e, conv, req))
+	// 对齐真实样本细节：专家页直连召唤的 actual_use type 为空、cost=0。
+	events[len(events)-1]["type"] = ""
+	events[len(events)-1]["cost"] = 0
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件: %w", err)
+	}
+	return fmt.Sprintf("已上报「%s」召唤+使用链（真实对话 requestId）", e.ProfessionZH), nil
 }
 
 // runAppearance 完成 Hp_Appearance（换主题）。
