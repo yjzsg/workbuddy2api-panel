@@ -235,7 +235,7 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isChatCompletionPath(r.URL.Path) {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}

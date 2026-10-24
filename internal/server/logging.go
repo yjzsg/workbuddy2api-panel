@@ -411,6 +411,10 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// path 请求实际命中的路径（/v1/chat/completions、MiniMax 的
+	// /v1/text/chatcompletion_v2、智谱-4V 的 /api/paas/v4/chat/completions）。
+	// 记录原样路径而不是固定常量，才能在 request-logs 里分清流量从哪个渠道进来。
+	path string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -463,10 +467,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

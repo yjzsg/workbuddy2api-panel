@@ -252,6 +252,41 @@ func TestRequestMetricsClientInfoDisabled(t *testing.T) {
 	}
 }
 
+// 归档事件的 path 必须是请求真正命中的路径：网关同时认 OpenAI / MiniMax / 智谱-4V
+// 三个 chat 路径，写死常量会让 request-logs 里分不清流量从哪个渠道进来。
+func TestRequestMetricsRecordsActualPath(t *testing.T) {
+	cases := []string{
+		"/v1/chat/completions",
+		"/v1/text/chatcompletion_v2",
+		"/api/paas/v4/chat/completions",
+	}
+	for _, path := range cases {
+		up := newFakeUpstream(t, func(string) (int, string, bool) {
+			return 200, sseOK, true
+		})
+		reqLog := reqlog.New(reqlog.Config{})
+		h := NewHandler(Config{
+			Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+			Upstream:   up,
+			RequestLog: reqLog,
+		})
+		req := httptest.NewRequest("POST", path,
+			strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s code=%d body=%s", path, rec.Code, rec.Body)
+		}
+		s := reqLog.Snapshot()
+		if len(s.Recent) != 1 {
+			t.Fatalf("%s recent = %+v", path, s.Recent)
+		}
+		if got := s.Recent[0].Path; got != path {
+			t.Errorf("%s path = %q want %q", path, got, path)
+		}
+	}
+}
+
 // 无代理头时回落到 TCP 对端地址——直连部署下这是唯一来源线索。
 func TestClientIPForLogFallsBackToRemoteAddr(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
