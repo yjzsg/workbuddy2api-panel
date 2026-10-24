@@ -1689,6 +1689,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
 				markTurnSuccess(acct.UID)
+				// 这一支同时兜住两种形态：客户端先断（人走了）与上游读流报错
+				// （EOF / 连接被掐）。此前两者都不打日志，线上根本分不出「谁先
+				// 走」——2026-10-24 排查 kimi 中断时只能靠猜。client_gone 由请求
+				// context 判定（canceled 即客户端已走），直接给出结论。
+				log.Printf("WARN: [server] stream acct=%s model=%s: 流中断 client_gone=%v err=%s",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel,
+					r.Context().Err() != nil, logfmt.Truncate(fmt.Sprint(sErr), 160))
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess

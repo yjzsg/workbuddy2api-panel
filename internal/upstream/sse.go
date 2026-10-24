@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -487,6 +489,25 @@ type streamOptions struct {
 	markup       *MarkupRepair
 	modelFrom    string
 	modelTo      string
+	pingEvery    time.Duration
+}
+
+// defaultStreamPingInterval 上游静默多久发一次保活注释帧。
+//
+// 为什么必须有保活（2026-10-24 实测）：上游在开始吐数据前只发**一帧**
+// `: heartbeat`（实测 4.3s 处），之后若模型长时间思考/规划而不产帧，链路上
+// 就一个字节都没有。Cloudflare 橙云的反代对**空闲**连接约 100s 就掐断——实测
+// 三次被截断的请求分别跑了 176/186/219s 且都被切断，客户端 2s 后就重发一次
+// （New API 的重试特征），recorded 为 interrupted（客户端先走）。我们自己跑
+// 连续吐字的流（80s / 131s / 259s，最长 12370 帧）一次都没断 ⇒ 问题是空闲，
+// 不是时长。20s 远小于链路上任何一个空闲上限，且 SSE 注释帧对 OpenAI 客户端
+// 与 New API 的 scanner 都是「非 data: 行直接忽略」，不影响语义。
+const defaultStreamPingInterval = 20 * time.Second
+
+// WithPingInterval 覆盖静默保活间隔（<=0 用默认 20s；传负值以外的极小值主要
+// 给测试用）。
+func WithPingInterval(d time.Duration) StreamOption {
+	return func(o *streamOptions) { o.pingEvery = d }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -582,6 +603,60 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// 出站写闸门 + 静默保活（见 defaultStreamPingInterval 的实测背景）。
+	// 所有写响应体的地方都必须走 writeOut：保活 goroutine 与主循环并发写同一个
+	// ResponseWriter 会踩 net/http 的「并发写」未定义行为，靠这把锁串行化。
+	var (
+		writeMu   sync.Mutex
+		lastWrite atomic.Int64
+	)
+	lastWrite.Store(time.Now().UnixNano())
+	writeOut := func(s string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if _, werr := io.WriteString(w, s); werr != nil {
+			return werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		lastWrite.Store(time.Now().UnixNano())
+		return nil
+	}
+	pingEvery := o.pingEvery
+	if pingEvery <= 0 {
+		pingEvery = defaultStreamPingInterval
+	}
+	stopPing := make(chan struct{})
+	var pingWG sync.WaitGroup
+	pingWG.Add(1)
+	go func() {
+		defer pingWG.Done()
+		// 半个间隔检查一次：保证空闲达到 pingEvery 后最迟 1.5 个间隔内发出保活，
+		// 不会因为 ticker 边界把实际间隔拉到 2×pingEvery。
+		t := time.NewTicker(pingEvery / 2)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastWrite.Load())) < pingEvery {
+					continue
+				}
+				if err := writeOut(": ping\n\n"); err != nil {
+					// 客户端已走：主循环下一次写会拿到同一个错误并走 interrupted 口径，
+					// 这里直接退出，不重复报错。
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopPing)
+		pingWG.Wait()
+	}()
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
@@ -610,11 +685,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if strings.Contains(payload, "\"credit\"") {
 			payload = stripUsageCredit(payload)
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+		if werr := writeOut("data: " + payload + "\n\n"); werr != nil {
 			return werr
-		}
-		if fl != nil {
-			fl.Flush()
 		}
 		return nil
 	}
@@ -790,11 +862,8 @@ readLoop:
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			if werr := writeOut(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -836,11 +905,8 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := writeOut("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if fl != nil {
-		fl.Flush()
 	}
 	if validFrames == 0 {
 		return errEmptyStream
