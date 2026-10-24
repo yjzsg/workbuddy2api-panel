@@ -858,6 +858,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// 打日志（2026-10-24）：这条此前只写响应、不打日志，线上只能看到 request-log 里
+		// model/account/ttfb 全 null 的 400（例如 New API 那批），根本分不清是「客户端
+		// 上传中断」还是「我们自己拒的」。读 body 失败 = 请求体没传完（客户端提前关连接 /
+		// 慢上传中途放弃），此时还没选号、不消耗账号、不计费。
+		log.Printf("WARN: [server] read body 失败（请求体没传完）src=%s ua=%q len=%d err=%v",
+			clientIPForLog(r), r.UserAgent(), r.ContentLength, err)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
