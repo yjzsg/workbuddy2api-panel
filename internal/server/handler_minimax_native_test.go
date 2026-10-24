@@ -90,13 +90,14 @@ func TestMiniMaxNativePathRequiresAuth(t *testing.T) {
 // 若漏掉 MiniMax 原生路径，从 New API 该渠道进来的流量在 request-logs 里完全不可见，
 // 排障时会被误判成「上游根本没打过来」。
 func TestIsChatCompletionPath(t *testing.T) {
-	yes := []string{"/v1/chat/completions", "/v1/text/chatcompletion_v2"}
+	yes := []string{"/v1/chat/completions", "/v1/text/chatcompletion_v2", "/api/paas/v4/chat/completions"}
 	for _, p := range yes {
 		if !isChatCompletionPath(p) {
 			t.Errorf("%q 应被识别为对话补全路径", p)
 		}
 	}
-	no := []string{"/v1/models", "/v1/chat/completions/x", "/v1/text/chatcompletion_v2/", "/status", ""}
+	no := []string{"/v1/models", "/v1/chat/completions/x", "/v1/text/chatcompletion_v2/", "/status", "",
+		"/api/paas/v4/models", "/api/paas/v4/chat/completions/"}
 	for _, p := range no {
 		if isChatCompletionPath(p) {
 			t.Errorf("%q 不应被识别为对话补全路径", p)

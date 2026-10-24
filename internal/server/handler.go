@@ -197,6 +197,20 @@ func NewHandler(cfg Config) *Handler {
 	// 不认这条路径时的现象：客户端在 New API 里选 MiniMax 类型/分组即 404 page not found，
 	// 选 OpenAI/DeepSeek 类型则正常。
 	h.mux.HandleFunc("POST /v1/text/chatcompletion_v2", h.withAuth(h.chatCompletions))
+	// 智谱（GLM）原生路径兼容（2026-10-24）：New API 的「智谱-4V」渠道类型
+	// （ChannelTypeZhipu_v4）把上游 URL 拼成 <base>/api/paas/v4/chat/completions
+	// （new-api relay/channel/zhipu_4v/adaptor.go:87）；请求体经 requestOpenAI2Zhipu
+	// 之后仍是 OpenAI 形状（model/stream/messages/temperature/top_p/stop/tools/
+	// tool_choice/max_tokens，见 relay-zhipu_v4.go:46-73），响应也交给
+	// openai.Adaptor.DoResponse 解析（adaptor.go:123）——即除 URL 之外全是 OpenAI 语义，
+	// 与 MiniMax 那条同理，不需要任何格式转换。
+	// 另外它的「获取模型列表」固定打 <base>/api/paas/v4/models
+	// （new-api controller/channel_upstream_update.go:414-419），不认这条 GET 就会
+	// 「选智谱类型拉不到模型」——现象与当初 MiniMax 选类型即 404 完全一样。
+	// 注意「智谱(v3)」是另一套协议：<base>/api/paas/v3/model-api/<model>/invoke|sse-invoke，
+	// 且请求体被转成 prompt 等原生字段，本网关不认；客户端请选「智谱-4V」。
+	h.mux.HandleFunc("POST /api/paas/v4/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("GET /api/paas/v4/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
@@ -248,7 +262,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 否则从 New API 的 MiniMax 渠道进来的流量在 request-logs 里完全不可见，排障时会被
 // 误判成「上游根本没打过来」。
 func isChatCompletionPath(p string) bool {
-	return p == "/v1/chat/completions" || p == "/v1/text/chatcompletion_v2"
+	return p == "/v1/chat/completions" ||
+		p == "/v1/text/chatcompletion_v2" ||
+		p == "/api/paas/v4/chat/completions"
 }
 
 // keyCtxKey context 中承载"本次请求命中的密钥"的键。
