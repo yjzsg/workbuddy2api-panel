@@ -329,6 +329,30 @@ func (p *Panel) acceptWithVerifyMP(a *auth.Auth, code string) bool {
 	return false
 }
 
+// acceptWithVerify 普通任务（非小程序域）的 accept 并回读验证，口径同
+// acceptWithVerifyMP：上游存在 200+OK 但未真正登记的形态，判定以回读
+// accept_status 为准，未生效重试一次。
+//
+// 为什么需要它：单任务「一键完成」此前不带 accept，用户必须先点「接受」再点
+// 「一键完成」——否则行为事件上报全部 200，但回读恒 not_accepted、进度不涨
+// （2026-10-24 实测：4 条专家体验任务未 accept 时 auto 后仍 0/1，accept 后同
+// 一批动作立刻 1/1 并自动领奖）。
+func (p *Panel) acceptWithVerify(a *auth.Auth, code string) bool {
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
+			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(a.UID, a.Nickname), code, attempt, err)
+			continue
+		}
+		time.Sleep(reportGap)
+		t, err := p.taskByCode(a, code)
+		if err == nil && t != nil && t.AcceptStatus != "not_accepted" && t.AcceptStatus != "" {
+			return true
+		}
+		log.Printf("autotask %s %s: accept 尝试%d 未登记生效（回读=%q）", logfmt.Label(a.UID, a.Nickname), code, attempt, acceptStatusOr(t))
+	}
+	return false
+}
+
 // acceptStatusOr 安全读取任务 accept_status（nil 任务返回 "?"）。
 func acceptStatusOr(t *upstream.Task) string {
 	if t == nil {
@@ -683,6 +707,29 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
 	}
+	// 前置 accept：上游要求任务先报名（not_accepted → accepted）才计分。此前只有
+	// mp 系动作内部自带 accept、全量入口在阶段 0 批量 accept，单任务入口缺这一步，
+	// 用户得先在任务中心点「接受」再点「一键完成」，否则上报全 200 但回读恒
+	// not_accepted、进度不涨（2026-10-24 实测）。已 accepted/completed 的不会进来。
+	didAccept := false
+	if before.AcceptStatus == "not_accepted" || before.AcceptStatus == "" {
+		var ok bool
+		if isMP {
+			ok = p.acceptWithVerifyMP(a, act.TaskCode)
+		} else {
+			ok = p.acceptWithVerify(a, act.TaskCode)
+		}
+		if !ok {
+			writeErr(w, http.StatusBadGateway,
+				"accept 未登记生效（上游 200+OK 但未落账形态），请稍后重试")
+			return
+		}
+		didAccept = true
+		// accept 成功后重读一次：progress_before 才有意义（否则只显示 not_accepted）。
+		if t2, err2 := p.taskByCode(a, act.TaskCode); err2 == nil && t2 != nil {
+			before = t2
+		}
+	}
 	msg, err := act.run(p, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
@@ -710,6 +757,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		"progress_after":   progressAfter,
 		"claimable":        claimable,
 		"attempt":          act.Attempt,
+		"accepted":         didAccept,
 		"verify_supported": true,
 	}
 	// 达标即自动领奖（Web 端 claim）：把"完成→领奖"收敛成一步，无需用户再点一次。
